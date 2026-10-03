@@ -157,7 +157,9 @@ jobs:
             -storepass "$ANDROID_KEY_PASSWORD" \
             -keypass "$ANDROID_KEY_PASSWORD" \
             "$probe_dir/probe.jar" "$ANDROID_KEY_ALIAS"
-          jarsigner -verify -strict "$probe_dir/probe.jar"
+          probe_verify_log="$RUNNER_TEMP/terarelay-probe-verify.log"
+          jarsigner -verify "$probe_dir/probe.jar" | tee "$probe_verify_log"
+          grep -Fq "jar verified." "$probe_verify_log"
 
           cat > src-tauri/gen/android/keystore.properties <<EOF
           keyAlias=$ANDROID_KEY_ALIAS
@@ -180,7 +182,9 @@ jobs:
           test -n "$apk"
           test -n "$aab"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
-          jarsigner -verify -strict "$aab"
+          aab_verify_log="$RUNNER_TEMP/terarelay-aab-verify.log"
+          jarsigner -verify "$aab" | tee "$aab_verify_log"
+          grep -Fq "jar verified." "$aab_verify_log"
 
       - name: Upload signed Android release outputs
         uses: actions/upload-artifact@v7

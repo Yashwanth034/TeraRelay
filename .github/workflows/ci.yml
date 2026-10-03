@@ -163,7 +163,19 @@ jobs:
         run: npm run tauri -- android init --ci
 
       - name: Build Android APK
-        run: npm run tauri -- android build --apk true --target aarch64 --ci
+        shell: bash
+        run: |
+          set -o pipefail
+          log_file="$RUNNER_TEMP/terarelay-android-build.log"
+          if npm run tauri -- android build --apk true --target aarch64 --ci 2>&1 | tee "$log_file"; then
+            exit 0
+          fi
+          details="$(tail -n 60 "$log_file")"
+          details="${details//'%'/'%25'}"
+          details="${details//$'\r'/'%0D'}"
+          details="${details//$'\n'/'%0A'}"
+          echo "::error title=Android build failed::$details"
+          exit 1
 
   ios-simulator:
     name: iOS simulator build
@@ -199,4 +211,16 @@ jobs:
         run: npm run tauri -- ios init --ci
 
       - name: Build iOS simulator application
-        run: npm run tauri -- ios build --target aarch64-sim --ci
+        shell: bash
+        run: |
+          set -o pipefail
+          log_file="$RUNNER_TEMP/terarelay-ios-build.log"
+          if npm run tauri -- ios build --target aarch64-sim --ci 2>&1 | tee "$log_file"; then
+            exit 0
+          fi
+          details="$(tail -n 60 "$log_file")"
+          details="${details//'%'/'%25'}"
+          details="${details//$'\r'/'%0D'}"
+          details="${details//$'\n'/'%0A'}"
+          echo "::error title=iOS simulator build failed::$details"
+          exit 1

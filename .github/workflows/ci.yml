@@ -72,21 +72,33 @@ jobs:
         run: python3 -m py_compile src-tauri/src/tdlib_fast_worker.py
 
   desktop:
-    name: Desktop build / ${{ matrix.name }}
+    name: Desktop package / ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Linux x64
             os: ubuntu-22.04
+            args: ""
+            artifact: terarelay-linux-x64
           - name: Windows x64
             os: windows-latest
+            args: ""
+            artifact: terarelay-windows-x64
           - name: macOS Apple Silicon
             os: macos-latest
+            args: "--target aarch64-apple-darwin"
+            artifact: terarelay-macos-arm64
+          - name: macOS Intel
+            os: macos-latest
+            args: "--target x86_64-apple-darwin"
+            artifact: terarelay-macos-x64
+
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: app
+
     steps:
       - uses: actions/checkout@v7
 
@@ -94,7 +106,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y             libwebkit2gtk-4.1-dev             libayatana-appindicator3-dev             librsvg2-dev             patchelf             xdg-utils
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
 
       - uses: actions/setup-node@v7
         with:
@@ -104,17 +121,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri -> target
+          key: desktop-${{ matrix.artifact }}
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build desktop application without packaging
+      - name: Build distributable desktop bundles
         env:
           APPLE_SIGNING_IDENTITY: "-"
-        run: npm run tauri -- build --no-bundle --ci
+        run: npm run tauri -- build --ci ${{ matrix.args }}
+
+      - name: Upload desktop bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: app/src-tauri/target/**/release/bundle/**/*
 
   android:
     name: Android ARM64 build

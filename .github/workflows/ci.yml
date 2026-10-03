@@ -210,6 +210,13 @@ jobs:
       - name: Initialize iOS native project
         run: npm run tauri -- ios init --ci
 
+      - name: Work around Xcode 26 MetalToolchain linker regression
+        shell: bash
+        run: |
+          xcodebuild -showComponent MetalToolchain || true
+          xcodebuild -deleteComponent MetalToolchain || true
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+
       - name: Build iOS simulator application
         shell: bash
         run: |

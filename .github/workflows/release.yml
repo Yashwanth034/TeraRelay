@@ -118,13 +118,51 @@ jobs:
       - name: Initialize Android native project
         run: npm run tauri -- android init --ci
 
-      - name: Build unsigned release APK and AAB
+      - name: Configure Android release signing
+        shell: bash
+        env:
+          ANDROID_KEY_BASE64_1: ${{ secrets.ANDROID_KEY_BASE64_1 }}
+          ANDROID_KEY_BASE64_2: ${{ secrets.ANDROID_KEY_BASE64_2 }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEY_BASE64_1"
+          test -n "$ANDROID_KEY_BASE64_2"
+          test -n "$ANDROID_KEY_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+
+          key_file="$RUNNER_TEMP/terarelay-upload.p12"
+          printf '%s%s' "$ANDROID_KEY_BASE64_1" "$ANDROID_KEY_BASE64_2" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          keyAlias=$ANDROID_KEY_ALIAS
+          password=$ANDROID_KEY_PASSWORD
+          storeFile=$key_file
+          storeType=PKCS12
+          EOF
+
+          python3 ../scripts/configure-android-signing.py
+
+      - name: Build signed release APK and AAB
         run: npm run tauri -- android build --apk true --aab true --ci
 
-      - name: Upload Android build outputs for signing/review
+      - name: Verify Android release signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          aab="$(find src-tauri/gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -n 1)"
+          test -n "$apk"
+          test -n "$aab"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
+          jarsigner -verify -strict "$aab"
+
+      - name: Upload signed Android release outputs
         uses: actions/upload-artifact@v7
         with:
-          name: terarelay-android-unsigned
+          name: terarelay-android-signed
           if-no-files-found: error
           path: |
             app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk

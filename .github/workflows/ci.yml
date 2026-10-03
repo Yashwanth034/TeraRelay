@@ -218,7 +218,10 @@ jobs:
           if npm run tauri -- ios build --target aarch64-sim --ci 2>&1 | tee "$log_file"; then
             exit 0
           fi
-          details="$(tail -n 60 "$log_file")"
+          details="$(grep -Ei 'error:|fatal error|failed|cannot|undefined|linker command failed|not found' "$log_file" | tail -n 30 || true)"
+          if [ -z "$details" ]; then
+            details="$(tail -n 30 "$log_file")"
+          fi
           details="${details//'%'/'%25'}"
           details="${details//$'\r'/'%0D'}"
           details="${details//$'\n'/'%0A'}"

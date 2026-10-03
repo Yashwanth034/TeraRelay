@@ -18,7 +18,7 @@ Version 0.1.0 provides:
 - localization
 - Linux packaging as .deb and AppImage
 
-Linux x86_64 is the currently verified release platform. Windows, macOS, Android, and iOS use the same Telegram-backed logical-file format and MTProto transfer fallback; their native build/runtime paths are being validated separately before release artifacts are published.
+TeraRelay v0.1.0 has successful CI/build-package validation on Linux x86_64, Windows x64, macOS Apple Silicon and Intel, Android ARM64, and the iOS simulator. This validates the build/package paths and is not equivalent to full runtime/device testing on every platform. Linux x86_64 includes the additional TDLib/C++ acceleration path; Windows, macOS, Android, and iOS use the MTProto fallback. The iOS target is simulator-validated only; no signed device IPA is published in v0.1.0.
 
 ## Development
 

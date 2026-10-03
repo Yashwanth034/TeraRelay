@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="TeraRelay">
+  <defs>
+    <linearGradient id="g" x1="18" y1="14" x2="110" y2="114" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8A91FF"/>
+      <stop offset="1" stop-color="#5369F8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#g)"/>
+  <path d="M24 38H62V51H49V92H37V51H24V38Z" fill="white"/>
+  <path fill-rule="evenodd" d="M66 38H84C96 38 104 45 104 57C104 65 100 71 94 74L106 92H91L81 77H78V92H66V38ZM78 51V65H84C89 65 92 62 92 58C92 53 89 51 84 51H78Z" fill="white" opacity=".94"/>
+</svg>

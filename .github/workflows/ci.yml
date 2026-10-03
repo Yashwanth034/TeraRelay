@@ -1,0 +1,202 @@
+name: Cross-platform CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Source, tests and Linux baseline
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             libwebkit2gtk-4.1-dev             libayatana-appindicator3-dev             librsvg2-dev             patchelf             xdg-utils
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Source hygiene
+        working-directory: .
+        run: bash scripts/check-source.sh
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Locale structure
+        run: node check-i18n.cjs
+
+      - name: JavaScript dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Rust format
+        working-directory: app/src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Rust check
+        working-directory: app/src-tauri
+        run: cargo check --locked
+
+      - name: Rust tests
+        working-directory: app/src-tauri
+        run: cargo test --locked
+
+      - name: Python worker syntax
+        run: python3 -m py_compile src-tauri/src/tdlib_fast_worker.py
+
+  desktop:
+    name: Desktop build / ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-22.04
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS Apple Silicon
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             libwebkit2gtk-4.1-dev             libayatana-appindicator3-dev             librsvg2-dev             patchelf             xdg-utils
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build desktop application without packaging
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: npm run tauri -- build --no-bundle --ci
+
+  android:
+    name: Android ARM64 build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK 36 and NDK r28
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          NDK_VERSION="$(sdkmanager --list | sed -n 's/^[[:space:]]*ndk;\([^ ]*\).*/\1/p' | grep '^28\.' | sort -V | tail -1)"
+          test -n "$NDK_VERSION"
+          sdkmanager             "platform-tools"             "platforms;android-36"             "build-tools;36.0.0"             "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: android-aarch64
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Initialize Android native project
+        run: npm run tauri -- android init --ci
+
+      - name: Build Android APK
+        run: npm run tauri -- android build --apk true --target aarch64 --ci
+
+  ios-simulator:
+    name: iOS simulator build
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: ios-simulator
+
+      - name: Ensure CocoaPods is available
+        run: command -v pod >/dev/null || brew install cocoapods
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Initialize iOS native project
+        run: npm run tauri -- ios init --ci
+
+      - name: Build iOS simulator application
+        run: npm run tauri -- ios build --target aarch64-sim --ci

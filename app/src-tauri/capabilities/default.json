@@ -1,0 +1,19 @@
+{
+  "identifier": "default",
+  "description": "Standard permissions for TeraRelay",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "os:default",
+    "shell:allow-open",
+    "store:default",
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "fs:allow-read",
+    "fs:allow-write",
+    "fs:scope-app-recursive"
+  ]
+}

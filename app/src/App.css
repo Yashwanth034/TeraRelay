@@ -1,0 +1,680 @@
+@import "tailwindcss";
+
+/* stylelint-disable at-rule-no-unknown */
+/* Dark Theme (Default) - Using Tailwind v4 @theme directive */
+@theme {
+  --color-telegram-bg: #070a12;
+  --color-telegram-surface: #0d1320;
+  --color-telegram-primary: #8b7cff;
+  --color-telegram-secondary: #55d9e6;
+  --color-telegram-text: #f7f8fc;
+  --color-telegram-subtext: #8f99ad;
+  --color-telegram-border: rgba(151, 164, 190, 0.14);
+  --color-telegram-hover: rgba(255, 255, 255, 0.055);
+  --color-telegram-glass-bg: #0d1320;
+  --color-telegram-glass-border: #aab5d0;
+}
+
+/* Light Theme Overrides */
+:root.light {
+  --color-telegram-bg: #f5f6fb;
+  --color-telegram-surface: #ffffff;
+  --color-telegram-primary: #6657e8;
+  --color-telegram-secondary: #168f9e;
+  --color-telegram-text: #151827;
+  --color-telegram-subtext: #667085;
+  --color-telegram-border: rgba(35, 43, 67, 0.11);
+  --color-telegram-hover: rgba(67, 76, 110, 0.055);
+  --color-telegram-glass-bg: #ffffff;
+  --color-telegram-glass-border: #59627a;
+}
+
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background: var(--color-telegram-bg);
+  color: var(--color-telegram-text);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* TeraRelay auth canvas: cinematic depth without a heavy WebGL scene. */
+.auth-gradient {
+  background:
+    radial-gradient(circle at 14% 18%, rgba(112, 91, 255, 0.24), transparent 30%),
+    radial-gradient(circle at 86% 78%, rgba(56, 211, 224, 0.14), transparent 28%),
+    radial-gradient(circle at 65% 8%, rgba(100, 120, 255, 0.10), transparent 24%),
+    linear-gradient(135deg, #05070d 0%, #0a0f1d 48%, #070a12 100%);
+}
+
+:root.light .auth-gradient {
+  background:
+    radial-gradient(circle at 12% 18%, rgba(124, 108, 255, 0.17), transparent 31%),
+    radial-gradient(circle at 86% 80%, rgba(64, 198, 210, 0.13), transparent 28%),
+    linear-gradient(135deg, #f8f8fc 0%, #eef1f8 52%, #f7f8fb 100%);
+}
+
+/* TeraRelay product shell */
+.terarelay-auth-stage {
+  isolation: isolate;
+  overflow: auto;
+}
+
+.terarelay-auth-stage::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  opacity: 0.22;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.028) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,.8), transparent 88%);
+}
+
+.terarelay-auth-stage::after {
+  content: "";
+  position: fixed;
+  width: 36rem;
+  height: 36rem;
+  top: 10%;
+  left: 48%;
+  z-index: -1;
+  border-radius: 999px;
+  pointer-events: none;
+  background: radial-gradient(circle, rgba(139,124,255,.13), transparent 66%);
+  filter: blur(14px);
+}
+
+.terarelay-auth-layout {
+  width: min(1040px, 100%);
+  min-height: 610px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(390px, .78fr);
+  align-items: stretch;
+  gap: 22px;
+}
+
+.terarelay-auth-story {
+  position: relative;
+  min-width: 0;
+  padding: 46px 48px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid rgba(151,164,190,.12);
+  border-radius: 28px;
+  overflow: hidden;
+  background:
+    linear-gradient(145deg, rgba(20,27,46,.66), rgba(8,12,22,.72));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 30px 90px rgba(0,0,0,.26);
+}
+
+.terarelay-auth-story::after {
+  content: "";
+  position: absolute;
+  width: 300px;
+  height: 300px;
+  right: -100px;
+  bottom: -110px;
+  border-radius: 50%;
+  border: 1px solid rgba(85,217,230,.15);
+  box-shadow:
+    0 0 0 42px rgba(85,217,230,.025),
+    0 0 0 84px rgba(139,124,255,.022);
+}
+
+.terarelay-auth-brand {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.terarelay-auth-brand img {
+  filter: drop-shadow(0 12px 24px rgba(72,82,210,.25));
+}
+
+.terarelay-auth-brand h1 {
+  color: var(--color-telegram-text);
+  font-size: 20px;
+  font-weight: 760;
+  letter-spacing: -0.025em;
+}
+
+.terarelay-eyebrow {
+  color: color-mix(in srgb, var(--color-telegram-secondary) 78%, var(--color-telegram-text));
+  font-size: 9px;
+  line-height: 1.2;
+  font-weight: 800;
+  letter-spacing: .16em;
+}
+
+.terarelay-auth-copy {
+  position: relative;
+  z-index: 1;
+  max-width: 520px;
+  margin: auto 0;
+}
+
+.terarelay-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 18px;
+  padding: 7px 10px;
+  color: #c6d0e7;
+  border: 1px solid rgba(151,164,190,.14);
+  border-radius: 999px;
+  background: rgba(255,255,255,.035);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+
+.terarelay-status-pill > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #67e8c8;
+  box-shadow: 0 0 14px rgba(103,232,200,.6);
+}
+
+.terarelay-auth-copy h2 {
+  max-width: 520px;
+  color: #f8f9ff;
+  font-size: clamp(35px, 4.1vw, 55px);
+  line-height: 1.02;
+  letter-spacing: -0.055em;
+  font-weight: 690;
+}
+
+.terarelay-auth-copy > p {
+  max-width: 500px;
+  margin-top: 20px;
+  color: #98a3b8;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.terarelay-auth-points {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0,1fr));
+  gap: 9px;
+}
+
+.terarelay-auth-points > div {
+  min-width: 0;
+  min-height: 84px;
+  padding: 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1px solid rgba(151,164,190,.11);
+  border-radius: 14px;
+  background: rgba(255,255,255,.026);
+  color: #aab5ca;
+}
+
+.terarelay-auth-points svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: #8b7cff;
+}
+
+.terarelay-auth-points span {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.terarelay-auth-points strong {
+  color: #eef1fa;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.terarelay-auth-points small {
+  color: #727e94;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.terarelay-auth-card {
+  align-self: center;
+  max-width: 430px;
+  justify-self: end;
+}
+
+.terarelay-mini-mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(139,124,255,.28);
+  border-radius: 11px;
+  color: #b5aaff;
+  background: linear-gradient(145deg, rgba(139,124,255,.16), rgba(85,217,230,.05));
+}
+
+.terarelay-theme-toggle {
+  color: #aab4c8;
+  background: rgba(11,16,28,.76);
+  border: 1px solid rgba(151,164,190,.15);
+  box-shadow: 0 12px 28px rgba(0,0,0,.18);
+}
+
+.terarelay-theme-toggle:hover {
+  color: #ffffff;
+  background: rgba(21,28,45,.92);
+}
+
+.terarelay-primary-action {
+  color: #ffffff;
+  background: linear-gradient(100deg, #7667f2, #665bf0 58%, #536fdd);
+  border: 1px solid rgba(187,179,255,.18);
+  box-shadow: 0 13px 32px rgba(79,67,192,.25), inset 0 1px 0 rgba(255,255,255,.16);
+}
+
+.terarelay-primary-action:hover {
+  background: linear-gradient(100deg, #8274f7, #7165f4 58%, #5f7be7);
+  box-shadow: 0 15px 36px rgba(79,67,192,.31), inset 0 1px 0 rgba(255,255,255,.18);
+}
+
+.terarelay-auth-card .glass-input:focus {
+  border-color: rgba(139,124,255,.78);
+  box-shadow: 0 0 0 3px rgba(139,124,255,.10);
+}
+
+:root.light .terarelay-auth-story {
+  background: linear-gradient(145deg, rgba(255,255,255,.80), rgba(246,247,252,.85));
+  border-color: rgba(50,58,86,.10);
+  box-shadow: 0 30px 80px rgba(70,76,108,.12);
+}
+
+:root.light .terarelay-auth-copy h2,
+:root.light .terarelay-auth-brand h1,
+:root.light .terarelay-auth-points strong {
+  color: #181b2b;
+}
+
+:root.light .terarelay-auth-copy > p {
+  color: #697287;
+}
+
+:root.light .terarelay-status-pill {
+  color: #59627a;
+  background: rgba(255,255,255,.68);
+}
+
+:root.light .terarelay-theme-toggle {
+  color: #515b72;
+  background: rgba(255,255,255,.82);
+  border-color: rgba(50,58,86,.11);
+}
+
+@media (max-width: 900px) {
+  .terarelay-auth-layout {
+    width: min(500px, 100%);
+    grid-template-columns: 1fr;
+  }
+
+  .terarelay-auth-story {
+    display: none;
+  }
+
+  .terarelay-auth-card {
+    max-width: 500px;
+    justify-self: stretch;
+  }
+}
+
+/* Glassmorphism Utilities - Dark */
+.glass {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 70%, transparent);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 8%, transparent);
+}
+
+:root.light .glass {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 85%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 8%, transparent);
+}
+
+/* Auth-specific glass - works on gradient backgrounds in both themes */
+.auth-glass {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 85%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 10%, transparent);
+}
+
+:root.light .auth-glass {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 90%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 30%, transparent);
+  color: #1a1a1a;
+}
+
+/* Force dark text inside auth-glass in light mode */
+:root.light .auth-glass .text-white {
+  color: #1a1a1a;
+}
+
+:root.light .auth-glass .text-white\/60 {
+  color: rgba(26, 26, 26, 0.7);
+}
+
+:root.light .auth-glass .text-gray-400 {
+  color: #555;
+}
+
+:root.light .auth-glass .text-blue-200 {
+  color: #1e40af;
+}
+
+:root.light .auth-glass .placeholder-gray-600::placeholder {
+  color: #9ca3af;
+}
+
+:root.light .auth-glass input {
+  background: rgba(0, 0, 0, 0.05);
+  border-color: rgba(0, 0, 0, 0.15);
+  color: #1a1a1a;
+}
+
+/* Auth form icons - Direct overrides for maximum visibility */
+.auth-form-icon {
+  color: #ffffff !important;
+  /* Default (Dark Mode): Pure White */
+  opacity: 1 !important;
+  z-index: 20;
+}
+
+/* Light Mode Override */
+:root.light .auth-form-icon {
+  color: #000000 !important;
+  /* Light Mode: Pure Black */
+  opacity: 0.8 !important;
+}
+
+.glass-input {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 60%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 10%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+:root.light .glass-input {
+  background: color-mix(in srgb, var(--color-telegram-glass-bg) 90%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-telegram-glass-border) 15%, transparent);
+}
+
+/* Custom Scrollbar - Dark */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 99px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(36, 129, 204, 0.6);
+}
+
+/* Custom Scrollbar - Light */
+:root.light ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+}
+
+:root.light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(36, 129, 204, 0.5);
+}
+
+/* Progress Animation */
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+
+  50% {
+    transform: translateX(50%);
+  }
+
+  100% {
+    transform: translateX(200%);
+  }
+}
+
+.animate-progress-indeterminate {
+  animation: progress-indeterminate 1.5s infinite linear;
+}
+
+/* Light mode specific overrides for common patterns */
+:root.light .bg-telegram-bg {
+  background-color: var(--color-telegram-bg);
+}
+
+:root.light .bg-telegram-surface {
+  background-color: var(--color-telegram-surface);
+}
+
+:root.light .border-white\/5,
+:root.light .border-white\/10 {
+  border-color: var(--color-telegram-border);
+}
+
+:root.light .bg-white\/5,
+:root.light .hover\:bg-white\/5:hover {
+  background-color: var(--color-telegram-hover);
+}
+
+:root.light .bg-white\/10,
+:root.light .hover\:bg-white\/10:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+:root.light .bg-black\/20,
+:root.light .bg-black\/30,
+:root.light .bg-black\/50 {
+  background-color: rgba(0, 0, 0, 0.08);
+}
+
+/* File card action buttons - more visible in light mode */
+:root.light .file-action-btn {
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  color: white !important;
+}
+
+:root.light .file-action-btn:hover {
+  background-color: var(--color-telegram-primary) !important;
+}
+
+/* Invert text colors for light mode where needed */
+:root.light .text-telegram-text {
+  color: var(--color-telegram-text);
+}
+
+:root.light .text-telegram-subtext {
+  color: var(--color-telegram-subtext);
+}
+
+/* Card shadows for light mode */
+:root.light .shadow-2xl {
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+}
+
+/* Input styling for light mode */
+:root.light input,
+:root.light textarea {
+  background-color: #ffffff;
+  border-color: rgba(0, 0, 0, 0.15);
+  color: #1a1a1a;
+}
+
+:root.light input::placeholder,
+:root.light textarea::placeholder {
+  color: #9ca3af;
+}
+
+:root.light input:focus,
+:root.light textarea:focus {
+  border-color: var(--color-telegram-primary);
+}
+
+/* Main TeraRelay workspace */
+.terarelay-shell {
+  background:
+    radial-gradient(circle at 72% -18%, rgba(139,124,255,.09), transparent 30%),
+    radial-gradient(circle at 100% 100%, rgba(85,217,230,.045), transparent 28%),
+    var(--color-telegram-bg);
+}
+
+.tr-sidebar {
+  position: relative;
+  background: linear-gradient(180deg, rgba(16,22,36,.98), rgba(10,15,26,.96));
+  box-shadow: inset -1px 0 rgba(255,255,255,.018);
+}
+
+.tr-sidebar::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 18px;
+  right: 18px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(139,124,255,.38), transparent);
+  pointer-events: none;
+}
+
+.tr-main-panel {
+  min-width: 0;
+  background: linear-gradient(180deg, rgba(8,12,21,.78), rgba(6,9,16,.88));
+}
+
+.tr-topbar {
+  background: rgba(10,15,26,.82);
+  border-bottom-color: rgba(151,164,190,.10);
+  box-shadow: 0 10px 30px rgba(0,0,0,.08);
+}
+
+.tr-topbar input {
+  height: 36px;
+  padding-inline: 14px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.045);
+  border-color: rgba(151,164,190,.12);
+}
+
+.tr-topbar input:focus {
+  background: rgba(255,255,255,.06);
+  border-color: rgba(139,124,255,.48);
+  box-shadow: 0 0 0 3px rgba(139,124,255,.07);
+}
+
+.tr-file-explorer {
+  background: linear-gradient(rgba(255,255,255,.012), rgba(255,255,255,0));
+}
+
+.tr-file-card {
+  background: linear-gradient(145deg, rgba(18,25,41,.98), rgba(12,18,30,.98));
+  border-color: rgba(151,164,190,.105);
+  box-shadow: inset 0 1px rgba(255,255,255,.022);
+}
+
+.tr-file-card:hover {
+  border-color: rgba(139,124,255,.38);
+}
+
+.tr-transfer-dock {
+  background: rgba(11,16,28,.94);
+  border-color: rgba(151,164,190,.15);
+  box-shadow: 0 22px 70px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.04);
+  backdrop-filter: blur(18px);
+}
+
+:root.light .tr-sidebar,
+:root.light .tr-main-panel,
+:root.light .tr-topbar,
+:root.light .tr-transfer-dock {
+  background: rgba(255,255,255,.94);
+}
+
+:root.light .tr-file-card {
+  background: linear-gradient(145deg, #ffffff, #f8f9fc);
+  box-shadow: 0 8px 24px rgba(58,65,90,.06);
+}
+
+/* ── Performance Mode ──────────────────────────────────────── */
+/* Disables GPU-heavy effects for WebKitGTK / older hardware.  */
+/* Toggle via Settings → General → Performance Mode.           */
+
+.performance-mode *,
+.performance-mode *::before,
+.performance-mode *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+.performance-mode {
+  /* Kill backdrop-filter completely */
+  --tw-backdrop-blur: none !important;
+}
+
+.performance-mode .backdrop-blur-sm,
+.performance-mode .backdrop-blur,
+.performance-mode .backdrop-blur-md,
+.performance-mode .backdrop-blur-lg,
+.performance-mode .backdrop-blur-xl,
+.performance-mode .backdrop-blur-2xl,
+.performance-mode .backdrop-blur-3xl {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.performance-mode .glass,
+.performance-mode .auth-glass,
+.performance-mode .glass-input {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Kill heavy shadows */
+.performance-mode .shadow-lg,
+.performance-mode .shadow-xl,
+.performance-mode .shadow-2xl,
+.performance-mode .drop-shadow-lg {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12) !important;
+  filter: none !important;
+}
+
+/* Reduce paint cost */
+.performance-mode .animate-pulse,
+.performance-mode .animate-spin {
+  animation: none !important;
+}
+
+/* Hide scrollbar utility */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}

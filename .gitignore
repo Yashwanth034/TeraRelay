@@ -1,0 +1,41 @@
+# TeraRelay workspace
+.repotunnel-tmp/
+app/node_modules/
+app/dist/
+app/dist-ssr/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Local QA fixtures
+app/src-tauri/tdlib-one-login-proof-1MiB.bin
+app/src-tauri/tdlib-one-login-restart-proof-1MiB.bin
+app/src-tauri/tdlib-premium-check-1MiB.bin
+app/src-tauri/tdlib-native-actual-4GiB.bin
+
+# Runtime/private data
+*.log
+*.session
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pem
+*.p8
+*.p12
+*.jks
+*.keystore
+keystore.properties
+*.mobileprovision
+*.provisionprofile
+
+# Release artifacts belong in GitHub Releases, not source control
+*.deb
+*.AppImage
+*.msi
+*.dmg
+*.pkg
+*.apk
+*.aab
+*.ipa
+
+.DS_Store

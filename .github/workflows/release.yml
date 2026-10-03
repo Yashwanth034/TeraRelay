@@ -1,0 +1,174 @@
+name: Build release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    name: Desktop release / ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: ""
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - name: macOS Intel
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Build and attach desktop bundles
+        uses: tauri-apps/tauri-action@action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          projectPath: app
+          tagName: v__VERSION__
+          releaseName: "TeraRelay v__VERSION__"
+          releaseBody: "Cross-platform TeraRelay release. See the attached platform packages and checksums."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  android:
+    name: Android release build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK 36 and NDK r28
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          NDK_VERSION="$(sdkmanager --list | sed -n 's/^[[:space:]]*ndk;\([^ ]*\).*/\1/p' | grep '^28\.' | sort -V | tail -1)"
+          test -n "$NDK_VERSION"
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: android-release
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Initialize Android native project
+        run: npm run tauri -- android init --ci
+
+      - name: Build unsigned release APK and AAB
+        run: npm run tauri -- android build --apk true --aab true --ci
+
+      - name: Upload Android build outputs for signing/review
+        uses: actions/upload-artifact@v7
+        with:
+          name: terarelay-android-unsigned
+          if-no-files-found: error
+          path: |
+            app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            app/src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+
+  ios-simulator:
+    name: iOS simulator release validation
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: ios-simulator-release
+
+      - name: Ensure CocoaPods is available
+        run: command -v pod >/dev/null || brew install cocoapods
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Initialize iOS native project
+        run: npm run tauri -- ios init --ci
+
+      - name: Build iOS simulator application
+        run: npm run tauri -- ios build --target aarch64-sim --ci
+
+      - name: Upload iOS simulator output
+        uses: actions/upload-artifact@v7
+        with:
+          name: terarelay-ios-simulator
+          if-no-files-found: error
+          path: app/src-tauri/gen/apple/build/**/*

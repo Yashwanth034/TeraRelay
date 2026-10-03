@@ -136,6 +136,29 @@ jobs:
           printf '%s%s' "$ANDROID_KEY_BASE64_1" "$ANDROID_KEY_BASE64_2" | base64 --decode > "$key_file"
           chmod 600 "$key_file"
 
+          expected_sha256="8c9d377b0caeae7dfd7fe3af76721cded21e7f3c9fbd9071aa609a4b8bec1aaa"
+          actual_sha256="$(sha256sum "$key_file" | awk '{print $1}')"
+          echo "Android keystore SHA-256: $actual_sha256"
+          test "$actual_sha256" = "$expected_sha256"
+
+          keytool -list -v \
+            -storetype PKCS12 \
+            -keystore "$key_file" \
+            -storepass "$ANDROID_KEY_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS"
+
+          probe_dir="$RUNNER_TEMP/terarelay-signing-probe"
+          mkdir -p "$probe_dir"
+          printf 'TeraRelay signing probe' > "$probe_dir/probe.txt"
+          (cd "$probe_dir" && jar --create --file probe.jar probe.txt)
+          jarsigner \
+            -keystore "$key_file" \
+            -storetype PKCS12 \
+            -storepass "$ANDROID_KEY_PASSWORD" \
+            -keypass "$ANDROID_KEY_PASSWORD" \
+            "$probe_dir/probe.jar" "$ANDROID_KEY_ALIAS"
+          jarsigner -verify -strict "$probe_dir/probe.jar"
+
           cat > src-tauri/gen/android/keystore.properties <<EOF
           keyAlias=$ANDROID_KEY_ALIAS
           password=$ANDROID_KEY_PASSWORD

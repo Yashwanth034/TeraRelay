@@ -47,4 +47,4 @@ The current locked graph contains `hickory-proto 0.25.2` through Grammers' optio
 
 ## Reporting
 
-For a public repository, use GitHub's private vulnerability-reporting/security-advisory flow when available. Do not include credentials, session files, or private user data in a public issue.
+Use [GitHub private vulnerability reporting](https://github.com/Yashwanth034/TeraRelay/security/advisories/new) for security vulnerabilities. Do not include credentials, Telegram session files, signing material, or private user data in a public issue.

@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a reproducible TeraRelay problem
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem.
+
+        **Do not attach or paste Telegram session files, API hashes, login codes, 2-step verification passwords, signing keys, private file contents, or other credentials.**
+
+        For security vulnerabilities, use GitHub's private vulnerability reporting instead of a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: TeraRelay version
+      description: "Example: v0.1.0"
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - Windows x64
+        - macOS Apple Silicon
+        - macOS Intel
+        - Android ARM64
+        - iOS simulator
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Optional. Redact usernames, phone numbers, session data, credentials, private file names/content, and other sensitive information.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, Telegram session data, private file contents, and other sensitive information from this report.
+          required: true

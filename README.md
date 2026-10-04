@@ -33,6 +33,13 @@ You choose **one large file** — for example 10 GB, 100 GB, or another file tha
 
 Later, you click **Download once**. TeraRelay fetches the required parts, verifies them, puts them back in the correct order, and reconstructs the **original file with its original name and size**.
 
+## Performance
+
+- **Upload:** ~18–25 MB/s
+- **Download:** ~10–15 MB/s
+
+Actual speeds depend on your connection and Telegram's server load.
+
 ```text
 Example: one 100 GB archive
 

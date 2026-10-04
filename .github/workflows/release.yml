@@ -67,7 +67,7 @@ jobs:
           projectPath: app
           tagName: v__VERSION__
           releaseName: "TeraRelay v__VERSION__"
-          releaseBody: "Cross-platform TeraRelay release. See the attached platform packages and checksums."
+          releaseBody: "TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

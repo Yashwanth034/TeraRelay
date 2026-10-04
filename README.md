@@ -5,7 +5,7 @@
 <h1 align="center">TeraRelay</h1>
 
 <p align="center">
-  <strong>Your Telegram account, turned into a private cross-platform file storage client.</strong>
+  <strong>Store files far larger than Telegram's single-file limit — TeraRelay chunks them automatically and gives you the original file back as one download.</strong>
 </p>
 
 <p align="center">
@@ -25,9 +25,61 @@
 
 ---
 
+## The core idea
+
+Telegram has a per-document upload limit. TeraRelay works around that limit at the **logical-file layer**.
+
+You choose **one large file** — for example 10 GB, 100 GB, or another file that is far beyond Telegram's single-document limit. TeraRelay automatically splits it into Telegram-sized parts, uploads those parts to your Telegram-backed storage, records the manifest, and keeps the chunks hidden from the normal UI.
+
+Later, you click **Download once**. TeraRelay fetches the required parts, verifies them, puts them back in the correct order, and reconstructs the **original file with its original name and size**.
+
+```text
+Example: one 100 GB archive
+
+100 GB original file
+        │
+        ▼
+TeraRelay splits it automatically
+        │
+        ├── part 001
+        ├── part 002
+        ├── part 003
+        ├── ...
+        └── manifest + integrity metadata
+                │
+                ▼
+        stored through Telegram
+                │
+                ▼
+      shown as ONE logical file
+                │
+          one Download action
+                │
+                ▼
+      original 100 GB file restored
+```
+
+So the user does **not** have to manually name, upload, track, download, reorder, or join dozens of chunk files.
+
+### Why use TeraRelay instead of splitting files manually?
+
+| Task | Manual Telegram workflow | TeraRelay |
+| --- | --- | --- |
+| Upload a huge file | Split it yourself and upload many parts | Select the original file once |
+| Keep track of parts | Manage part names/order yourself | Manifest and ordering are automatic |
+| What you see | Many separate Telegram documents | One logical file |
+| Download later | Download every part and join them manually | Click Download once |
+| Reconstruct original | Manual tooling/scripts | Automatic reconstruction |
+| Integrity | Verify parts yourself | Size/checksum validation |
+| Interrupted transfer | Track/retry parts yourself | Resume/recovery logic built in |
+
+> **Large-file scope:** TeraRelay is designed for logical files much larger than Telegram's single-document limit, including tens or hundreds of gigabytes. Practical limits still depend on Telegram/account behavior, available storage, network reliability, runtime, and local disk space. Release validation has included multi-gigabyte files; 100 GB is an explanatory example, not a claim that every environment has been benchmarked at that size.
+
 ## What is TeraRelay?
 
-TeraRelay is a Tauri + Rust + React application that uses **your own Telegram account as the backing storage layer**. It presents Telegram-backed storage as a normal file-storage experience instead of exposing Telegram messages, document parts, or large-file chunks to the user.
+TeraRelay is a cross-platform Tauri + Rust + React application that turns **your own Telegram account into a managed file-storage layer**.
+
+Its main job is to hide Telegram's storage mechanics from you: normal documents stay normal documents, and very large files are represented as one logical file even when Telegram stores them internally as many documents.
 
 There is no separate TeraRelay cloud-storage account or remote file-storage backend. Your Telegram session and TeraRelay application state stay local to the client, while file data is stored through Telegram.
 
@@ -35,13 +87,15 @@ There is no separate TeraRelay cloud-storage account or remote file-storage back
 
 ## Highlights
 
-- **Telegram login** — phone login, QR login, and 2-step verification
-- **Persistent sessions** — stay signed in across application restarts
-- **Personal Vault** — keep private storage isolated from shared TeraRelay channels
-- **Logical channels** — owner/member roles with invite, join, rejoin, leave, and revoke flows
-- **Large files** — files above Telegram's normal per-document limit are split internally and reconstructed as one logical file
+- **Huge logical files** — select one large file; TeraRelay handles Telegram-sized chunking and reconstruction automatically
+- **One-file experience** — internal Telegram parts stay hidden; the UI shows the original logical file
+- **Automatic reconstruction** — one Download action restores the original file from its stored parts
 - **Integrity validation** — manifests, ordered chunks, exact-size reconstruction, and checksum validation
 - **Resumable transfers** — upload/download recovery for interrupted or stale local transfer state
+- **Your Telegram storage** — files are stored through your own Telegram account rather than a separate TeraRelay storage backend
+- **Personal Vault** — private storage separated from shared TeraRelay channels
+- **Logical channels** — owner/member roles with invite, join, rejoin, leave, and revoke flows
+- **Persistent Telegram sessions** — phone login, QR login, 2-step verification, and session restore
 - **File management** — search, rename, move, delete, preview, and folder upload
 - **Desktop local sharing** — local share links for supported desktop files
 - **Proxy support and localization**

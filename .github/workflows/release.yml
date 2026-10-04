@@ -72,6 +72,16 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      - name: Attach license and third-party notices
+        if: matrix.name == 'Linux x64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./app/package.json').version")"
+          gh release upload "v$version" LICENSE THIRD_PARTY_NOTICES.md --clobber
+
   android:
     name: Android release build
     runs-on: ubuntu-24.04

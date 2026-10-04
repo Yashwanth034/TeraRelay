@@ -46,8 +46,10 @@ These measurements are test results, not guaranteed speeds. See [PERFORMANCE.md]
 - Android ARM64: signed APK and AAB, with signature verification in release CI
 - iOS: simulator build validation only
 
-### Security and release hygiene
+### Security, licensing, and release hygiene
 
+- Proprietary TeraRelay license with explicit permission to use official unmodified binaries
+- Separate third-party license/notices inventory
 - Public-source hygiene checks
 - Session, credential, signing-key, local-data, cache, and QA-output exclusions
 - npm high-severity audit check

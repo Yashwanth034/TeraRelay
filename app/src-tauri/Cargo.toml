@@ -3,6 +3,9 @@ name = "terarelay"
 version = "0.1.0"
 description = "TeraRelay private Telegram-backed file storage client."
 authors = ["Yashwanth"]
+license-file = "../../LICENSE"
+repository = "https://github.com/Yashwanth034/TeraRelay"
+homepage = "https://github.com/Yashwanth034/TeraRelay"
 edition = "2021"
 
 

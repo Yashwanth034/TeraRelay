@@ -12,6 +12,7 @@
   <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Yashwanth034/TeraRelay?display_name=tag"></a>
   <a href="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml"><img alt="Cross-platform CI" src="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><img alt="Downloads" src="https://img.shields.io/github/downloads/Yashwanth034/TeraRelay/total"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-proprietary-red"></a>
 </p>
 
 <p align="center">
@@ -202,6 +203,7 @@ What is deliberately **not** claimed in v0.1.0:
 
 ## Documentation
 
+- [Project license](LICENSE)
 - [Changelog](CHANGELOG.md)
 - [Security model and advisories](SECURITY.md)
 - [Support and reporting](.github/SUPPORT.md)
@@ -211,6 +213,8 @@ What is deliberately **not** claimed in v0.1.0:
 
 ## License
 
-TeraRelay v0.1.0 does **not** grant an open-source license for TeraRelay's original source code. Copyright and other rights remain with the project owner unless a project license is added later.
+TeraRelay's original source code is **proprietary and All Rights Reserved**. The public repository is source-visible for inspection, evaluation, and security review; it is **not** an open-source license grant.
 
-Third-party dependencies remain subject to their own licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Official, unmodified TeraRelay binary releases may be downloaded, installed, and used for lawful personal or internal business use under the project terms. See [LICENSE](LICENSE) for the complete permissions and restrictions.
+
+Third-party dependencies remain subject to their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

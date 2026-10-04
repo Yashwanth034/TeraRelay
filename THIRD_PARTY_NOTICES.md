@@ -40,4 +40,4 @@ Their upstream license terms and package documentation continue to apply.
 
 Before publishing binary artifacts, maintainers should regenerate/review the resolved dependency inventory, retain required copyright/license notices, and include any notices required by the exact versions distributed.
 
-TeraRelay's original source code is not granted an open-source license in v0.1.0. This does not alter or restrict the separate licenses and notices that apply to third-party software.
+TeraRelay's original source code is governed by the proprietary [LICENSE](LICENSE) at the repository root. That license does not alter or restrict the separate licenses and notices that apply to third-party software.

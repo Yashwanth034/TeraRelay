@@ -1,6 +1,10 @@
 {
   "name": "terarelay",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Yashwanth",
+  "repository": "https://github.com/Yashwanth034/TeraRelay",
+  "homepage": "https://github.com/Yashwanth034/TeraRelay",
   "version": "0.1.0",
   "type": "module",
   "scripts": {

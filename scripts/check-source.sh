@@ -6,6 +6,22 @@ cd "$ROOT"
 
 tracked="$(git ls-files)"
 
+required_public_files=(
+  "README.md"
+  "LICENSE"
+  "SECURITY.md"
+  "PERFORMANCE.md"
+  "THIRD_PARTY_NOTICES.md"
+  "CHANGELOG.md"
+)
+
+for required_file in "${required_public_files[@]}"; do
+  if [[ ! -f "$required_file" ]]; then
+    echo "Required public/release file is missing: $required_file"
+    exit 1
+  fi
+done
+
 if printf '%s\n' "$tracked" | grep -Ei '(^|/)(\.env($|\.)|.*\.session$|shares\.db$|.*\.(pem|p8|p12|jks|keystore|mobileprovision|provisionprofile)$|keystore\.properties$)' >/dev/null; then
   echo "Sensitive runtime/signing file is tracked by Git"
   printf '%s\n' "$tracked" | grep -Ei '(^|/)(\.env($|\.)|.*\.session$|shares\.db$|.*\.(pem|p8|p12|jks|keystore|mobileprovision|provisionprofile)$|keystore\.properties$)' || true

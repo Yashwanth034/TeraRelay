@@ -1,0 +1,62 @@
+# TeraRelay Proprietary License
+
+Copyright (c) 2026 Yashwanth. All rights reserved.
+
+This license applies to TeraRelay's original source code and project materials.
+Third-party software remains governed by its own license terms.
+
+## 1. Permission to use official releases
+
+You may download, install, and run official, unmodified TeraRelay binary releases
+published by the copyright holder for lawful personal use or internal business use.
+
+You may also clone, view, and locally build the publicly available TeraRelay source
+code for evaluation, testing, security review, learning about the project, and
+preparing contributions for possible submission to this repository.
+
+## 2. Restrictions
+
+Except where applicable law expressly permits otherwise, you may not, without prior
+written permission from the copyright holder:
+
+- publish, redistribute, sublicense, sell, rent, lease, or commercially exploit
+  TeraRelay's original source code or substantial portions of it;
+- distribute modified builds or derivative versions of TeraRelay;
+- use TeraRelay's original source code to create or distribute a competing or
+  derivative product or hosted service;
+- remove or alter copyright, license, attribution, or third-party notices; or
+- represent a modified or unofficial build as an official TeraRelay release.
+
+Local modifications for private evaluation, testing, security research, or
+contribution preparation are permitted, provided they are not distributed.
+
+## 3. GitHub access
+
+Access to this public repository does not grant additional intellectual property
+rights beyond this license, GitHub's applicable terms of service, or rights granted
+by applicable law.
+
+## 4. Third-party software
+
+Third-party software included in, linked by, or used to build TeraRelay remains
+subject to its own copyright notices and license terms. Nothing in this license
+changes, replaces, or restricts those third-party licenses.
+
+See THIRD_PARTY_NOTICES.md for a project-maintained summary.
+
+## 5. No warranty
+
+THE SOFTWARE AND PROJECT MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE
+FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN THE SOFTWARE.
+
+## 6. Additional permissions
+
+For redistribution, commercial licensing, derivative-product licensing, or other
+permissions not granted above, contact the repository owner:
+
+https://github.com/Yashwanth034/TeraRelay

@@ -35,6 +35,10 @@ cargo audit
 
 Known upstream advisories that cannot be resolved without breaking required functionality must be documented rather than hidden.
 
+### JavaScript build dependencies
+
+v0.1.1 locks `source-map-js` to 1.2.2 to address [GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q). The high-severity npm audit passed for this release. Continue checking the locked dependency graph before every release.
+
 ### Current upstream Rust advisories
 
 The current locked graph contains `hickory-proto 0.25.2` through Grammers' optional proxy DNS resolver and is reported by RustSec for `RUSTSEC-2026-0118` and `RUSTSEC-2026-0119`.

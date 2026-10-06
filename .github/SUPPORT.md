@@ -18,4 +18,4 @@ Use [GitHub private vulnerability reporting](https://github.com/Yashwanth034/Ter
 
 ## Platform scope
 
-The current public release is v0.1.0. Android is ARM64-only, and iOS is simulator-validated only; no signed physical-device IPA is published in v0.1.0.
+The current public release is v0.1.1. Android is ARM64-only, and iOS is simulator-validated only; no signed physical-device IPA is published in v0.1.1.

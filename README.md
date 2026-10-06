@@ -110,7 +110,7 @@ There is no separate TeraRelay cloud-storage account or remote file-storage back
 
 ## Downloads
 
-The current public release is **v0.1.0**.
+The current public release is **v0.1.1**.
 
 | Platform | Release status | Packages |
 | --- | --- | --- |
@@ -119,7 +119,7 @@ The current public release is **v0.1.0**.
 | macOS Apple Silicon | ✅ Packaged and release-validated | DMG, app archive |
 | macOS Intel | ✅ Packaged and release-validated | DMG, app archive |
 | Android ARM64 | ✅ Signed and release-validated | APK, AAB |
-| iOS | ⚠️ Simulator build validated only | No signed device IPA in v0.1.0 |
+| iOS | ⚠️ Simulator build validated only | No signed device IPA in v0.1.1 |
 
 **Download:** [GitHub Releases →](https://github.com/Yashwanth034/TeraRelay/releases/latest)
 
@@ -191,12 +191,12 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark conditions and limitation
 5. Use Personal Vault or create/join a TeraRelay channel.
 6. Upload and manage files normally; TeraRelay handles the Telegram storage details.
 
-### v0.1.0 platform notes
+### v0.1.1 platform notes
 
 - **Android:** ARM64 only.
 - **iOS:** simulator build validation only; physical-device/App Store distribution requires Apple signing/provisioning.
 - **Desktop signing:** v0.1.1 is distributed through GitHub Releases rather than an OS app store; platform reputation/security prompts may appear depending on the OS.
-- **Worldwide public sharing:** not enabled in v0.1.0. Desktop share links are local application features.
+- **Worldwide public sharing:** not enabled in v0.1.1. Desktop share links are local application features.
 
 ## Security model
 
@@ -252,12 +252,12 @@ Cross-platform CI also validates Linux, Windows, macOS, Android ARM64, and the i
 
 ## Project status
 
-**v0.1.0** is the first public release.
+**v0.1.1** is the current stable release. **v0.1.0** was the first public release.
 
-What is deliberately **not** claimed in v0.1.0:
+Current v0.1.1 limitations:
 
 - Telegram cloud storage is not end-to-end encrypted.
-- Android 32-bit ABIs are not part of the v0.1.0 release.
+- Android 32-bit ABIs are not part of the v0.1.1 release.
 - iOS physical-device/App Store distribution is not published.
 - Worldwide public file sharing is not implemented.
 - Cross-platform build/package validation is not the same as exhaustive device/runtime testing.

@@ -2,6 +2,25 @@
 
 All notable public changes to TeraRelay are documented here.
 
+## [0.1.1] - 2026-10-06
+
+### Transfers and playback
+
+- Improved native upload/download progress and speed reporting.
+- Persist transfer queues across restarts and reuse confirmed upload parts after checking the source file.
+- Validate multipart ordering, sizes, checksums, and manifest capacity, including part counts beyond 999.
+- Preserve existing destination files until downloads are complete and verified.
+- Support ZIP64 folder archives with files over 4 GiB.
+- Show full multipart movie duration and seek across parts while preserving audio selection and pause state.
+
+### Release validation and security
+
+- Patched the source-map-js build dependency to 1.2.2; generated frontend output is unchanged.
+- Install FFmpeg for CI media tests, limit Rust test duration, and support source-only checks without rebuilding installers.
+- Published Linux, Windows, macOS Apple Silicon/Intel, and signed Android ARM64 packages with SHA-256 checksums.
+- iOS simulator validation passed; no signed physical-device IPA is included.
+- Large-file recovery and reconstruction checks passed; no 1 TB/5 TB live Telegram transfer or guaranteed throughput is claimed.
+
 ## [0.1.0] - 2026-10-03
 
 First public release.
@@ -65,4 +84,5 @@ These measurements are test results, not guaranteed speeds. See [PERFORMANCE.md]
 - Worldwide public file sharing is not implemented
 - Cross-platform build/package validation is not exhaustive runtime/device testing
 
+[0.1.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.0

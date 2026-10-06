@@ -173,7 +173,7 @@ jobs:
 
           cat > src-tauri/gen/android/keystore.properties <<EOF
           keyAlias=$ANDROID_KEY_ALIAS
-          password=$ANDROID_KEY_PASSWORD
+          password=${ANDROID_KEY_PASSWORD}
           storeFile=$key_file
           storeType=PKCS12
           EOF

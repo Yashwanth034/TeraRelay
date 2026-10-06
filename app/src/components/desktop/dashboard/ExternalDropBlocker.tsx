@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, CheckCircle2 } from 'lucide-react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { DragDropOverlay } from './DragDropOverlay';
 
 /**
@@ -24,34 +24,51 @@ export function ExternalDropBlocker({ onFilesDropped, onUploadClick, disabled = 
     onFilesDroppedRef.current = onFilesDropped;
     disabledRef.current = disabled;
 
-    // Listen for file-dropped events emitted from Rust on_navigation handler.
-    // This catches file drops on Linux window managers that bypass DOM drag events
-    // and instead pass files as application-level file-open events.
+    // Native Tauri drag/drop supplies real absolute filesystem paths.
+    // Linux enables this at the webview level in tauri.linux.conf.json; platforms
+    // that keep native drag/drop disabled continue to use the DOM fallback below.
     useEffect(() => {
-        let unlisten: UnlistenFn | undefined;
+        let unlisten: (() => void) | undefined;
         let messageTimeout: ReturnType<typeof setTimeout>;
 
         (async () => {
             try {
-                unlisten = await listen<string>('file-dropped', (event) => {
+                unlisten = await getCurrentWebview().onDragDropEvent((event) => {
                     if (disabledRef.current) return;
-                    const path = event.payload;
-                    if (path && typeof path === 'string' && path.length > 0) {
-                        onFilesDroppedRef.current?.([path]);
-                        // Show the same visual confirmation as DOM-based drops
-                        clearTimeout(messageTimeout);
-                        setDroppedCount(1);
-                        messageTimeout = setTimeout(() => setDroppedCount(null), 2000);
+
+                    if (event.payload.type === 'enter' || event.payload.type === 'over') {
+                        setIsDragging(true);
+                        return;
+                    }
+
+                    if (event.payload.type === 'leave') {
+                        setIsDragging(false);
+                        return;
+                    }
+
+                    if (event.payload.type === 'drop') {
+                        setIsDragging(false);
+                        const paths = Array.from(new Set(
+                            event.payload.paths.filter(path => typeof path === 'string' && path.length > 0),
+                        ));
+
+                        if (paths.length > 0) {
+                            onFilesDroppedRef.current?.(paths);
+                            clearTimeout(messageTimeout);
+                            setDroppedCount(paths.length);
+                            messageTimeout = setTimeout(() => setDroppedCount(null), 2000);
+                        }
                     }
                 });
-            } catch (e) {
-                // listen() throws only if the event name is invalid — shouldn't happen
-                console.warn('[ExternalDropBlocker] Failed to listen for file-dropped event:', e);
+            } catch (error) {
+                // Native drag/drop is intentionally disabled on some platforms;
+                // the DOM fallback below remains available there.
+                console.debug('[ExternalDropBlocker] Native drag/drop unavailable:', error);
             }
         })();
 
         return () => {
-            if (unlisten) unlisten();
+            unlisten?.();
             clearTimeout(messageTimeout);
         };
     }, []);

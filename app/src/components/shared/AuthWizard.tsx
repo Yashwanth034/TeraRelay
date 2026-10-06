@@ -404,6 +404,9 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                 className="w-full rounded-xl border border-telegram-border bg-telegram-bg/70 py-3 pl-10 pr-3 text-sm text-telegram-text outline-none transition focus:border-telegram-primary/60"
                                             />
                                         </div>
+                                        <span className="mt-1.5 block text-[11px] leading-relaxed text-telegram-subtext">
+                                            Include your country code, for example +91 98765 43210.
+                                        </span>
                                     </label>
 
                                     {hasSavedCredentials && (

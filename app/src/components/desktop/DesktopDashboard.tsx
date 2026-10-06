@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
 import { TelegramFile, BandwidthStats, ShareInfo } from '../../types';
-import { formatBytes, getFileCategory, isMediaFile, isPdfFile, isArchiveFile, nativeShareOrCopy, copyToClipboard, type FileCategory } from '../../utils';
+import { formatBytes, getFileCategory, isMediaFile, isVideoFile, isPdfFile, isArchiveFile, nativeShareOrCopy, copyToClipboard, type FileCategory } from '../../utils';
 
 // Components
 import { Sidebar } from './dashboard/Sidebar';
@@ -132,22 +132,24 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const {
         uploadQueue,
-        setUploadQueue,
         handleManualUpload,
         handleFolderUpload,
         handleDropUpload,
         handleUrlUpload,
         cancelAll: cancelUploads,
         cancelItem: cancelUploadItem,
+        pauseItem: pauseUploadItem,
+        resumeItem: resumeUploadItem,
         retryItem: retryUploadItem,
     } = useFileUpload(activeFolderId, store);
     const {
         downloadQueue,
         queueDownload,
         queueBulkDownload,
-        clearFinished: clearDownloads,
         cancelAll: cancelDownloads,
         cancelItem: cancelDownloadItem,
+        pauseItem: pauseDownloadItem,
+        resumeItem: resumeDownloadItem,
         retryItem: retryDownloadItem,
     } = useFileDownload(store);
 
@@ -396,8 +398,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     });
 
     const handlePreview = (file: TelegramFile, orderedFiles?: TelegramFile[]) => {
-        if (file.is_split) {
-            // Split files span multiple Telegram messages; preview/streaming work on a single one
+        if (file.is_split && !isVideoFile(file.name)) {
+            // Other split previews still require reconstruction before opening.
             toast.info('This file is stored in multiple parts. Download it to open it.');
             return;
         }
@@ -823,20 +825,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             )}
 
 
-            <UploadQueue
-                items={uploadQueue}
-                onClearFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
-                onCancelAll={cancelUploads}
-                onCancelItem={cancelUploadItem}
-                onRetryItem={retryUploadItem}
-            />
-            <DownloadQueue
-                items={downloadQueue}
-                onClearFinished={clearDownloads}
-                onCancelAll={cancelDownloads}
-                onCancelItem={cancelDownloadItem}
-                onRetryItem={retryDownloadItem}
-            />
+            {(uploadQueue.length > 0 || downloadQueue.length > 0) && (
+                <div className="fixed bottom-24 right-5 z-[100] flex max-h-[calc(100vh-8rem)] w-[380px] max-w-[calc(100vw-2.5rem)] flex-col gap-3 overflow-y-auto">
+                    <UploadQueue
+                        items={uploadQueue}
+                        onCancelAll={cancelUploads}
+                        onCancelItem={cancelUploadItem}
+                        onPauseItem={pauseUploadItem}
+                        onResumeItem={resumeUploadItem}
+                        onRetryItem={retryUploadItem}
+                    />
+                    <DownloadQueue
+                        items={downloadQueue}
+                        onCancelAll={cancelDownloads}
+                        onCancelItem={cancelDownloadItem}
+                        onPauseItem={pauseDownloadItem}
+                        onResumeItem={resumeDownloadItem}
+                        onRetryItem={retryDownloadItem}
+                    />
+                </div>
+            )}
 
             {activeChannel && activeFolderId !== null && (
                 <ChannelInfoPanel

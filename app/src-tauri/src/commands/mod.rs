@@ -48,6 +48,7 @@ pub mod secure_credentials;
 pub mod settings;
 pub mod sharing;
 pub mod streaming;
+pub mod transfers;
 pub mod utils;
 pub mod video_metadata;
 

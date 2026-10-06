@@ -1,7 +1,10 @@
+use crate::commands::streaming::StreamConfig;
 use crate::commands::utils::resolve_peer;
 use crate::mp4_utils;
+use crate::transcode::TranscodeManager;
 use crate::TelegramState;
 use grammers_client::types::Media;
+use std::sync::Arc;
 use tauri::State;
 
 #[derive(serde::Serialize)]
@@ -12,6 +15,24 @@ pub struct VideoMetadata {
     pub track_count: usize,
     pub width: Option<u32>,
     pub height: Option<u32>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct MediaTrackInfo {
+    pub index: i32,
+    pub kind: String,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub channels: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+pub struct MediaTrackProbe {
+    pub audio_tracks: Vec<MediaTrackInfo>,
+    pub subtitle_tracks: Vec<MediaTrackInfo>,
+    pub duration_secs: Option<f64>,
+    pub start_time_secs: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -49,6 +70,203 @@ pub async fn cmd_get_video_metadata(
         width,
         height,
     })
+}
+
+#[tauri::command]
+pub async fn cmd_probe_media_tracks(
+    message_id: i32,
+    folder_id: Option<i64>,
+    config: State<'_, StreamConfig>,
+) -> Result<MediaTrackProbe, String> {
+    let folder_segment = folder_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "home".to_string());
+    let stream_url = format!(
+        "http://localhost:{}/stream/{}/{}?token={}",
+        config.port,
+        folder_segment,
+        message_id,
+        urlencoding::encode(&config.token)
+    );
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        tokio::process::Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-show_entries")
+            .arg("format=duration,start_time:stream=index,codec_type,codec_name,channels:stream_tags=language,title")
+            .arg("-of")
+            .arg("json")
+            .arg(&stream_url)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "FFprobe timed out while reading media tracks".to_string())?
+    .map_err(|e| format!("FFprobe is unavailable: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFprobe failed: {}", stderr.trim()));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("Invalid FFprobe JSON: {e}"))?;
+
+    Ok(parse_media_track_probe(parsed))
+}
+
+fn finite_probe_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .filter(|n| n.is_finite())
+}
+
+fn parse_media_track_probe(parsed: serde_json::Value) -> MediaTrackProbe {
+    let mut audio_tracks = Vec::new();
+    let mut subtitle_tracks = Vec::new();
+
+    for stream in parsed
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(index) = stream.get("index").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let kind = stream
+            .get("codec_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if kind != "audio" && kind != "subtitle" {
+            continue;
+        }
+
+        let tags = stream.get("tags").and_then(serde_json::Value::as_object);
+        let track = MediaTrackInfo {
+            index: index as i32,
+            kind: kind.clone(),
+            codec: stream
+                .get("codec_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            language: tags
+                .and_then(|value| value.get("language"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            title: tags
+                .and_then(|value| value.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            channels: stream
+                .get("channels")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32),
+        };
+
+        if kind == "audio" {
+            audio_tracks.push(track);
+        } else {
+            subtitle_tracks.push(track);
+        }
+    }
+
+    MediaTrackProbe {
+        audio_tracks,
+        subtitle_tracks,
+        duration_secs: finite_probe_number(&parsed["format"]["duration"]).filter(|n| *n > 0.0),
+        start_time_secs: finite_probe_number(&parsed["format"]["start_time"]),
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_prepare_subtitle_track(
+    message_id: i32,
+    folder_id: Option<i64>,
+    stream_index: i32,
+    config: State<'_, StreamConfig>,
+    manager: State<'_, Arc<TranscodeManager>>,
+) -> Result<String, String> {
+    if stream_index < 0 {
+        return Err("Invalid subtitle stream index".to_string());
+    }
+
+    let folder_value = folder_id.unwrap_or(0);
+    let folder_segment = folder_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "home".to_string());
+    let file_key = format!("{}_{}", folder_value, message_id);
+    let output_dir = manager.cache_root.join("subtitles").join(&file_key);
+    let output_path = output_dir.join(format!("{stream_index}.vtt"));
+
+    if output_path.exists()
+        && std::fs::metadata(&output_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false)
+    {
+        return Ok(format!("/subtitle/{file_key}/{stream_index}.vtt"));
+    }
+
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("Failed to create subtitle cache: {e}"))?;
+
+    let stream_url = format!(
+        "http://localhost:{}/stream/{}/{}?token={}",
+        config.port,
+        folder_segment,
+        message_id,
+        urlencoding::encode(&config.token)
+    );
+
+    let ffmpeg_path = manager
+        .ffmpeg_path
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        tokio::process::Command::new(ffmpeg_path)
+            .arg("-y")
+            .arg("-v")
+            .arg("error")
+            .arg("-i")
+            .arg(&stream_url)
+            .arg("-map")
+            .arg(format!("0:{stream_index}"))
+            .arg("-vn")
+            .arg("-an")
+            .arg("-c:s")
+            .arg("webvtt")
+            .arg(&output_path)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Subtitle extraction timed out".to_string())?
+    .map_err(|e| format!("Failed to launch FFmpeg for subtitles: {e}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Subtitle conversion failed: {}", stderr.trim()));
+    }
+
+    if !output_path.exists()
+        || std::fs::metadata(&output_path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true)
+    {
+        let _ = std::fs::remove_file(&output_path);
+        return Err("Subtitle conversion produced no output".to_string());
+    }
+
+    Ok(format!("/subtitle/{file_key}/{stream_index}.vtt"))
 }
 
 #[tauri::command]
@@ -202,4 +420,30 @@ fn parse_mp4_metadata(buffer: &[u8]) -> Result<ParsedMetadata, String> {
         has_audio,
         track_count: context.tracks.len(),
     })
+}
+
+#[cfg(test)]
+mod track_probe_tests {
+    use super::*;
+    #[test]
+    fn track_probe_keeps_complete_source_duration_and_selected_track_metadata() {
+        let probe = parse_media_track_probe(serde_json::json!({
+            "format":{"duration":"7200.064","start_time":"-0.064"},
+            "streams":[{"index":2,"codec_type":"audio","codec_name":"aac","channels":2,"tags":{"language":"tel"}},
+                       {"index":3,"codec_type":"subtitle","codec_name":"subrip"}]
+        }));
+        assert_eq!(probe.duration_secs, Some(7200.064));
+        assert_eq!(probe.start_time_secs, Some(-0.064));
+        assert_eq!(probe.audio_tracks[0].index, 2);
+        assert_eq!(probe.audio_tracks[0].language.as_deref(), Some("tel"));
+        assert_eq!(probe.subtitle_tracks[0].index, 3);
+    }
+    #[test]
+    fn unknown_or_nonfinite_duration_does_not_create_a_false_movie_length() {
+        for duration in ["N/A", "NaN", "inf", "-1", "0"] {
+            let probe =
+                parse_media_track_probe(serde_json::json!({"format":{"duration":duration}}));
+            assert_eq!(probe.duration_secs, None);
+        }
+    }
 }

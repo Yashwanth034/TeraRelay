@@ -58,6 +58,7 @@ use tokio::sync::Mutex;
 
 pub mod api_routes;
 pub mod db;
+mod download_output;
 pub mod fmp4_remux;
 pub mod mp4_utils;
 pub mod server;
@@ -510,9 +511,15 @@ pub fn run() {
             commands::cmd_delete_saved_api_credentials,
             commands::cmd_get_files,
             commands::cmd_upload_file,
+            commands::transfers::cmd_load_transfer_queue,
+            commands::transfers::cmd_save_transfer_queue,
             commands::initiate_upload,
             tdlib_fast::cmd_fast_transfer_status,
             tdlib_fast::cmd_fast_transfer_prepare_saved,
+            tdlib_fast::cmd_fast_transfer_prepare_manual_saved,
+            tdlib_fast::cmd_fast_transfer_phone,
+            tdlib_fast::cmd_fast_transfer_code,
+            tdlib_fast::cmd_fast_transfer_password,
             tdlib_fast::cmd_fast_transfer_logout_saved,
             commands::cmd_upload_from_url,
             cmd_open_file_externally,
@@ -565,6 +572,8 @@ pub fn run() {
             commands::cmd_get_tera_channel_members,
             cmd_get_system_diagnostics,
             commands::cmd_get_video_metadata,
+            commands::cmd_probe_media_tracks,
+            commands::cmd_prepare_subtitle_track,
             commands::cmd_get_video_metadata_batch,
             transcode::cmd_get_transcode_capabilities,
             transcode::cmd_prepare_transcoded_stream,
@@ -578,6 +587,7 @@ pub fn run() {
             transcode::cmd_clear_transcode_cache,
             fmp4_remux::cmd_prepare_fmp4_stream,
             fmp4_remux::cmd_get_fmp4_status,
+            fmp4_remux::cmd_cancel_fmp4_stream,
             commands::cmd_list_archive_contents,
             commands::cmd_extract_archive_entry,
             commands::cmd_get_enriched_folders,

@@ -21,8 +21,8 @@ interface MediaPlayerProps {
     activeFolderId: number | null;
 }
 
-function isMp4Video(name: string): boolean {
-    return name.toLowerCase().endsWith('.mp4');
+function shouldPreferFmp4Remux(name: string): boolean {
+    return /\.(mkv|mov|avi)$/i.test(name);
 }
 
 export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, totalItems, activeFolderId }: MediaPlayerProps) {
@@ -76,9 +76,9 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
 
     const isVideo = isVideoFile(file.name);
     const isAudio = isAudioFile(file.name);
-    const isMp4 = isMp4Video(file.name);
 
     useEffect(() => {
+        if (isVideo) return;
         const handleKeyDown = (e: KeyboardEvent) => {
             const target = e.target as HTMLElement;
             if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
@@ -128,10 +128,11 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [onClose, onNext, onPrev, toggleFullscreen]);
+    }, [onClose, onNext, onPrev, toggleFullscreen, isVideo]);
 
-    // MP4 files: use adaptive streaming with quality controls + throttling
-    if (isMp4 && streamUrl) {
+    // All video containers use the adaptive player. MP4 uses the direct MSE
+    // path; MKV/MOV/AVI/WebM first try the fast no-reencode fMP4 remux path.
+    if (isVideo && streamUrl) {
         return (
             <AdaptiveMediaPlayer
                 file={file}
@@ -142,6 +143,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
                 onPrev={onPrev}
                 currentIndex={currentIndex}
                 totalItems={totalItems}
+                preferRemux={shouldPreferFmp4Remux(file.name)}
             />
         );
     }

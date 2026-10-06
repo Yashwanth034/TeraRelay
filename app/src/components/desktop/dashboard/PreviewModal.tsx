@@ -3,7 +3,12 @@ import { X, File, ChevronLeft, ChevronRight } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../../types';
-import { isImageFile } from '../../../utils';
+import { isAndroidPlatform, isImageFile } from '../../../utils';
+
+interface StreamInfo {
+    token: string;
+    base_url: string;
+}
 
 const PREVIEW_CACHE_TTL_MS = 5 * 60 * 1000;
 const PREVIEW_CACHE_MAX_ITEMS = 8;
@@ -50,7 +55,7 @@ const forgetPreview = (key: string) => {
     previewCache.delete(key);
 };
 
-const isSafeToPrefetch = (name: string) => isImageFile(name);
+const isSafeToPrefetch = (name: string) => isAndroidPlatform && isImageFile(name);
 
 interface PreviewModalProps {
     file: TelegramFile;
@@ -69,11 +74,13 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const latestRequestRef = useRef(0);
+    const streamFallbackRef = useRef(false);
 
     useEffect(() => {
         const load = async () => {
             const key = getPreviewCacheKey(file.id, activeFolderId);
             const requestId = ++latestRequestRef.current;
+            streamFallbackRef.current = false;
             const cachedSrc = getCachedPreview(key);
 
             if (cachedSrc) {
@@ -87,6 +94,18 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
             setLoading(true);
             setError(null);
             try {
+                // Desktop images can render straight from the authenticated
+                // localhost stream. This avoids downloading the full image,
+                // converting it to base64, and duplicating it in WebView memory.
+                if (!isAndroidPlatform && isImageFile(file.name)) {
+                    const streamInfo = await invoke<StreamInfo>('cmd_get_stream_info');
+                    if (requestId !== latestRequestRef.current) return;
+                    const folderIdParam = activeFolderId !== null ? activeFolderId.toString() : 'home';
+                    setSrc(`${streamInfo.base_url}/stream/${folderIdParam}/${file.id}?token=${streamInfo.token}`);
+                    setLoading(false);
+                    return;
+                }
+
                 const path = await invoke<string>('cmd_get_preview', {
                     messageId: file.id,
                     folderId: activeFolderId
@@ -221,8 +240,39 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                                 src={src}
                                 className="max-w-full max-h-[85vh] object-contain rounded-lg shadow-2xl bg-black"
                                 alt="Preview"
-                                onError={() => {
+                                onError={async () => {
                                     const key = getPreviewCacheKey(file.id, activeFolderId);
+
+                                    if (
+                                        !isAndroidPlatform
+                                        && src.startsWith('http://')
+                                        && !streamFallbackRef.current
+                                    ) {
+                                        streamFallbackRef.current = true;
+                                        setLoading(true);
+                                        try {
+                                            const path = await invoke<string>('cmd_get_preview', {
+                                                messageId: file.id,
+                                                folderId: activeFolderId,
+                                            });
+                                            if (!path) {
+                                                throw new Error('Preview not available');
+                                            }
+                                            const fallbackSrc = path.startsWith('data:')
+                                                ? path
+                                                : convertFileSrc(path);
+                                            rememberPreview(key, fallbackSrc);
+                                            setSrc(fallbackSrc);
+                                            setError(null);
+                                        } catch (e) {
+                                            forgetPreview(key);
+                                            setError(String(e));
+                                        } finally {
+                                            setLoading(false);
+                                        }
+                                        return;
+                                    }
+
                                     forgetPreview(key);
                                     setError('Failed to render image preview');
                                 }}

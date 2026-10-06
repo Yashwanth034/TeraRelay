@@ -194,14 +194,16 @@ impl NativeWorker {
         })
     }
 
-    fn request<F>(
+    fn request<F, N>(
         &mut self,
         mut request: Value,
         mut on_progress: F,
+        mut on_network: N,
         cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> Result<Value, String>
     where
         F: FnMut(u64),
+        N: FnMut(u64),
     {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -239,6 +241,29 @@ impl NativeWorker {
                         if delta > 0 {
                             on_progress(delta);
                         }
+                    }
+                }
+                continue;
+            }
+
+            if event == Some("network") {
+                if response.get("id").and_then(Value::as_u64) == Some(id) {
+                    if let Some(delta) = response.get("delta").and_then(Value::as_u64) {
+                        if delta > 0 {
+                            on_network(delta);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if event == Some("speed_limit") {
+                if response.get("id").and_then(Value::as_u64) == Some(id) {
+                    if let Some(is_upload) = response.get("is_upload").and_then(Value::as_bool) {
+                        log::warn!(
+                            "TDLib {} speed limited by Telegram (updateSpeedLimitNotification)",
+                            if is_upload { "upload" } else { "download" }
+                        );
                     }
                 }
                 continue;
@@ -319,6 +344,31 @@ fn read_worker_line(reader: &mut BufReader<ChildStdout>) -> Result<Value, String
 
 fn platform_supported() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
+}
+
+fn is_tdlib_unauthorized(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("tdlib error 401") || normalized.contains("unauthorized")
+}
+
+async fn reset_tdlib_authorization(
+    app: &tauri::AppHandle,
+    state: &TdlibFastState,
+) -> Result<(), String> {
+    abort_worker(state).await;
+
+    let session_dir = app_data_dir(app)?.join(SESSION_DIR_NAME);
+    match tokio::fs::remove_dir_all(&session_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to reset stale TDLib authorization: {error}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn secure_dir(path: &Path) -> Result<(), String> {
@@ -601,7 +651,7 @@ async fn authorize_tdlib_from_existing_session(
         let worker = guard
             .as_mut()
             .ok_or_else(|| "TDLib setup has not been started.".to_string())?;
-        let result = worker.request(json!({"action": "qr_start"}), |_| {}, None)?;
+        let result = worker.request(json!({"action": "qr_start"}), |_| {}, |_| {}, None)?;
         worker.update_auth_from_result(&result);
         Ok::<Value, String>(result)
     })
@@ -646,7 +696,7 @@ async fn authorize_tdlib_from_existing_session(
         let worker = guard
             .as_mut()
             .ok_or_else(|| "TDLib setup has not been started.".to_string())?;
-        let result = worker.request(json!({"action": "qr_wait"}), |_| {}, None)?;
+        let result = worker.request(json!({"action": "qr_wait"}), |_| {}, |_| {}, None)?;
         worker.update_auth_from_result(&result);
         Ok::<FastTransferStatus, String>(worker.status(true))
     })
@@ -696,7 +746,12 @@ async fn prepare_worker(
         }
 
         let worker = guard.as_mut().expect("worker initialized");
-        let result = worker.request(json!({"action": "prepare", "timeout": 15}), |_| {}, None)?;
+        let result = worker.request(
+            json!({"action": "prepare", "timeout": 15}),
+            |_| {},
+            |_| {},
+            None,
+        )?;
         worker.update_auth_from_result(&result);
         Ok::<FastTransferStatus, String>(worker.status(true))
     })
@@ -718,13 +773,26 @@ pub async fn cmd_fast_transfer_status(
             .lock()
             .map_err(|_| "TDLib worker lock poisoned".to_string())?;
         if let Some(worker) = guard.as_mut() {
-            let result = worker.request(
+            match worker.request(
                 json!({"action": "status", "timeout": 5}),
                 |_| {},
+                |_| {},
                 None,
-            )?;
-            worker.update_auth_from_result(&result);
-            return Ok(worker.status(runtime.installed));
+            ) {
+                Ok(result) => {
+                    worker.update_auth_from_result(&result);
+                    return Ok(worker.status(runtime.installed));
+                }
+                Err(error) if is_tdlib_unauthorized(&error) => {
+                    log::warn!(
+                        "TDLib saved authorization is no longer valid; it will be relinked automatically."
+                    );
+                    worker.ready = false;
+                    worker.auth_state = "unauthorized".to_string();
+                    return Ok(worker.status(runtime.installed));
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(FastTransferStatus {
@@ -759,8 +827,33 @@ async fn prepare_with_existing_session(
     api_hash: String,
     install: bool,
 ) -> Result<FastTransferStatus, String> {
-    let status = prepare_worker(app_handle, state, api_id, api_hash, install).await?;
-    if status.ready || status.auth_state != "phone" {
+    let mut status = match prepare_worker(app_handle, state, api_id, api_hash.clone(), install)
+        .await
+    {
+        Ok(status) => status,
+        Err(error) if is_tdlib_unauthorized(&error) => {
+            log::warn!(
+                "TDLib saved authorization was rejected; rebuilding it from the active TeraRelay login."
+            );
+            reset_tdlib_authorization(app_handle, state).await?;
+            prepare_worker(app_handle, state, api_id, api_hash.clone(), false).await?
+        }
+        Err(error) => return Err(error),
+    };
+
+    // Do not erase TDLib authorization just because startup has not reached
+    // Ready yet. Password/code states are valid authorization continuations,
+    // and transient startup/closing states must be allowed to settle. Only a
+    // confirmed 401 above, or an explicit manual-login fallback, resets the DB.
+    if status.auth_state == "closed" {
+        abort_worker(state).await;
+        status = prepare_worker(app_handle, state, api_id, api_hash.clone(), false).await?;
+    }
+
+    if status.ready
+        || matches!(status.auth_state.as_str(), "password" | "code")
+        || status.auth_state != "phone"
+    {
         return Ok(status);
     }
 
@@ -823,6 +916,26 @@ pub async fn cmd_fast_transfer_prepare_saved(
     .await
 }
 
+#[tauri::command]
+pub async fn cmd_fast_transfer_prepare_manual_saved(
+    app_handle: tauri::AppHandle,
+    state: State<'_, TdlibFastState>,
+    install: bool,
+) -> Result<FastTransferStatus, String> {
+    let credentials = crate::commands::secure_credentials::load_api_credentials(&app_handle)?;
+
+    reset_tdlib_authorization(&app_handle, state.inner()).await?;
+
+    prepare_worker(
+        &app_handle,
+        state.inner(),
+        credentials.api_id,
+        credentials.api_hash,
+        install,
+    )
+    .await
+}
+
 async fn auth_action(
     state: &TdlibFastState,
     action: &'static str,
@@ -837,7 +950,12 @@ async fn auth_action(
         let worker = guard
             .as_mut()
             .ok_or_else(|| "TDLib setup has not been started.".to_string())?;
-        let result = worker.request(json!({"action": action, field: value}), |_| {}, None)?;
+        let result = worker.request(
+            json!({"action": action, field: value}),
+            |_| {},
+            |_| {},
+            None,
+        )?;
         worker.update_auth_from_result(&result);
         Ok::<FastTransferStatus, String>(worker.status(true))
     })
@@ -897,7 +1015,8 @@ pub async fn cmd_fast_transfer_logout(
                         .lock()
                         .map_err(|_| "TDLib worker lock poisoned".to_string())?;
                     if let Some(worker) = guard.as_mut() {
-                        let result = worker.request(json!({"action": "logout"}), |_| {}, None);
+                        let result =
+                            worker.request(json!({"action": "logout"}), |_| {}, |_| {}, None);
                         guard.take();
                         result.map(|_| ())
                     } else {
@@ -919,6 +1038,11 @@ pub async fn cmd_fast_transfer_logout(
             }
         }
     }
+
+    // Always destroy the in-memory worker before removing its on-disk
+    // authorization database. A stale worker must never survive logout and
+    // be reused by the next Telegram login.
+    abort_worker(state.inner()).await;
 
     let app_data = app_data_dir(&app_handle)?;
     for path in [
@@ -948,6 +1072,7 @@ pub async fn upload_document(
     path: String,
     caption: String,
     bytes_counter: Arc<AtomicU64>,
+    network_counter: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<i64, String> {
     let worker_arc = state.worker.clone();
@@ -969,8 +1094,9 @@ pub async fn upload_document(
         );
         let started = std::time::Instant::now();
         let mut sample_started = started;
-        let mut sample_bytes = 0u64;
+        let mut sample_network_bytes = 0u64;
         let mut acknowledged_total = 0u64;
+        let progress_log_counter = bytes_counter.clone();
         let result = worker.request(
             json!({
                 "action": "upload",
@@ -982,16 +1108,19 @@ pub async fn upload_document(
             |delta| {
                 bytes_counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
                 acknowledged_total = acknowledged_total.saturating_add(delta);
-                sample_bytes = sample_bytes.saturating_add(delta);
+            },
+            |delta| {
+                network_counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+                sample_network_bytes = sample_network_bytes.saturating_add(delta);
                 let elapsed = sample_started.elapsed().as_secs_f64();
                 if elapsed >= 1.0 {
                     log::info!(
-                        "TDLib upload progress: acknowledged={} bytes, speed={:.2} MiB/s",
-                        acknowledged_total,
-                        sample_bytes as f64 / elapsed / (1024.0 * 1024.0)
+                        "TDLib upload acknowledged: file_progress={} bytes, speed={:.2} MiB/s",
+                        progress_log_counter.load(std::sync::atomic::Ordering::Relaxed),
+                        sample_network_bytes as f64 / elapsed / (1024.0 * 1024.0)
                     );
                     sample_started = std::time::Instant::now();
-                    sample_bytes = 0;
+                    sample_network_bytes = 0;
                 }
             },
             Some(&cancel_rx),
@@ -1041,6 +1170,7 @@ pub async fn download_documents(
     path: String,
     chunks: Vec<FastDownloadChunk>,
     bytes_counter: Arc<AtomicU64>,
+    network_counter: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<bool>,
     force: bool,
 ) -> Result<FastDownloadOutcome, String> {
@@ -1066,8 +1196,9 @@ pub async fn download_documents(
         );
         let started = std::time::Instant::now();
         let mut sample_started = started;
-        let mut sample_bytes = 0u64;
+        let mut sample_network_bytes = 0u64;
         let mut downloaded_total = 0u64;
+        let progress_log_counter = bytes_counter.clone();
 
         let result = worker.request(
             json!({
@@ -1076,21 +1207,24 @@ pub async fn download_documents(
                 "path": path,
                 "chunks": chunks,
                 "force": force,
-                "timeout": 7200,
+                "inactivity_timeout": 7200,
             }),
             |delta| {
                 bytes_counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
                 downloaded_total = downloaded_total.saturating_add(delta);
-                sample_bytes = sample_bytes.saturating_add(delta);
+            },
+            |delta| {
+                network_counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+                sample_network_bytes = sample_network_bytes.saturating_add(delta);
                 let elapsed = sample_started.elapsed().as_secs_f64();
                 if elapsed >= 1.0 {
                     log::info!(
-                        "TDLib download progress: received={} bytes, speed={:.2} MiB/s",
-                        downloaded_total,
-                        sample_bytes as f64 / elapsed / (1024.0 * 1024.0)
+                        "TDLib download network: file_progress={} bytes, speed={:.2} MiB/s",
+                        progress_log_counter.load(std::sync::atomic::Ordering::Relaxed),
+                        sample_network_bytes as f64 / elapsed / (1024.0 * 1024.0)
                     );
                     sample_started = std::time::Instant::now();
-                    sample_bytes = 0;
+                    sample_network_bytes = 0;
                 }
             },
             Some(&cancel_rx),
@@ -1160,7 +1294,7 @@ pub fn shutdown_worker(state: &TdlibFastState) {
         return;
     };
     if let Some(worker) = guard.as_mut() {
-        let _ = worker.request(json!({"action": "shutdown"}), |_| {}, None);
+        let _ = worker.request(json!({"action": "shutdown"}), |_| {}, |_| {}, None);
     }
     guard.take();
 }
@@ -1189,6 +1323,22 @@ pub async fn create_split_temp(
 
     let unique_dir = temp_root.join(format!("{}-{}", std::process::id(), rand::random::<u64>()));
     secure_dir(&unique_dir)?;
+    // An I/O failure must not retain a partial multi-gigabyte staging file.
+    struct FailedSplitCleanup {
+        directory: PathBuf,
+        keep: bool,
+    }
+    impl Drop for FailedSplitCleanup {
+        fn drop(&mut self) {
+            if !self.keep {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+    }
+    let mut cleanup = FailedSplitCleanup {
+        directory: unique_dir.clone(),
+        keep: false,
+    };
     // Keep the exact logical Telegram document name as the basename. TDLib uses
     // the local basename as the uploaded document filename.
     let destination = unique_dir.join(file_name);
@@ -1253,12 +1403,71 @@ pub async fn create_split_temp(
         copied as f64 / split_started.elapsed().as_secs_f64().max(0.001) / (1024.0 * 1024.0)
     );
 
+    cleanup.keep = true;
     Ok((destination, format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_sideband_notices_do_not_change_result_or_byte_counters() {
+        let script = r#"
+import json, sys
+request = json.loads(sys.stdin.readline())
+i = request["id"]
+events = [
+    {"event": "progress", "id": i + 1, "delta": 4096},
+    {"event": "network", "id": i + 1, "delta": 4096},
+    {"event": "speed_limit", "id": i, "is_upload": True},
+    {"event": "heartbeat", "id": i},
+    {"event": "progress", "id": i, "delta": 12},
+    {"event": "network", "id": i, "delta": 0},
+    {"event": "network", "id": i, "delta": 12},
+    {"event": "speed_limit", "id": i + 1, "is_upload": False},
+    {"event": "speed_limit", "id": i, "is_upload": "invalid"},
+    {"event": "result", "id": i + 1, "ok": True, "result": {}},
+    {"event": "result", "id": i, "ok": True,
+     "result": {"message_id": 700, "bytes_uploaded": 12}},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Python transfer fixture starts");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut worker = NativeWorker {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+            auth_state: "ready".to_string(),
+            ready: true,
+            is_premium: Some(false),
+        };
+        let mut progress = 0;
+        let mut network = 0;
+        let result = worker
+            .request(
+                json!({"action": "upload"}),
+                |bytes| progress += bytes,
+                |bytes| network += bytes,
+                None,
+            )
+            .unwrap();
+        assert_eq!(result, json!({"message_id": 700, "bytes_uploaded": 12}));
+        assert_eq!((progress, network), (12, 12));
+        assert_eq!(worker.auth_state, "ready");
+        assert!(worker.ready);
+        assert_eq!(worker.is_premium, Some(false));
+        worker.child.wait().unwrap();
+    }
 
     #[test]
     fn destination_json_is_stable() {
@@ -1276,6 +1485,13 @@ mod tests {
     fn pinned_hashes_have_expected_length() {
         assert_eq!(SQLCIPHER_SHA256.len(), 64);
         assert_eq!(TDJSON_SHA256.len(), 64);
+    }
+
+    #[test]
+    fn detects_expired_tdlib_authorization() {
+        assert!(is_tdlib_unauthorized("TDLib error 401: Unauthorized"));
+        assert!(is_tdlib_unauthorized("unauthorized"));
+        assert!(!is_tdlib_unauthorized("TDLib error 500: Internal"));
     }
 
     #[test]

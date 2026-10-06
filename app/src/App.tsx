@@ -19,6 +19,7 @@ import { ConfirmProvider } from "./context/ConfirmContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
 import { useSettings } from "./context/SettingsContext";
+import { FastTransferAuthProvider } from "./context/FastTransferAuthContext";
 import { useTranslation } from "react-i18next";
 
 const queryClient = new QueryClient();
@@ -176,7 +177,9 @@ function App() {
         <QueryClientProvider client={queryClient}>
           <ConfirmProvider>
             <SettingsProvider>
-              <AppContent />
+              <FastTransferAuthProvider>
+                <AppContent />
+              </FastTransferAuthProvider>
             </SettingsProvider>
           </ConfirmProvider>
         </QueryClientProvider>

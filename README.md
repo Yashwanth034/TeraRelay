@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download TeraRelay v0.1.0</strong></a>
+  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download TeraRelay v0.1.1</strong></a>
   ·
   <a href="SECURITY.md">Security</a>
   ·
@@ -188,7 +188,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark conditions and limitation
 
 - **Android:** ARM64 only.
 - **iOS:** simulator build validation only; physical-device/App Store distribution requires Apple signing/provisioning.
-- **Desktop signing:** v0.1.0 is distributed through GitHub Releases rather than an OS app store; platform reputation/security prompts may appear depending on the OS.
+- **Desktop signing:** v0.1.1 is distributed through GitHub Releases rather than an OS app store; platform reputation/security prompts may appear depending on the OS.
 - **Worldwide public sharing:** not enabled in v0.1.0. Desktop share links are local application features.
 
 ## Security model

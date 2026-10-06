@@ -288,10 +288,30 @@ pub fn get_enriched_folders_internal(
         .unwrap_or(0);
 
     for mut folder in raw_folders {
+        let telegram_confirms_owner = folder.role.as_deref() == Some("owner");
+
         if let Some((order, group_id, logical_name, logical_role)) = local_map.get(&folder.id) {
             folder.display_order = *order;
             folder.group_id = *group_id;
-            folder.role = logical_role.clone();
+
+            // Telegram's creator flag is authoritative enough to repair a stale
+            // local member classification (for example after a fresh profile
+            // rediscovers a channel that this account actually created).
+            if telegram_confirms_owner {
+                if logical_role.as_deref() != Some("owner") {
+                    let mut role_stmt = conn
+                        .prepare(
+                            "UPDATE logical_channels SET role = 'owner' WHERE backing_channel_id = ?",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    role_stmt.bind((1, folder.id)).map_err(|e| e.to_string())?;
+                    role_stmt.next().map_err(|e| e.to_string())?;
+                }
+                folder.role = Some("owner".to_string());
+            } else {
+                folder.role = logical_role.clone();
+            }
+
             if let Some(logical_name) = logical_name {
                 folder.name = logical_name.clone();
             }
@@ -339,16 +359,21 @@ pub fn get_enriched_folders_internal(
                 .map_err(|e| e.to_string())?;
             insert_stmt.next().map_err(|e| e.to_string())?;
 
-            // A channel discovered outside TeraRelay cannot safely be assumed
-            // to be owned by this installation. Treat it as a member binding
-            // unless TeraRelay itself created it through cmd_create_folder.
+            // A newly discovered channel is writable only when Telegram
+            // explicitly confirms that this logged-in account is the creator.
+            // Otherwise keep the conservative member/read-only classification.
+            let discovered_role = if telegram_confirms_owner {
+                "owner"
+            } else {
+                "member"
+            };
             crate::commands::logical_channels::ensure_logical_channel(
                 conn,
                 folder.id,
                 &folder.name,
-                "member",
+                discovered_role,
             )?;
-            folder.role = Some("member".to_string());
+            folder.role = Some(discovered_role.to_string());
         }
         enriched.push(folder);
     }
@@ -466,6 +491,65 @@ mod tests {
             .unwrap();
         assert!(matches!(stmt.next().unwrap(), sqlite::State::Row));
         assert_eq!(stmt.read::<String, _>(0).unwrap(), "member");
+    }
+
+    #[test]
+    fn newly_discovered_creator_is_owner_immediately() {
+        let conn = test_db();
+        let raw = FolderMetadata {
+            id: 457,
+            parent_id: None,
+            name: "owned [TR]".to_string(),
+            username: None,
+            is_public: false,
+            group_id: None,
+            display_order: 0,
+            role: Some("owner".to_string()),
+        };
+
+        let folders = get_enriched_folders_internal(&conn, vec![raw]).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].role.as_deref(), Some("owner"));
+
+        let mut stmt = conn
+            .prepare("SELECT role FROM logical_channels WHERE backing_channel_id = 457")
+            .unwrap();
+        assert!(matches!(stmt.next().unwrap(), sqlite::State::Row));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "owner");
+    }
+
+    #[test]
+    fn telegram_creator_repairs_stale_member_role() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO folder_metadata
+             (channel_id, name, username, is_public, display_order, group_id)
+             VALUES (458, 'owned', NULL, 0, 1, NULL);
+             INSERT INTO logical_channels
+             (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+             VALUES ('1123456789abcdef0123456789abcdef', 458, 'owned', 'member', 1, 1, 1);",
+        )
+        .unwrap();
+
+        let raw = FolderMetadata {
+            id: 458,
+            parent_id: None,
+            name: "owned [TR]".to_string(),
+            username: None,
+            is_public: false,
+            group_id: None,
+            display_order: 0,
+            role: Some("owner".to_string()),
+        };
+
+        let folders = get_enriched_folders_internal(&conn, vec![raw]).unwrap();
+        assert_eq!(folders[0].role.as_deref(), Some("owner"));
+
+        let mut stmt = conn
+            .prepare("SELECT role FROM logical_channels WHERE backing_channel_id = 458")
+            .unwrap();
+        assert!(matches!(stmt.next().unwrap(), sqlite::State::Row));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "owner");
     }
 
     #[test]

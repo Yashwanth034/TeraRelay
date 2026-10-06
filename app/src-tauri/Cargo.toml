@@ -1,6 +1,6 @@
 [package]
 name = "terarelay"
-version = "0.1.0"
+version = "0.1.1"
 description = "TeraRelay private Telegram-backed file storage client."
 authors = ["Yashwanth"]
 license-file = "../../LICENSE"

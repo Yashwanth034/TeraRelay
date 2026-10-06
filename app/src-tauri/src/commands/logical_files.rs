@@ -144,7 +144,10 @@ pub fn validate_manifest(
     let mut seen_messages = HashSet::new();
     let mut total = 0u64;
     for (zero_index, chunk) in manifest.chunks.iter().enumerate() {
-        let expected_index = zero_index as u32 + 1;
+        let expected_index = u32::try_from(zero_index)
+            .ok()
+            .and_then(|i| i.checked_add(1))
+            .ok_or_else(|| "Manifest part index overflow".to_string())?;
         if chunk.index != expected_index {
             return Err(format!(
                 "Manifest chunk order is invalid at index {}",
@@ -186,6 +189,52 @@ pub fn validate_manifest(
         if !valid_sha256(hash) {
             return Err("Manifest whole-file SHA-256 is invalid".to_string());
         }
+    }
+    Ok(())
+}
+
+/// Bound metadata before uploading any payload. The estimate uses maximum
+/// numeric widths and a checksum on every part, while preserving the bounded
+/// manifest parser shared with existing clients.
+pub fn ensure_upload_manifest_capacity(
+    channel_id: &str,
+    original_name: &str,
+    total_size: u64,
+    parts: u32,
+) -> Result<(), String> {
+    let header = LogicalFileManifestV1 {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        file_id: "0".repeat(32),
+        logical_channel_id: channel_id.to_string(),
+        original_name: original_name.to_string(),
+        total_size,
+        mime_type: mime_guess::from_path(original_name)
+            .first()
+            .map(|m| m.essence_str().to_string()),
+        created_at: i64::MAX,
+        whole_sha256: None,
+        chunks: Vec::new(),
+    };
+    let largest_chunk = ManifestChunkV1 {
+        index: u32::MAX,
+        message_id: i64::from(i32::MAX),
+        size: u64::MAX,
+        sha256: Some("0".repeat(64)),
+    };
+    let header_bytes = serde_json::to_vec(&header)
+        .map_err(|e| e.to_string())?
+        .len() as u64;
+    let per_chunk = serde_json::to_vec(&largest_chunk)
+        .map_err(|e| e.to_string())?
+        .len() as u64
+        + 1;
+    let estimated = u64::from(parts)
+        .checked_mul(per_chunk)
+        .and_then(|n| n.checked_add(header_bytes));
+    if parts == 0 || estimated.is_none_or(|n| n > MAX_MANIFEST_BYTES) {
+        return Err(format!(
+            "File requires {parts} storage parts; its metadata exceeds the supported manifest capacity. No file data was uploaded."
+        ));
     }
     Ok(())
 }
@@ -621,6 +670,34 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn large_manifest_round_trip_supports_a_ten_terabyte_single_file() {
+        let mut manifest = sample_manifest();
+        manifest.original_name = "backup.tar.zst".to_string();
+        manifest.chunks = (1..=5000)
+            .map(|index| ManifestChunkV1 {
+                index,
+                message_id: i64::from(index),
+                size: 2_000_000_000,
+                sha256: Some("a".repeat(64)),
+            })
+            .collect();
+        manifest.total_size = 10_000_000_000_000;
+        ensure_upload_manifest_capacity(
+            &manifest.logical_channel_id,
+            &manifest.original_name,
+            manifest.total_size,
+            5000,
+        )
+        .unwrap();
+        let bytes = encode_manifest(&manifest).unwrap();
+        assert!(bytes.len() as u64 <= MAX_MANIFEST_BYTES);
+        assert_eq!(decode_manifest(&bytes, None, None).unwrap(), manifest);
+        assert!(
+            ensure_upload_manifest_capacity("channel", "too-many.bin", u64::MAX, u32::MAX).is_err()
+        );
     }
 
     #[test]

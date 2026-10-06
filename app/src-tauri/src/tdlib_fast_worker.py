@@ -118,6 +118,32 @@ class Worker:
             "application_version": "0.1.0",
         }
 
+    def network_file_totals(self) -> tuple[int, int] | None:
+        """Return cumulative TDLib file-traffic bytes for this isolated worker.
+
+        TDLib's updateFile callbacks are deliberately coalesced and can be
+        several seconds apart. Network statistics are maintained independently
+        and let the UI reflect real file traffic between those callbacks.
+        """
+        try:
+            stats = self.td.request(
+                {"@type": "getNetworkStatistics", "only_current": True},
+                timeout=2,
+            )
+        except Exception:
+            return None
+
+        sent = 0
+        received = 0
+        for entry in stats.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("@type") != "networkStatisticsEntryFile":
+                continue
+            sent += max(0, int(entry.get("sent_bytes") or 0))
+            received += max(0, int(entry.get("received_bytes") or 0))
+        return sent, received
+
     def advance_auth(self, timeout: float = 25.0) -> str:
         if self.ready:
             return "ready"
@@ -133,6 +159,13 @@ class Worker:
             return "password"
         if self.auth_state == "authorizationStateWaitOtherDeviceConfirmation":
             return "qr"
+        if self.auth_state in {
+            "authorizationStateClosing",
+            "authorizationStateClosed",
+            "authorizationStateLoggingOut",
+        }:
+            self.ready = False
+            return "closed"
 
         if self.auth_state == "starting":
             self.td.send({"@type": "getOption", "name": "version"})
@@ -376,102 +409,160 @@ class Worker:
         caption = str(request.get("caption") or "")
         chat_id = self.destination_chat(destination)
 
-        sent = self.td.request(
-            {
-                "@type": "sendMessage",
-                "chat_id": chat_id,
-                "message_thread_id": 0,
-                "reply_to": None,
-                "options": None,
-                "reply_markup": None,
-                "input_message_content": {
-                    "@type": "inputMessageDocument",
-                    "document": {"@type": "inputFileLocal", "path": str(path)},
-                    "thumbnail": None,
-                    "disable_content_type_detection": True,
-                    "caption": {
-                        "@type": "formattedText",
-                        "text": caption,
-                        "entities": [],
+        from typing import Callable
+
+        last_emitted = 0
+        confirmed = 0
+        last_heartbeat = time.monotonic()
+        td = self.td
+
+        def emit_upload_progress(candidate: int, allow_complete: bool = False) -> None:
+            nonlocal last_emitted
+            upper = size if allow_complete or size <= 1 else size - 1
+            bounded = min(max(0, int(candidate)), upper)
+            if bounded <= last_emitted:
+                return
+            delta = bounded - last_emitted
+            last_emitted = bounded
+            emit({
+                "event": "progress",
+                "id": request_id,
+                "delta": delta,
+                "uploaded": bounded,
+                "size": size,
+            })
+
+        def on_bytes(amount: int) -> None:
+            nonlocal confirmed
+            delta = min(max(0, int(amount)), size - confirmed)
+            if delta <= 0:
+                return
+            confirmed += delta
+            emit_upload_progress(confirmed)
+            emit({
+                "event": "network",
+                "id": request_id,
+                "delta": delta,
+                "measurement": "acknowledged",
+            })
+
+        class UploadEvents:
+            def read_event(proxy, event):
+                nonlocal last_heartbeat
+                now = time.monotonic()
+                if now - last_heartbeat >= 0.25:
+                    emit({"event": "heartbeat", "id": request_id})
+                    last_heartbeat = now
+                if event and event.get("@type") == "updateSpeedLimitNotification":
+                    is_upload = event.get("is_upload")
+                    if isinstance(is_upload, bool):
+                        emit({"event": "speed_limit", "id": request_id,
+                              "is_upload": is_upload})
+                return event
+
+            def request(proxy, payload, timeout=30):
+                payload["input_message_content"]["caption"]["text"] = caption
+                return td.request(payload, timeout=timeout)
+
+            def pop_update(proxy):
+                return proxy.read_event(td.pop_update())
+
+            def receive(proxy, timeout=0.5):
+                return proxy.read_event(td.receive(min(0.25, timeout)))
+
+        class NativeUpload:
+            td = UploadEvents()
+            ready = self.ready
+
+            def send_document(
+                self,
+                chat_id: int,
+                path: Path,
+                on_bytes: Callable[[int], None] | None = None,
+                timeout: float = 7200.0,
+            ) -> str | None:
+                """Send one general file through TDLib and report real upload-byte deltas."""
+                path = path.expanduser().resolve()
+                if not path.is_file():
+                    raise RuntimeError(f"Telegram file does not exist: {path}")
+                size = path.stat().st_size
+                if size <= 0:
+                    raise RuntimeError(f"Telegram cannot upload an empty file: {path.name}")
+                if not self.ready:
+                    raise RuntimeError("TDLib session is not authorized.")
+
+                sent = self.td.request(
+                    {
+                        "@type": "sendMessage",
+                        "chat_id": int(chat_id),
+                        "message_thread_id": 0,
+                        "reply_to": None,
+                        "options": None,
+                        "reply_markup": None,
+                        "input_message_content": {
+                            "@type": "inputMessageDocument",
+                            "document": {"@type": "inputFileLocal", "path": str(path)},
+                            "thumbnail": None,
+                            "disable_content_type_detection": True,
+                            "caption": {"@type": "formattedText", "text": "", "entities": []},
+                        },
                     },
-                },
-            },
-            timeout=30,
+                    timeout=30,
+                )
+                old_message_id = int(sent.get("id", 0))
+                content = sent.get("content", {})
+                document = content.get("document", {}) if isinstance(content, dict) else {}
+                file_obj = document.get("document", {}) if isinstance(document, dict) else {}
+                file_id = int(file_obj["id"]) if isinstance(file_obj, dict) and file_obj.get("id") is not None else None
+
+                last_uploaded = 0
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    obj = self.td.pop_update() or self.td.receive(min(0.5, max(0.01, deadline - time.monotonic())))
+                    if not obj:
+                        continue
+                    typ = obj.get("@type")
+                    if typ == "updateFile":
+                        current = obj.get("file", {})
+                        if file_id is not None and int(current.get("id", -1)) != file_id:
+                            continue
+                        remote = current.get("remote", {})
+                        uploaded = max(0, int(remote.get("uploaded_size", 0) or 0))
+                        if uploaded > last_uploaded:
+                            delta = min(uploaded, size) - min(last_uploaded, size)
+                            last_uploaded = uploaded
+                            if delta > 0 and on_bytes:
+                                on_bytes(delta)
+                        continue
+                    if typ == "updateMessageSendSucceeded":
+                        old = obj.get("old_message_id")
+                        if old is None or int(old) == old_message_id:
+                            # TDLib may coalesce the final updateFile with message success.
+                            # Count only any unreported tail, never more than the file size.
+                            if on_bytes and last_uploaded < size:
+                                on_bytes(size - last_uploaded)
+                            message = obj.get("message", {})
+                            remote_id = int(message.get("id", 0))
+                            return str(remote_id) if remote_id else None
+                        continue
+                    if typ == "updateMessageSendFailed":
+                        old = obj.get("old_message_id")
+                        if old is None or int(old) == old_message_id:
+                            error = obj.get("error", {})
+                            raise RuntimeError(f"TDLib send failed: {error.get('message', 'unknown error')}")
+                raise TimeoutError(f"TDLib upload timed out: {path.name}")
+
+        message_id = NativeUpload().send_document(
+            chat_id,
+            path,
+            on_bytes=on_bytes,
+            timeout=float(request.get("timeout", 7200.0)),
         )
-
-        old_message_id = int(sent.get("id", 0) or 0)
-        content = sent.get("content", {})
-        document = content.get("document", {}) if isinstance(content, dict) else {}
-        file_obj = document.get("document", {}) if isinstance(document, dict) else {}
-        file_id = (
-            int(file_obj["id"])
-            if isinstance(file_obj, dict) and file_obj.get("id") is not None
-            else None
-        )
-
-        last_uploaded = 0
-        deadline = time.monotonic() + float(request.get("timeout", 7200.0))
-        while time.monotonic() < deadline:
-            obj = self.td.pop_update() or self.td.receive(
-                min(0.5, max(0.01, deadline - time.monotonic()))
-            )
-            if not obj:
-                continue
-
-            typ = obj.get("@type")
-            if typ == "updateFile":
-                current = obj.get("file", {})
-                if file_id is not None and int(current.get("id", -1)) != file_id:
-                    continue
-                remote = current.get("remote", {})
-                uploaded = max(0, int(remote.get("uploaded_size", 0) or 0))
-                if uploaded > last_uploaded:
-                    bounded_previous = min(last_uploaded, size)
-                    bounded_current = min(uploaded, size)
-                    delta = max(0, bounded_current - bounded_previous)
-                    last_uploaded = uploaded
-                    if delta:
-                        emit(
-                            {
-                                "event": "progress",
-                                "id": request_id,
-                                "delta": delta,
-                                "uploaded": bounded_current,
-                                "size": size,
-                            }
-                        )
-                continue
-
-            if typ == "updateMessageSendSucceeded":
-                old = obj.get("old_message_id")
-                if old is None or int(old) == old_message_id:
-                    bounded_previous = min(last_uploaded, size)
-                    if bounded_previous < size:
-                        emit(
-                            {
-                                "event": "progress",
-                                "id": request_id,
-                                "delta": size - bounded_previous,
-                                "uploaded": size,
-                                "size": size,
-                            }
-                        )
-                    message = obj.get("message", {})
-                    return {
-                        "message_id": int(message.get("id", 0) or 0),
-                        "bytes_uploaded": size,
-                    }
-                continue
-
-            if typ == "updateMessageSendFailed":
-                old = obj.get("old_message_id")
-                if old is None or int(old) == old_message_id:
-                    error = obj.get("error", {})
-                    raise RuntimeError(
-                        f"TDLib send failed: {error.get('message', 'unknown error')}"
-                    )
-
-        raise TimeoutError(f"TDLib upload timed out: {path.name}")
+        emit_upload_progress(size, allow_complete=True)
+        return {
+            "message_id": int(message_id or 0),
+            "bytes_uploaded": size,
+        }
 
     def download(self, request_id: int, request: dict) -> dict:
         if not self.ready:
@@ -488,10 +579,11 @@ class Worker:
         output_path = Path(str(request["path"])).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         force = bool(request.get("force", False))
-        timeout = float(request.get("timeout", 7200.0))
+        inactivity_timeout = float(request.get("inactivity_timeout", request.get("timeout", 7200.0)))
 
         tracked: dict[int, dict] = {}
         total_expected = 0
+        cached_at_start = 0
         for chunk in chunks:
             server_message_id = int(chunk["message_id"])
             expected_size = int(chunk.get("size") or 0)
@@ -539,6 +631,11 @@ class Worker:
                 and not Path(initial_path).expanduser().is_file()
             )
 
+            initial_downloaded = min(
+                max(0, int(initial_local.get("downloaded_size") or 0)),
+                expected_size,
+            )
+
             if force or stale_completed_local:
                 try:
                     self.td.request({"@type": "deleteFile", "file_id": file_id}, timeout=20)
@@ -548,18 +645,64 @@ class Worker:
                             f"Failed to reset stale TDLib local file state for chunk "
                             f"{server_message_id}: {exc}"
                         ) from exc
+                initial_downloaded = 0
 
             tracked[file_id] = {
                 "message_id": server_message_id,
                 "size": expected_size,
                 "sha256": expected_hash,
-                "downloaded": 0,
+                "downloaded": initial_downloaded,
                 "completed": False,
                 "path": "",
             }
+            cached_at_start += initial_downloaded
             total_expected += expected_size
 
+        network_received_total = 0
+        last_emitted = 0
+
+        def authoritative_downloaded_total() -> int:
+            return min(
+                total_expected,
+                sum(max(0, int(info["downloaded"])) for info in tracked.values()),
+            )
+
+        def emit_download_progress(candidate: int, allow_complete: bool = False) -> None:
+            nonlocal last_emitted
+            upper = total_expected if allow_complete or total_expected <= 1 else total_expected - 1
+            bounded = min(max(0, int(candidate)), upper)
+            if bounded <= last_emitted:
+                return
+            delta = bounded - last_emitted
+            received_delta = max(0, bounded - max(last_emitted, cached_at_start))
+            last_emitted = bounded
+            emit_network_bytes(received_delta)
+            emit(
+                {
+                    "event": "progress",
+                    "id": request_id,
+                    "delta": delta,
+                    "downloaded": bounded,
+                    "size": total_expected,
+                }
+            )
+
+        def emit_network_bytes(delta: int) -> None:
+            nonlocal network_received_total
+            if delta <= 0:
+                return
+            network_received_total += int(delta)
+            emit(
+                {
+                    "event": "network",
+                    "id": request_id,
+                    "delta": int(delta),
+                }
+            )
+
+        emit_download_progress(cached_at_start)
         started = time.monotonic()
+        last_progress_at = started
 
         for file_id, info in tracked.items():
             result = self.td.request(
@@ -609,17 +752,10 @@ class Worker:
                 int(local.get("downloaded_size") or 0),
                 int(info["size"]),
             )
-            if downloaded:
+            if downloaded > int(info["downloaded"]):
                 info["downloaded"] = downloaded
-                emit(
-                    {
-                        "event": "progress",
-                        "id": request_id,
-                        "delta": downloaded,
-                        "downloaded": downloaded,
-                        "size": total_expected,
-                    }
-                )
+                last_progress_at = time.monotonic()
+            emit_download_progress(authoritative_downloaded_total())
 
             if (
                 bool(local.get("is_downloading_completed"))
@@ -629,18 +765,65 @@ class Worker:
                 info["completed"] = True
                 info["path"] = candidate
 
-        deadline = started + timeout
+        last_progress_poll = time.monotonic()
+        last_heartbeat = started
+        pending_progress: dict[int, float] = {}
+        progress_tag = f"download-progress-{request_id}-"
+
+        def heartbeat() -> None:
+            nonlocal last_heartbeat
+            now = time.monotonic()
+            if now - last_heartbeat >= 0.25:
+                emit({"event": "heartbeat", "id": request_id})
+                last_heartbeat = now
+
         while not all(bool(info["completed"]) for info in tracked.values()):
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            # File size must not impose a wall-clock limit while confirmed bytes
+            # keep arriving. Heartbeats and unchanged/unrelated snapshots do not
+            # extend this inactivity budget.
+            deadline = last_progress_at + inactivity_timeout
+            if now >= deadline:
                 raise TimeoutError("TDLib download timed out")
+            heartbeat()
+
+            if now - last_progress_poll >= 0.25:
+                # Keep receiving file updates while snapshots are in flight.
+                for tracked_file_id, tracked_info in tracked.items():
+                    if bool(tracked_info["completed"]):
+                        continue
+                    pending_since = pending_progress.get(tracked_file_id)
+                    if pending_since is not None and now - pending_since < 2.0:
+                        continue
+                    self.td.send({
+                        "@type": "getFile",
+                        "file_id": tracked_file_id,
+                        "@extra": f"{progress_tag}{tracked_file_id}",
+                    })
+                    pending_progress[tracked_file_id] = now
+                last_progress_poll = now
 
             obj = self.td.pop_update() or self.td.receive(
-                min(0.5, max(0.01, deadline - time.monotonic()))
+                min(0.1, max(0.01, deadline - time.monotonic()))
             )
-            if not obj or obj.get("@type") != "updateFile":
+            if not obj:
+                continue
+            if obj.get("@type") == "updateSpeedLimitNotification":
+                is_upload = obj.get("is_upload")
+                if isinstance(is_upload, bool):
+                    emit({"event": "speed_limit", "id": request_id, "is_upload": is_upload})
+                continue
+            if obj.get("@type") == "updateFile":
+                current = obj.get("file") or {}
+            elif obj.get("@type") == "file":
+                current = obj
+                response_file_id = int(current.get("id") or 0)
+                if obj.get("@extra") != f"{progress_tag}{response_file_id}":
+                    continue
+                pending_progress.pop(response_file_id, None)
+            else:
                 continue
 
-            current = obj.get("file") or {}
             file_id = int(current.get("id") or 0)
             info = tracked.get(file_id)
             if info is None:
@@ -651,19 +834,10 @@ class Worker:
                 int(local.get("downloaded_size") or 0),
                 int(info["size"]),
             )
-            previous = int(info["downloaded"])
-            if bounded_current > previous:
-                delta = bounded_current - previous
+            if bounded_current > int(info["downloaded"]):
                 info["downloaded"] = bounded_current
-                emit(
-                    {
-                        "event": "progress",
-                        "id": request_id,
-                        "delta": delta,
-                        "downloaded": bounded_current,
-                        "size": total_expected,
-                    }
-                )
+                last_progress_at = time.monotonic()
+            emit_download_progress(authoritative_downloaded_total())
 
             if bool(local.get("is_downloading_completed")):
                 info["completed"] = True
@@ -771,6 +945,7 @@ class Worker:
                         if not block:
                             break
                         output.write(block)
+                        heartbeat()
                         copied += len(block)
                         reconstructed += len(block)
                         if hasher is not None:
@@ -796,10 +971,18 @@ class Worker:
                 f"Reconstructed file size mismatch: expected {total_expected}, got {reconstructed}"
             )
 
+        emit_download_progress(total_expected, allow_complete=True)
+        measured_network_bytes = network_received_total
+        if measured_network_bytes <= 0:
+            # Statistics may be unavailable on an older/runtime-specific TDLib
+            # build. Fall back to bytes that actually had to come from network,
+            # excluding bytes already present in TDLib's cache at start.
+            measured_network_bytes = max(0, total_expected - cached_at_start)
+
         return {
             "bytes_downloaded": reconstructed,
             "network_seconds": network_elapsed,
-            "average_bytes_per_sec": int(total_expected / network_elapsed),
+            "average_bytes_per_sec": int(measured_network_bytes / network_elapsed),
         }
 
     def logout(self) -> dict:

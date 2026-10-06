@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save, open } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -6,7 +6,9 @@ import { toast } from 'sonner';
 import { DownloadItem, TelegramFile } from '../types';
 import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback, sanitizeFilename } from '../utils';
 import { useSettings } from '../context/SettingsContext';
+import { useFastTransferAuth } from '../context/FastTransferAuthContext';
 import type { Store } from '@tauri-apps/plugin-store';
+import { normalizeDownloadQueue, useRecoverableTransferQueue } from '../transferQueue';
 
 interface ProgressPayload {
     id: string;
@@ -16,49 +18,14 @@ interface ProgressPayload {
     speed_bytes_per_sec: number;
 }
 
-interface FastTransferStatus {
-    supported: boolean;
-    runtime_installed: boolean;
-    ready: boolean;
-    auth_state: string;
-    backend: string;
-    detail: string;
-}
-
 export function useFileDownload(store: Store | null) {
-    const [downloadQueue, setDownloadQueue] = useState<DownloadItem[]>([]);
-    const [initialized, setInitialized] = useState(false);
+    const { queue: downloadQueue, setQueue: setDownloadQueue, queueRef, initialized, durable, persist } =
+        useRecoverableTransferQueue('download', store, normalizeDownloadQueue);
     const cancelledRef = useRef<Set<string>>(new Set());
-    const activeCountRef = useRef(0);
+    const pausedRef = useRef<Set<string>>(new Set());
+    const activeIdsRef = useRef<Set<string>>(new Set());
     const { settings } = useSettings();
-    const fastReadyCheckRef = useRef<Promise<boolean> | null>(null);
-    const persistedQueueRef = useRef('');
-
-    const ensureFastTransferReady = async (): Promise<boolean> => {
-        if (isAndroidPlatform) return true;
-        if (fastReadyCheckRef.current) return fastReadyCheckRef.current;
-
-        const check = (async () => {
-            const current = await invoke<FastTransferStatus>('cmd_fast_transfer_status');
-            if (!current.supported || current.ready) return true;
-
-            const prepared = await invoke<FastTransferStatus>('cmd_fast_transfer_prepare_saved', {
-                install: !current.runtime_installed,
-            });
-            if (prepared.ready) return true;
-
-            throw new Error('TeraRelay could not prepare the transfer session. Restart TeraRelay or sign in again.');
-        })();
-
-        fastReadyCheckRef.current = check;
-        try {
-            return await check;
-        } finally {
-            if (fastReadyCheckRef.current === check) {
-                fastReadyCheckRef.current = null;
-            }
-        }
-    };
+    const { ensureFastTransferReady } = useFastTransferAuth();
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -77,58 +44,32 @@ export function useFileDownload(store: Store | null) {
         return () => { unlisten?.(); };
     }, []);
 
-    // Load saved queue on mount
     useEffect(() => {
-        if (!store || initialized) return;
-        store.get<DownloadItem[]>('downloadQueue').then((saved) => {
-            if (saved && saved.length > 0) {
-                const pending = saved.filter(i => i.status === 'pending');
-                if (pending.length > 0) {
-                    setDownloadQueue(pending);
-                    toast.info(`Restored ${pending.length} pending downloads`);
-                }
-            }
-            setInitialized(true);
-        });
-    }, [store, initialized]);
-
-    // Persist recoverable work. Active downloads are stored as pending so
-    // an app restart can safely resume them from TDLib's partial cache.
-    useEffect(() => {
-        if (!store || !initialized) return;
-        const recoverable = downloadQueue
-            .filter(i => i.status === 'pending' || i.status === 'downloading')
-            .map(i => ({
-                id: i.id,
-                messageId: i.messageId,
-                filename: i.filename,
-                folderId: i.folderId,
-                savePath: i.savePath,
-                status: 'pending' as const,
-            }));
-        const serialized = JSON.stringify(recoverable);
-        if (serialized === persistedQueueRef.current) return;
-        persistedQueueRef.current = serialized;
-        store.set('downloadQueue', recoverable).then(() => store.save());
-    }, [store, downloadQueue, initialized]);
-
-    // Process up to maxConcurrentDownloads in parallel
-    useEffect(() => {
+        if (!initialized || !durable) return;
         const maxConcurrent = settings.maxConcurrentDownloads || 1;
-        const available = maxConcurrent - activeCountRef.current;
+        const available = maxConcurrent - activeIdsRef.current.size;
         if (available <= 0) return;
-        const pendingItems = downloadQueue.filter(i => i.status === 'pending').slice(0, available);
+        const pendingItems = downloadQueue
+            .filter(i => i.status === 'pending' && !activeIdsRef.current.has(i.id))
+            .slice(0, available);
         for (const item of pendingItems) {
-            processItem(item);
+            void processItem(item);
         }
-    }, [downloadQueue, settings.maxConcurrentDownloads]);
+    }, [downloadQueue, settings.maxConcurrentDownloads, initialized, durable]);
 
     const processItem = async (item: DownloadItem) => {
-        activeCountRef.current++;
-        setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'downloading', progress: 0 } : i));
-
+        if (activeIdsRef.current.has(item.id)) return;
+        activeIdsRef.current.add(item.id);
+        let started = false;
+        let completed = false;
+        let savePath: string | null = item.savePath || null;
         try {
-            let savePath: string | null = item.savePath || null;
+            await persist();
+            if (queueRef.current.find(i => i.id === item.id)?.status !== 'pending') return;
+            started = true;
+            setDownloadQueue(q => q.map(i => i.id === item.id ? {
+                ...i, status: 'downloading', error: undefined, progress: 0, speedBytesPerSec: undefined,
+            } : i));
             if (!savePath) {
                 savePath = await pickWithFallback(
                     () => save({ defaultPath: item.filename }),
@@ -139,20 +80,21 @@ export function useFileDownload(store: Store | null) {
                 );
                 if (!savePath) {
                     setDownloadQueue(q => q.filter(i => i.id !== item.id));
-                    activeCountRef.current--;
+                    await persist();
                     return;
                 }
             }
 
-            if (savePath && savePath !== item.savePath) {
-                setDownloadQueue(q => q.map(i =>
-                    i.id === item.id ? { ...i, savePath } : i
-                ));
+            if (savePath !== item.savePath) {
+                const destination = savePath;
+                setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, savePath: destination } : i));
+                // Destination must survive reopening before TDLib receives any work.
+                await persist();
             }
-
             const ready = await ensureFastTransferReady();
-            if (!ready) {
-                throw new Error('TDLIB_SETUP_CANCELLED');
+            if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
+            if (cancelledRef.current.has(item.id) || pausedRef.current.has(item.id)) {
+                throw new Error('Transfer cancelled');
             }
 
             await invoke('cmd_download_file', {
@@ -163,30 +105,53 @@ export function useFileDownload(store: Store | null) {
                     transfer_id: item.id
                 }
             });
-
+            completed = true;
             if (cancelledRef.current.has(item.id)) {
                 cancelledRef.current.delete(item.id);
+                await persist();
             } else {
+                pausedRef.current.delete(item.id);
                 setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'success', progress: 100 } : i));
+                await persist();
                 window.setTimeout(() => {
                     setDownloadQueue(q => q.filter(i => !(i.id === item.id && i.status === 'success')));
                 }, 5000);
                 toast.success(`Downloaded: ${item.filename}`);
             }
         } catch (e) {
-            if (!cancelledRef.current.has(item.id)) {
-                const errMsg = String(e);
-                if (errMsg.includes('Transfer cancelled') || errMsg.includes('TDLIB_SETUP_CANCELLED')) {
-                    setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled' } : i));
+            if (!started) {
+                toast.error(`Could not save download queue: ${e}`);
+            } else if (pausedRef.current.has(item.id)) {
+                pausedRef.current.delete(item.id);
+                setDownloadQueue(q => q.map(i => i.id === item.id ? {
+                    ...i, status: 'paused', speedBytesPerSec: 0,
+                } : i));
+            } else if (cancelledRef.current.has(item.id)) {
+                cancelledRef.current.delete(item.id);
+            } else {
+                const errMsg = completed ? `Download completed, but queue save failed: ${e}` : String(e);
+                if (!completed && errMsg.includes('TDLIB_SETUP_CANCELLED')) {
+                    setDownloadQueue(q => q.map(i => i.id === item.id ? {
+                        ...i, status: 'paused',
+                        error: 'Transfer setup was cancelled. Resume when you are ready to finish setup.',
+                        speedBytesPerSec: 0,
+                    } : i));
+                } else if (!completed && errMsg.includes('Transfer cancelled')) {
+                    setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled', speedBytesPerSec: 0 } : i));
                 } else {
-                    setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
+                    setDownloadQueue(q => {
+                        const failed = { ...item, savePath: savePath || undefined, status: 'error' as const, error: errMsg, speedBytesPerSec: 0 };
+                        return q.some(i => i.id === item.id)
+                            ? q.map(i => i.id === item.id ? { ...i, ...failed } : i)
+                            : [...q, failed];
+                    });
                     toast.error(`Download failed: ${item.filename}`);
                 }
-            } else {
-                cancelledRef.current.delete(item.id);
             }
         } finally {
-            activeCountRef.current--;
+            // Every path (including save-dialog cancellation) releases exactly once.
+            activeIdsRef.current.delete(item.id);
+            setDownloadQueue(q => [...q]);
         }
     };
 
@@ -266,33 +231,77 @@ export function useFileDownload(store: Store | null) {
         setDownloadQueue(q => q.filter(i => i.status !== 'success'));
     };
 
+    const finishCancellation = async (items: DownloadItem[]) => {
+        try {
+            await persist();
+        } catch (e) {
+            setDownloadQueue(q => {
+                const ids = new Set(items.map(item => item.id));
+                const kept = q.map(item => ids.has(item.id) ? {
+                    ...item, status: 'error' as const, error: `Could not save cancellation: ${e}`,
+                } : item);
+                for (const item of items) {
+                    if (!kept.some(i => i.id === item.id)) {
+                        kept.push({ ...item, status: 'error', error: `Could not save cancellation: ${e}` });
+                    }
+                }
+                return kept;
+            });
+            toast.error(`Could not save download cancellation: ${e}`);
+        }
+    };
+
     const cancelAll = () => {
-        setDownloadQueue(q => {
-            const downloading = q.find(i => i.status === 'downloading');
-            if (downloading) {
-                cancelledRef.current.add(downloading.id);
-                invoke('cmd_cancel_transfer', { transferId: downloading.id }).catch(() => {});
+        const items = queueRef.current.filter(i =>
+            i.status === 'pending' || i.status === 'downloading' || i.status === 'pausing' || i.status === 'paused');
+        for (const item of items) {
+            if (activeIdsRef.current.has(item.id)) {
+                pausedRef.current.delete(item.id);
+                cancelledRef.current.add(item.id);
+                invoke('cmd_cancel_transfer', { transferId: item.id }).catch(() => {});
             }
-            return q
-                .filter(i => i.status !== 'pending')
-                .map(i => i.status === 'downloading' ? { ...i, status: 'cancelled' as const } : i);
-        });
+        }
+        setDownloadQueue(q => q
+            .filter(i => i.status !== 'pending')
+            .map(i => (i.status === 'downloading' || i.status === 'pausing' || i.status === 'paused')
+                ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 }
+                : i));
+        void finishCancellation(items);
         toast.info('All downloads cancelled');
     };
 
     const cancelItem = (id: string) => {
+        const item = queueRef.current.find(i => i.id === id);
+        if (!item || !['pending', 'downloading', 'pausing', 'paused'].includes(item.status)) return;
+        if (activeIdsRef.current.has(id)) {
+            pausedRef.current.delete(id);
+            cancelledRef.current.add(id);
+            invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+        }
+        setDownloadQueue(q => item.status === 'pending'
+            ? q.filter(i => i.id !== id)
+            : q.map(i => i.id === id ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 } : i));
+        void finishCancellation([item]);
+    };
+
+    const pauseItem = (id: string) => {
         setDownloadQueue(q => {
             const item = q.find(i => i.id === id);
-            if (item?.status === 'downloading') {
-                cancelledRef.current.add(id);
-                invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
-                return q.map(i => i.id === id ? { ...i, status: 'cancelled' as const } : i);
-            }
-            if (item?.status === 'pending') {
-                return q.filter(i => i.id !== id);
-            }
-            return q;
+            if (item?.status !== 'downloading') return q;
+            pausedRef.current.add(id);
+            invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+            return q.map(i => i.id === id
+                ? { ...i, status: 'pausing' as const, speedBytesPerSec: 0 }
+                : i);
         });
+    };
+
+    const resumeItem = (id: string) => {
+        setDownloadQueue(q => q.map(i =>
+            i.id === id && i.status === 'paused'
+                ? { ...i, status: 'pending' as const, error: undefined, speedBytesPerSec: 0 }
+                : i
+        ));
     };
 
     const retryItem = (id: string) => {
@@ -310,6 +319,8 @@ export function useFileDownload(store: Store | null) {
         clearFinished,
         cancelAll,
         cancelItem,
+        pauseItem,
+        resumeItem,
         retryItem,
     };
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -7,7 +7,9 @@ import { toast } from 'sonner';
 import { QueueItem } from '../types';
 import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback } from '../utils';
 import { useSettings } from '../context/SettingsContext';
+import { useFastTransferAuth } from '../context/FastTransferAuthContext';
 import type { Store } from '@tauri-apps/plugin-store';
+import { normalizeUploadQueue, useRecoverableTransferQueue } from '../transferQueue';
 
 interface ProgressPayload {
     id: string;
@@ -31,50 +33,15 @@ interface UploadPhasePayload {
     phase: 'preparing' | 'uploading';
 }
 
-interface FastTransferStatus {
-    supported: boolean;
-    runtime_installed: boolean;
-    ready: boolean;
-    auth_state: string;
-    backend: string;
-    detail: string;
-}
-
 export function useFileUpload(activeFolderId: number | null, store: Store | null) {
     const queryClient = useQueryClient();
     const { settings } = useSettings();
-    const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
-    const [initialized, setInitialized] = useState(false);
+    const { queue: uploadQueue, setQueue: setUploadQueue, queueRef, initialized, durable, persist } =
+        useRecoverableTransferQueue('upload', store, normalizeUploadQueue);
     const cancelledRef = useRef<Set<string>>(new Set());
-    const activeCountRef = useRef(0);
-    const fastReadyCheckRef = useRef<Promise<boolean> | null>(null);
-    const persistedQueueRef = useRef('');
-
-    const ensureFastTransferReady = async (): Promise<boolean> => {
-        if (isAndroidPlatform) return true;
-        if (fastReadyCheckRef.current) return fastReadyCheckRef.current;
-
-        const check = (async () => {
-            const current = await invoke<FastTransferStatus>('cmd_fast_transfer_status');
-            if (!current.supported || current.ready) return true;
-
-            const prepared = await invoke<FastTransferStatus>('cmd_fast_transfer_prepare_saved', {
-                install: !current.runtime_installed,
-            });
-            if (prepared.ready) return true;
-
-            throw new Error('TeraRelay could not prepare the transfer session. Restart TeraRelay or sign in again.');
-        })();
-
-        fastReadyCheckRef.current = check;
-        try {
-            return await check;
-        } finally {
-            if (fastReadyCheckRef.current === check) {
-                fastReadyCheckRef.current = null;
-            }
-        }
-    };
+    const pausedRef = useRef<Set<string>>(new Set());
+    const activeIdsRef = useRef<Set<string>>(new Set());
+    const { ensureFastTransferReady } = useFastTransferAuth();
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -89,6 +56,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                     progress: event.payload.percent,
                     uploadedBytes: event.payload.uploaded_bytes,
                     totalBytes: event.payload.total_bytes,
+                    // Rust already reports a rolling real-byte transfer rate.
+                    // Do not average it again in the UI.
                     speedBytesPerSec: event.payload.speed_bytes_per_sec,
                 } : i
             ));
@@ -96,7 +65,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
         listen<RemoteProgressPayload>('remote-upload-progress', (event) => {
             setUploadQueue(q => q.map(i =>
-                i.id === event.payload.id ? {
+                i.id === event.payload.id && activeIdsRef.current.has(i.id) &&
+                (i.status === 'uploading' || i.status === 'downloading') ? {
                     ...i,
                     status: event.payload.phase,
                     progress: event.payload.percent,
@@ -124,48 +94,19 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         };
     }, []);
 
+    // Only durable pending work can reserve the configured worker slots.
     useEffect(() => {
-        if (!store || initialized) return;
-        store.get<QueueItem[]>('uploadQueue').then((saved) => {
-            if (saved && saved.length > 0) {
-                const pending = saved.filter(i => i.status === 'pending');
-                if (pending.length > 0) {
-                    setUploadQueue(pending);
-                    toast.info(`Restored ${pending.length} pending uploads`);
-                }
-            }
-            setInitialized(true);
-        });
-    }, [store, initialized]);
-
-    useEffect(() => {
-        if (!store || !initialized) return;
-        const recoverable = uploadQueue
-            .filter(i => i.status === 'pending' || i.status === 'uploading' || i.status === 'downloading')
-            .map(i => ({
-                id: i.id,
-                path: i.path,
-                url: i.url,
-                folderId: i.folderId,
-                tempZipPath: i.tempZipPath,
-                status: 'pending' as const,
-            }));
-        const serialized = JSON.stringify(recoverable);
-        if (serialized === persistedQueueRef.current) return;
-        persistedQueueRef.current = serialized;
-        store.set('uploadQueue', recoverable).then(() => store.save());
-    }, [store, uploadQueue, initialized]);
-
-    // Process up to maxConcurrentUploads in parallel
-    useEffect(() => {
+        if (!initialized || !durable) return;
         const maxConcurrent = settings.maxConcurrentUploads || 1;
-        const available = maxConcurrent - activeCountRef.current;
+        const available = maxConcurrent - activeIdsRef.current.size;
         if (available <= 0) return;
-        const pendingItems = uploadQueue.filter(i => i.status === 'pending').slice(0, available);
+        const pendingItems = uploadQueue
+            .filter(i => i.status === 'pending' && !activeIdsRef.current.has(i.id))
+            .slice(0, available);
         for (const item of pendingItems) {
-            processItem(item);
+            void processItem(item);
         }
-    }, [uploadQueue, settings.maxConcurrentUploads]);
+    }, [uploadQueue, settings.maxConcurrentUploads, initialized, durable]);
 
     // Manage Android Foreground Service for persistent uploads
     useEffect(() => {
@@ -191,60 +132,96 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     };
 
     const processItem = async (item: QueueItem) => {
-        activeCountRef.current++;
-        const initialStatus = item.url ? 'downloading' : 'uploading';
-        setUploadQueue(q => q.map(i => i.id === item.id ? {
-            ...i,
-            status: initialStatus,
-            progress: 0,
-            uploadPhase: item.url ? undefined : 'uploading',
-        } : i));
+        if (activeIdsRef.current.has(item.id)) return;
+        // Reserve synchronously, before any save/auth await can trigger another render.
+        activeIdsRef.current.add(item.id);
+        let started = false;
+        let completed = false;
         try {
+            await persist();
+            const queued = queueRef.current.find(i => i.id === item.id);
+            if (queued?.status !== 'pending') return;
+            started = true;
+            const initialStatus = item.url ? 'downloading' : 'uploading';
+            setUploadQueue(q => q.map(i => i.id === item.id ? {
+                ...i,
+                status: initialStatus,
+                error: undefined,
+                progress: 0,
+                speedBytesPerSec: undefined,
+                uploadPhase: item.url ? undefined : 'uploading',
+            } : i));
             if (item.url) {
                 await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
             } else {
                 const ready = await ensureFastTransferReady();
-                if (!ready) {
-                    throw new Error('TDLIB_SETUP_CANCELLED');
+                if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
+                if (cancelledRef.current.has(item.id) || pausedRef.current.has(item.id)) {
+                    throw new Error('Transfer cancelled');
                 }
                 await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id });
             }
-            // Check if cancelled during upload
+            completed = true;
             if (cancelledRef.current.has(item.id)) {
                 cancelledRef.current.delete(item.id);
+                await persist();
+                const current = queueRef.current.find(i => i.id === item.id);
+                if (!current || current.status === 'cancelled') await cleanupTempZip(item);
             } else {
+                pausedRef.current.delete(item.id);
                 setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'success', progress: 100 } : i));
+                // Keep the source until removing recoverable work has really committed.
+                await persist();
+                await cleanupTempZip(item);
                 window.setTimeout(() => {
                     setUploadQueue(q => q.filter(i => !(i.id === item.id && i.status === 'success')));
                 }, 5000);
                 queryClient.invalidateQueries({ queryKey: ['files', item.folderId] });
             }
-            // Clean up temp zip on success
-            await cleanupTempZip(item);
         } catch (e) {
-            if (!cancelledRef.current.has(item.id)) {
-                const errMsg = String(e);
-                if (errMsg.includes('Transfer cancelled') || errMsg.includes('TDLIB_SETUP_CANCELLED')) {
-                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled' } : i));
-                } else if (errMsg.includes('FILE_TOO_BIG') || errMsg.includes('too large') || errMsg.includes('2 GB') || errMsg.includes('2GB')) {
-                    // Local files are split automatically; only URL uploads still have the 2 GB cap
-                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
-                    toast.error(`Upload failed: URL uploads are limited to 2 GB.`);
-                } else {
-                    const displayPath = item.url || item.path;
-                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
-                    toast.error(`Upload failed for ${displayPath.split('/').pop()}: ${e}`);
+            if (!started) {
+                toast.error(`Could not save upload queue: ${e}`);
+            } else if (pausedRef.current.has(item.id)) {
+                pausedRef.current.delete(item.id);
+                setUploadQueue(q => q.map(i => i.id === item.id ? {
+                    ...i, status: 'paused', speedBytesPerSec: 0,
+                } : i));
+            } else if (cancelledRef.current.has(item.id)) {
+                cancelledRef.current.delete(item.id);
+                try {
+                    await persist();
+                    const current = queueRef.current.find(i => i.id === item.id);
+                    if (!current || current.status === 'cancelled') await cleanupTempZip(item);
+                } catch (saveError) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? {
+                        ...i, status: 'error', error: `Could not save cancellation: ${saveError}`, speedBytesPerSec: 0,
+                    } : i));
                 }
             } else {
-                cancelledRef.current.delete(item.id);
+                const errMsg = completed ? `Upload completed, but queue save failed: ${e}` : String(e);
+                if (!completed && errMsg.includes('TDLIB_SETUP_CANCELLED')) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? {
+                        ...i, status: 'paused',
+                        error: 'Transfer setup was cancelled. Resume when you are ready to finish setup.',
+                        speedBytesPerSec: 0,
+                    } : i));
+                } else if (!completed && errMsg.includes('Transfer cancelled')) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled', speedBytesPerSec: 0 } : i));
+                } else {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? {
+                        ...i, status: 'error', error: errMsg, speedBytesPerSec: 0,
+                    } : i));
+                    if (item.url && (errMsg.includes('FILE_TOO_BIG') || errMsg.includes('too large') || errMsg.includes('2 GB') || errMsg.includes('2GB'))) {
+                        toast.error('Upload failed: URL uploads are limited to 2 GB.');
+                    } else {
+                        const displayPath = item.url || item.path;
+                        toast.error(`Upload failed for ${displayPath.split('/').pop()}: ${errMsg}`);
+                    }
+                }
+                // Failed and auth-cancelled uploads retain folder ZIPs for Retry/restart.
             }
-            // Clean up temp zip even on failure
-            await cleanupTempZip(item);
         } finally {
-            activeCountRef.current--;
-            // A user can press Retry before the cancelled backend call has
-            // finished unwinding. Re-trigger scheduling after the active slot
-            // is released so that pending retry cannot get stranded.
+            activeIdsRef.current.delete(item.id);
             setUploadQueue(q => [...q]);
         }
     };
@@ -344,34 +321,87 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const handleFolderUpload = performFolderUpload;
 
+    const finishCancellation = async (items: QueueItem[]) => {
+        try {
+            await persist();
+            for (const item of items) {
+                // The running worker cleans its source after the backend unwinds.
+                // A manual Retry can supersede this cancellation while its save waits.
+                const current = queueRef.current.find(i => i.id === item.id);
+                if (!activeIdsRef.current.has(item.id) && (!current || current.status === 'cancelled')) {
+                    await cleanupTempZip(item);
+                }
+            }
+        } catch (e) {
+            // A failed removal must keep its source and an actionable entry in memory.
+            setUploadQueue(q => {
+                const ids = new Set(items.map(item => item.id));
+                const kept = q.map(item => ids.has(item.id) ? {
+                    ...item, status: 'error' as const, error: `Could not save cancellation: ${e}`,
+                } : item);
+                for (const item of items) {
+                    if (!kept.some(i => i.id === item.id)) {
+                        kept.push({ ...item, status: 'error', error: `Could not save cancellation: ${e}` });
+                    }
+                }
+                return kept;
+            });
+            toast.error(`Could not save upload cancellation: ${e}`);
+        }
+    };
+
     const cancelAll = () => {
-        setUploadQueue(q => {
-            const activeItems = q.filter(i => i.status === 'uploading' || i.status === 'downloading');
-            for (const item of activeItems) {
+        const items = queueRef.current.filter(i =>
+            i.status === 'pending' || i.status === 'uploading' || i.status === 'downloading' ||
+            i.status === 'pausing' || i.status === 'paused');
+        for (const item of items) {
+            if (activeIdsRef.current.has(item.id)) {
+                pausedRef.current.delete(item.id);
                 cancelledRef.current.add(item.id);
                 invoke('cmd_cancel_transfer', { transferId: item.id }).catch(() => {});
             }
-            return q
-                .filter(i => i.status !== 'pending')
-                .map(i => (i.status === 'uploading' || i.status === 'downloading') ? { ...i, status: 'cancelled' as const } : i);
-        });
+        }
+        setUploadQueue(q => q
+            .filter(i => i.status !== 'pending')
+            .map(i => (i.status === 'uploading' || i.status === 'downloading' || i.status === 'pausing' || i.status === 'paused')
+                ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 }
+                : i));
+        void finishCancellation(items);
         toast.info('All uploads cancelled');
     };
 
     const cancelItem = (id: string) => {
+        const item = queueRef.current.find(i => i.id === id);
+        if (!item || !['pending', 'uploading', 'downloading', 'pausing', 'paused'].includes(item.status)) return;
+        if (activeIdsRef.current.has(id)) {
+            pausedRef.current.delete(id);
+            cancelledRef.current.add(id);
+            invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+        }
+        setUploadQueue(q => item.status === 'pending'
+            ? q.filter(i => i.id !== id)
+            : q.map(i => i.id === id ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 } : i));
+        void finishCancellation([item]);
+    };
+
+    const pauseItem = (id: string) => {
         setUploadQueue(q => {
             const item = q.find(i => i.id === id);
-            if (item?.status === 'uploading' || item?.status === 'downloading') {
-                cancelledRef.current.add(id);
-                invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
-                return q.map(i => i.id === id ? { ...i, status: 'cancelled' as const } : i);
-            }
-            // Remove pending items directly
-            if (item?.status === 'pending') {
-                return q.filter(i => i.id !== id);
-            }
-            return q;
+            if (item?.status !== 'uploading' && item?.status !== 'downloading') return q;
+            pausedRef.current.add(id);
+            invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
+            return q.map(i => i.id === id
+                ? { ...i, status: 'pausing' as const, speedBytesPerSec: 0 }
+                : i);
         });
+    };
+
+    const resumeItem = (id: string) => {
+        setUploadQueue(q => q.map(i =>
+            i.id === id && i.status === 'paused'
+                ? { ...i, status: 'pending' as const, error: undefined, speedBytesPerSec: 0 }
+                : i
+        ));
     };
 
     const retryItem = (id: string) => {
@@ -419,6 +449,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         handleUrlUpload,
         cancelAll,
         cancelItem,
+        pauseItem,
+        resumeItem,
         retryItem,
     };
 }

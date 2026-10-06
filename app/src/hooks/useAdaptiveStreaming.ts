@@ -187,7 +187,8 @@ export interface UseAdaptiveStreamingResult {
 export function useAdaptiveStreaming(
     streamUrl: string,
     fileName: string,
-    onProgressiveDetected?: () => void,
+    _onProgressiveDetected?: () => void,
+    preferNative = false,
 ): UseAdaptiveStreamingResult {
     // ── Ref-based mutable state ──────────────────────────────────────
     const mp4boxRef = useRef<ISOFile | null>(null);
@@ -231,11 +232,14 @@ export function useAdaptiveStreaming(
 
     const { settings, setQuality, setAdaptiveMode } = useStreamingSettings();
 
-    const needsFallback = !isMp4File(fileName) || shouldUseFallback(fileName) || !mseSupported();
-    const [useFallback] = useState(needsFallback);
-    // Dynamic fallback: if MSE pipeline fails to init, switch to native <video>
-    const [dynamicFallback, setDynamicFallback] = useState(false);
-    const effectiveUseFallback = useFallback || dynamicFallback;
+    const useFallback = preferNative || !isMp4File(fileName) || shouldUseFallback(fileName) || !mseSupported();
+    // A parser failure belongs to its source; navigating to another video
+    // must not inherit the previous file's fallback choice.
+    const [fallbackSource, setFallbackSource] = useState<string | null>(null);
+    const setDynamicFallback = useCallback((enabled: boolean) => {
+        setFallbackSource(enabled ? streamUrl : null);
+    }, [streamUrl]);
+    const effectiveUseFallback = useFallback || fallbackSource === streamUrl;
 
     useEffect(() => {
         const kbps = QUALITY_THROTTLE_MAP[settings.quality];
@@ -891,7 +895,7 @@ export function useAdaptiveStreaming(
 
     // ── Adaptive speed measurement ───────────────────────────────────
     useEffect(() => {
-        if (useFallback) return;
+        if (effectiveUseFallback) return;
         const interval = setInterval(() => {
             const samples = speedSamplesRef.current;
             if (samples.length < 2) return;
@@ -930,11 +934,11 @@ export function useAdaptiveStreaming(
             }
         }, SPEED_CHECK_INTERVAL_MS);
         return () => clearInterval(interval);
-    }, [useFallback, settings.adaptiveMode, settings.quality, setQuality]);
+    }, [effectiveUseFallback, settings.adaptiveMode, settings.quality, setQuality]);
 
     // ── Main initialization effect ───────────────────────────────────
     useEffect(() => {
-        if (useFallback || !streamUrl) {
+        if (effectiveUseFallback || !streamUrl) {
             console.log('[AdaptiveStreaming] 🚫 Skipping MSE: useFallback=', useFallback, 'streamUrl=', !!streamUrl);
             return;
         }
@@ -1005,12 +1009,8 @@ export function useAdaptiveStreaming(
                 if (fileSizeRef.current > 0) {
                     warmProgressiveMoovCache(streamUrl, fileSizeRef.current);
                 }
-                // Notify parent so it can trigger fMP4 remux in the background.
-                // Always fall back to native video — the parent can override
-                // later by providing a new stream URL once remux completes.
-                if (onProgressiveDetected) {
-                    onProgressiveDetected();
-                }
+                // Progressive MP4 is supported by native video. Remux only
+                // after an actual decoder error, handled by the visible player.
                 setDynamicFallback(true);
                 return;
             }
@@ -1124,7 +1124,7 @@ export function useAdaptiveStreaming(
             discoveryPrefixRef.current = null;
             discoverySuffixRef.current = null;
         };
-    }, [streamUrl, useFallback, startDownload, createSourceBuffer, abortFetch, abortDiscovery,
+    }, [streamUrl, effectiveUseFallback, startDownload, createSourceBuffer, abortFetch, abortDiscovery,
         clearSourceBuffer, initSegments, discoverMoov, discoverMoovRetry, discoverMoovTail, buildMsePipeline, fileName]);
 
     return {

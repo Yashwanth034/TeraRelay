@@ -1,109 +1,175 @@
 import { QueueItem } from "../../../types";
-import { X, RotateCcw, AlertCircle } from "lucide-react";
+import { AlertCircle, Pause, Play, RotateCcw, X } from "lucide-react";
 import { formatBytes } from "../../../utils";
-
 
 interface UploadQueueProps {
     items: QueueItem[];
-    onClearFinished: () => void;
     onCancelAll: () => void;
     onCancelItem: (id: string) => void;
+    onPauseItem: (id: string) => void;
+    onResumeItem: (id: string) => void;
     onRetryItem: (id: string) => void;
 }
 
-export function UploadQueue({ items, onClearFinished, onCancelAll, onCancelItem, onRetryItem }: UploadQueueProps) {
+export function UploadQueue({
+    items,
+    onCancelAll,
+    onCancelItem,
+    onPauseItem,
+    onResumeItem,
+    onRetryItem,
+}: UploadQueueProps) {
     if (items.length === 0) return null;
 
-    const hasPendingOrActive = items.some(i => i.status === 'pending' || i.status === 'uploading' || i.status === 'downloading');
+    const activeCount = items.filter(i => i.status === 'pending' || i.status === 'pausing' || i.status === 'uploading' || i.status === 'downloading').length;
+    const pausedCount = items.filter(i => i.status === 'paused').length;
 
     return (
-        <div className="tr-transfer-dock fixed bottom-5 right-5 w-[360px] bg-telegram-surface border border-telegram-border rounded-2xl shadow-2xl overflow-hidden z-[100]">
+        <div className="tr-transfer-dock w-full bg-telegram-surface border border-telegram-border rounded-2xl shadow-2xl overflow-hidden">
             <div className="p-3 border-b border-telegram-border bg-telegram-hover flex justify-between items-center">
-                <h4 className="text-sm font-medium text-telegram-text">Uploads</h4>
-                <div className="flex gap-2">
-                    {hasPendingOrActive && (
-                        <button onClick={onCancelAll} className="text-xs text-red-400 hover:text-red-300 transition-colors">Cancel All</button>
+                <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-medium text-telegram-text">Uploads</h4>
+                    {activeCount > 0 && (
+                        <span className="text-xs px-1.5 py-0.5 bg-blue-500/15 text-blue-400 rounded-full">
+                            {activeCount} active
+                        </span>
                     )}
-                    <button onClick={onClearFinished} className="text-xs text-telegram-primary hover:text-telegram-text transition-colors">Clear Finished</button>
+                    {pausedCount > 0 && (
+                        <span className="text-xs px-1.5 py-0.5 bg-yellow-500/15 text-yellow-400 rounded-full">
+                            {pausedCount} paused
+                        </span>
+                    )}
                 </div>
+                {(activeCount > 0 || pausedCount > 0) && (
+                    <button onClick={onCancelAll} className="text-xs text-red-400 hover:text-red-300 transition-colors">
+                        Cancel All
+                    </button>
+                )}
             </div>
-            <div className="max-h-60 overflow-y-auto p-2 space-y-2">
-                {items.map(item => (
-                    <div key={item.id} className="flex flex-col gap-1 p-2 bg-telegram-hover rounded">
-                        <div className="flex items-center gap-3 text-sm">
-                            <div className={`w-2 h-2 rounded-full flex-shrink-0 ${item.status === 'pending' ? 'bg-yellow-500' :
-                                item.status === 'downloading' ? 'bg-cyan-500 animate-pulse' :
-                                item.status === 'uploading' ? 'bg-blue-500 animate-pulse' :
+
+            <div className="max-h-64 overflow-y-auto p-2 space-y-2">
+                {items.map(item => {
+                    const active = item.status === 'uploading' || item.status === 'downloading';
+                    const showProgress = active || item.status === 'pausing' || item.status === 'paused';
+                    const filename = (item.url || item.path).split('/').pop();
+
+                    return (
+                        <div key={item.id} className="flex flex-col gap-1.5 p-2.5 bg-telegram-hover rounded-lg">
+                            <div className="flex items-center gap-2.5 text-sm">
+                                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                                    item.status === 'pending' ? 'bg-yellow-500' :
+                                    item.status === 'pausing' ? 'bg-yellow-400 animate-pulse' :
+                                    item.status === 'paused' ? 'bg-yellow-400' :
+                                    item.status === 'downloading' ? 'bg-cyan-500 animate-pulse' :
+                                    item.status === 'uploading' ? 'bg-blue-500 animate-pulse' :
                                     item.status === 'cancelled' ? 'bg-gray-500' :
-                                        item.status === 'error' ? 'bg-red-500' : 'bg-green-500'
+                                    item.status === 'error' ? 'bg-red-500' : 'bg-green-500'
                                 }`} />
-                            <div className="flex-1 truncate text-telegram-subtext" title={item.url || item.path}>
-                                {(item.url || item.path).split('/').pop()}
-                            </div>
-                            {(item.status === 'uploading' || item.status === 'downloading') && (
-                                <button onClick={() => onCancelItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Cancel">
-                                    <X className="w-3.5 h-3.5" />
-                                </button>
-                            )}
-                            {item.status === 'pending' && (
-                                <button onClick={() => onCancelItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Remove">
-                                    <X className="w-3.5 h-3.5" />
-                                </button>
-                            )}
-                            {(item.status === 'error' || item.status === 'cancelled') && (
-                                <button onClick={() => onRetryItem(item.id)} className="text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0" title="Retry">
-                                    <RotateCcw className="w-3.5 h-3.5" />
-                                </button>
-                            )}
-                        </div>
-                        {(item.status === 'uploading' || item.status === 'downloading') && (
-                            <>
-                                <div className="w-full bg-telegram-border h-1 mt-1 rounded-full overflow-hidden">
-                                    {item.status === 'uploading' && item.uploadPhase === 'preparing' && (item.uploadedBytes ?? 0) === 0 ? (
-                                        <div className="bg-blue-500 h-full w-full animate-progress-indeterminate" />
-                                    ) : item.progress !== undefined ? (
-                                        <div
-                                            className={`${item.status === 'downloading' ? 'bg-cyan-500' : 'bg-blue-500'} h-full rounded-full transition-all duration-300`}
-                                            style={{ width: `${item.progress}%` }}
-                                        />
-                                    ) : (
-                                        <div className={`${item.status === 'downloading' ? 'bg-cyan-500' : 'bg-blue-500'} h-full w-full animate-progress-indeterminate`} />
-                                    )}
+
+                                <div className="flex-1 truncate text-telegram-subtext" title={item.url || item.path}>
+                                    {filename}
                                 </div>
-                                <div className="flex justify-between text-[10px] text-telegram-subtext mt-0.5">
-                                    <span className="tabular-nums">
-                                        {item.status === 'downloading' ? (
-                                            <>Caching: {item.uploadedBytes !== undefined && item.totalBytes !== undefined
-                                                ? formatBytes(item.uploadedBytes) + ' / ' + formatBytes(item.totalBytes)
-                                                : item.progress !== undefined ? item.progress + '%' : ''}</>
-                                        ) : item.uploadPhase === 'preparing' ? (
-                                            <>{(item.uploadedBytes ?? 0) > 0
-                                                ? 'Preparing next part… ' + formatBytes(item.uploadedBytes!) + ' uploaded'
-                                                : 'Preparing first upload part…'}</>
+
+                                {active && (
+                                    <>
+                                        <button onClick={() => onPauseItem(item.id)} className="p-1 text-gray-400 hover:text-yellow-400 transition-colors" title="Pause">
+                                            <Pause className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                            <X className="w-3.5 h-3.5" />
+                                        </button>
+                                    </>
+                                )}
+
+                                {item.status === 'pausing' && (
+                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+
+                                {item.status === 'paused' && (
+                                    <>
+                                        <button onClick={() => onResumeItem(item.id)} className="p-1 text-gray-400 hover:text-green-400 transition-colors" title="Resume">
+                                            <Play className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                            <X className="w-3.5 h-3.5" />
+                                        </button>
+                                    </>
+                                )}
+
+                                {item.status === 'pending' && (
+                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+
+                                {(item.status === 'error' || item.status === 'cancelled') && (
+                                    <button onClick={() => onRetryItem(item.id)} className="p-1 text-gray-400 hover:text-blue-400 transition-colors" title="Retry">
+                                        <RotateCcw className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+                            </div>
+
+                            {showProgress && (
+                                <>
+                                    <div className="relative w-full bg-telegram-border h-1 rounded-full overflow-hidden">
+                                        {active && (item.uploadedBytes ?? 0) === 0 ? (
+                                            <div className="bg-blue-500 h-full w-1/2 animate-progress-indeterminate" />
                                         ) : (
-                                            <>Uploading: {item.uploadedBytes !== undefined && item.totalBytes !== undefined
-                                                ? formatBytes(item.uploadedBytes) + ' / ' + formatBytes(item.totalBytes)
-                                                : item.progress !== undefined ? item.progress + '%' : ''}</>
+                                            <>
+                                                <div
+                                                    className={`${item.status === 'downloading' ? 'bg-cyan-500' : 'bg-blue-500'} h-full rounded-full transition-[width] duration-700 ease-out`}
+                                                    style={{ width: `${Math.max(0, Math.min(100, item.progress ?? 0))}%` }}
+                                                />
+                                                {active && (item.speedBytesPerSec ?? 0) > 0 && (
+                                                    <div className="absolute inset-y-0 w-1/4 bg-white/20 animate-progress-indeterminate" />
+                                                )}
+                                            </>
                                         )}
-                                    </span>
-                                    <span className="w-[92px] flex-shrink-0 text-right tabular-nums">
-                                        {item.uploadPhase !== 'preparing' && item.speedBytesPerSec !== undefined
-                                            ? formatBytes(item.speedBytesPerSec) + '/s'
-                                            : ''}
-                                    </span>
+                                    </div>
+
+                                    <div className="flex justify-between text-[10px] text-telegram-subtext">
+                                        <span className="tabular-nums truncate pr-2">
+                                            {item.status === 'pausing'
+                                                ? 'Pausing…'
+                                                : item.status === 'paused'
+                                                    ? 'Paused'
+                                                    : item.status === 'downloading'
+                                                    ? `Caching: ${item.uploadedBytes !== undefined && item.totalBytes !== undefined ? `${formatBytes(item.uploadedBytes)} / ${formatBytes(item.totalBytes)}` : ''}`
+                                                    : item.uploadPhase === 'preparing'
+                                                        ? ((item.uploadedBytes ?? 0) > 0
+                                                            ? `Preparing next part… ${formatBytes(item.uploadedBytes!)} uploaded`
+                                                            : 'Preparing first upload part…')
+                                                        : (active && (item.uploadedBytes ?? 0) === 0
+                                                            ? 'Starting upload…'
+                                                            : `Uploading: ${item.uploadedBytes !== undefined && item.totalBytes !== undefined ? `${formatBytes(item.uploadedBytes)} / ${formatBytes(item.totalBytes)}` : item.progress !== undefined ? `${item.progress}%` : ''}`)}
+                                        </span>
+                                        <span className="w-[92px] flex-shrink-0 text-right tabular-nums">
+                                            {item.status === 'pausing'
+                                                ? 'Pausing…'
+                                                : item.status === 'paused'
+                                                    ? ''
+                                                    : item.uploadPhase !== 'preparing' && item.speedBytesPerSec !== undefined
+                                                        ? (active && item.speedBytesPerSec === 0 ? 'Waiting…' : `${formatBytes(item.speedBytesPerSec)}/s avg`)
+                                                        : ''}
+                                        </span>
+                                    </div>
+                                </>
+                            )}
+
+                            {item.status === 'success' && <div className="text-[10px] text-green-400">Completed</div>}
+                            {item.status === 'error' && item.error && (
+                                <div className="flex items-center gap-1 text-xs text-red-400">
+                                    <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                                    <span className="truncate">{item.error}</span>
                                 </div>
-                            </>
-                        )}
-                        {item.status === 'error' && item.error && (
-                            <div className="flex items-center gap-1 text-xs text-red-400 mt-1">
-                                <AlertCircle className="w-3 h-3 flex-shrink-0" />
-                                <span className="truncate">{item.error}</span>
-                            </div>
-                        )}
-                        {item.status === 'cancelled' && <div className="text-xs text-gray-400 mt-0.5">Cancelled</div>}
-                    </div>
-                ))}
+                            )}
+                            {item.status === 'cancelled' && <div className="text-xs text-gray-400">Cancelled</div>}
+                        </div>
+                    );
+                })}
             </div>
         </div>
-    )
+    );
 }

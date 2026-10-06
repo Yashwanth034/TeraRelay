@@ -68,7 +68,7 @@ export interface QueueItem {
     path: string;
     url?: string;
     folderId: number | null;
-    status: 'pending' | 'downloading' | 'uploading' | 'success' | 'error' | 'cancelled';
+    status: 'pending' | 'pausing' | 'paused' | 'downloading' | 'uploading' | 'success' | 'error' | 'cancelled';
     error?: string;
     progress?: number; // 0-100
     uploadedBytes?: number;
@@ -88,7 +88,7 @@ export interface DownloadItem {
     messageId: number;
     filename: string;
     folderId: number | null;
-    status: 'pending' | 'downloading' | 'success' | 'error' | 'cancelled';
+    status: 'pending' | 'pausing' | 'paused' | 'downloading' | 'success' | 'error' | 'cancelled';
     error?: string;
     progress?: number; // 0-100
     downloadedBytes?: number;
@@ -228,4 +228,20 @@ export interface VideoMetadata {
     track_count: number;
     width: number | null;
     height: number | null;
+}
+
+export interface MediaTrackInfo {
+    index: number;
+    kind: 'audio' | 'subtitle';
+    codec: string;
+    language: string | null;
+    title: string | null;
+    channels: number | null;
+}
+
+export interface MediaTrackProbe {
+    audio_tracks: MediaTrackInfo[];
+    subtitle_tracks: MediaTrackInfo[];
+    duration_secs?: number | null;
+    start_time_secs?: number | null;
 }

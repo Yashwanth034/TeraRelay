@@ -128,15 +128,10 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             await invoke('cmd_logout');
             await invoke('cmd_clean_cache');
 
-            try {
-                await invoke('cmd_delete_saved_api_credentials');
-            } catch {
-                toast.error('Signed out, but TeraRelay could not clear the operating-system credential entry.');
-            }
-
+            // Keep the saved Telegram API ID/hash. They identify the application,
+            // not the signed-in Telegram account, so the next login should only
+            // require the phone/code flow.
             if (store) {
-                await store.delete('api_id');
-                await store.delete('api_hash');
                 await store.delete('folders');
                 await store.save();
             }

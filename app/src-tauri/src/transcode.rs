@@ -920,7 +920,7 @@ pub async fn execute_transcode_pipeline(
 
 #[tauri::command]
 pub async fn cmd_get_transcode_capabilities(
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<TranscodeCapabilities, String> {
     // Lazy detection: if FFmpeg hasn't been detected yet, try now.
@@ -968,7 +968,7 @@ pub async fn cmd_prepare_transcoded_stream(
     folder_id: Option<i64>,
     quality: String,
     state: tauri::State<'_, TelegramState>,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<TranscodePrepareResult, String> {
     let folder_id = folder_id.unwrap_or(0);
     let key = TranscodeKey {
@@ -1186,7 +1186,7 @@ async fn get_duration_from_media(
 #[tauri::command]
 pub async fn cmd_get_transcode_status(
     job_id: String,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<TranscodeStatusResult, String> {
     let jobs = manager.jobs.lock().await;
     let job_arc = jobs
@@ -1224,7 +1224,7 @@ pub async fn cmd_get_transcode_status(
 #[tauri::command]
 pub async fn cmd_cancel_transcode(
     job_id: String,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<(), String> {
     let jobs = manager.jobs.lock().await;
     let job_arc = jobs
@@ -1289,7 +1289,7 @@ pub struct CachedVariantInfo {
 pub async fn cmd_get_cached_variants(
     message_id: i32,
     folder_id: Option<i64>,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<Vec<CachedVariantInfo>, String> {
     let folder_id = folder_id.unwrap_or(0);
     let file_key = format!("{}_{}", folder_id, message_id);
@@ -1498,7 +1498,7 @@ pub async fn cmd_clear_transcode_cache(
 pub async fn cmd_get_master_playlist_info(
     message_id: i32,
     folder_id: Option<i64>,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<MasterPlaylistInfo, String> {
     let folder_id = folder_id.unwrap_or(0);
     let file_key = format!("{}_{}", folder_id, message_id);
@@ -1748,4 +1748,25 @@ pub fn configure_hls_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(hls_master_playlist)
         .service(hls_playlist)
         .service(hls_segment);
+}
+
+#[cfg(test)]
+mod playback_manager_tests {
+    use super::*;
+    use std::any::TypeId;
+
+    fn assert_capability_state<T: Send + Sync + 'static, F>(
+        _: impl Fn(tauri::State<'static, T>, tauri::AppHandle) -> F,
+    ) {
+        assert_eq!(
+            TypeId::of::<T>(),
+            TypeId::of::<Arc<TranscodeManager>>(),
+            "Playback command requests a manager type that app setup never registers"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_capability_command_uses_the_registered_shared_manager() {
+        assert_capability_state(cmd_get_transcode_capabilities);
+    }
 }

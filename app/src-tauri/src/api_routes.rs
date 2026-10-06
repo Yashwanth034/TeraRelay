@@ -569,6 +569,7 @@ async fn api_download_file(
                             .mime_type()
                             .unwrap_or("application/octet-stream")
                             .to_string(),
+                        Media::Photo(_) => "image/jpeg".to_string(),
                         _ => "application/octet-stream".to_string(),
                     };
                     let filename = match &media {

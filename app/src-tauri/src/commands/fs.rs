@@ -869,14 +869,13 @@ impl SpeedWindow {
         let now = std::time::Instant::now();
         self.samples.push_back((now, self.total));
 
-        // Five seconds keeps the UI readable across TDLib's bursty progress
-        // callbacks while remaining 100% based on real acknowledged bytes.
-        // Keep one older boundary sample.
+        // Average measured traffic across coalesced TDLib reports. File-byte
+        // progress remains independent of this presentation window.
         while self.samples.len() > 2 {
             let remove = self
                 .samples
                 .get(1)
-                .map(|(time, _)| now.duration_since(*time).as_secs_f64() > 5.0)
+                .map(|(time, _)| now.duration_since(*time).as_secs_f64() > 12.0)
                 .unwrap_or(false);
             if remove {
                 self.samples.pop_front();
@@ -1532,6 +1531,123 @@ async fn upload_range_fast(
     Ok((uploaded, hash))
 }
 
+fn checked_upload_part_count(size: u64, part_size: u64) -> Result<u32, String> {
+    if part_size == 0 {
+        return Err("Upload part size must be positive".to_string());
+    }
+    u32::try_from(size.div_ceil(part_size).max(1))
+        .map_err(|_| "File requires more parts than the supported part-number range".to_string())
+}
+
+/// Fetch bounded metadata batches; reconstruction still follows the manifest
+/// IDs explicitly rather than relying on Telegram response order.
+pub(crate) async fn get_messages_in_batches(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    ids: &[i32],
+) -> Result<Vec<Option<grammers_client::types::Message>>, String> {
+    let mut messages = Vec::with_capacity(ids.len());
+    for batch in ids.chunks(100) {
+        messages.extend(
+            client
+                .get_messages_by_id(peer, batch)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(messages)
+}
+
+async fn verified_upload_parts(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    path: &str,
+    base: &str,
+    total: u32,
+    part_size: u64,
+    journal: &crate::commands::transfers::UploadJournal,
+) -> Result<HashMap<u32, (i32, u64, Option<String>)>, String> {
+    let checkpoint_ids: Vec<i32> = journal
+        .snapshot
+        .chunks
+        .values()
+        .map(|chunk| chunk.message_id as i32)
+        .collect();
+    let messages = get_messages_in_batches(client, peer, &checkpoint_ids).await?;
+    let message_map: HashMap<i32, _> = messages
+        .into_iter()
+        .flatten()
+        .map(|message| (message.id(), message))
+        .collect();
+    let mut verified = HashMap::new();
+    for chunk in journal.snapshot.chunks.values() {
+        let Some(message) = message_map.get(&(chunk.message_id as i32)) else {
+            continue;
+        };
+        let Some(Media::Document(document)) = message.media() else {
+            continue;
+        };
+        if document.size() as u64 != chunk.size {
+            continue;
+        }
+        let correct_caption = if total == 1 {
+            true
+        } else {
+            let name = message_display_name(message);
+            parse_part_name(&name).is_some_and(|(b, i, t, h)| {
+                b == base && i == chunk.index && t == total && h == chunk.sha256.as_deref()
+            })
+        };
+        if correct_caption {
+            verified.insert(
+                chunk.index,
+                (chunk.message_id as i32, chunk.size, chunk.sha256.clone()),
+            );
+        }
+    }
+    let reject_legacy_collisions = journal.snapshot.logical_file_id.is_none();
+    if total > 1 && (reject_legacy_collisions || verified.len() < total as usize) {
+        let discovered = find_parts(client, peer, base, total, reject_legacy_collisions).await?;
+        for (index, (id, size, hash)) in discovered {
+            let owned = verified.get(&index);
+            if !reject_legacy_collisions && owned.is_some() {
+                continue;
+            }
+            let offset = (u64::from(index) - 1) * part_size;
+            let expected = part_size.min(journal.snapshot.source.size - offset);
+            let own_id = owned.is_some_and(|(own_id, _, _)| *own_id == id);
+            if reject_legacy_collisions && (size != expected || (hash.is_none() && !own_id)) {
+                return Err("A different or unverified multipart file already uses this filename. Choose another filename before uploading.".to_string());
+            }
+            if size != expected || (hash.is_none() && !own_id) {
+                continue;
+            }
+            let local_hash = match owned.and_then(|(_, _, hash)| hash.clone()) {
+                Some(hash) => Some(hash),
+                None if hash.is_some() => {
+                    Some(crate::commands::transfers::hash_file_range(path, offset, expected).await?)
+                }
+                None => None,
+            };
+            if reject_legacy_collisions {
+                legacy_source_part_matches(
+                    expected,
+                    local_hash.as_deref(),
+                    size,
+                    hash.as_deref(),
+                    own_id,
+                )?;
+            }
+            if hash.is_some() && local_hash.as_deref() == hash.as_deref() {
+                verified.entry(index).or_insert((id, size, hash));
+            }
+        }
+    }
+    // No remote documents are deleted merely because a different same-name
+    // file or an interrupted transfer used the same multipart layout.
+    Ok(verified)
+}
+
 pub fn split_part_name(base: &str, idx: u32, total: u32) -> String {
     format!("{}{}{:03}-{:03}", base, SPLIT_MARKER, idx, total)
 }
@@ -1546,9 +1662,8 @@ pub fn split_part_caption(base: &str, idx: u32, total: u32, hash: Option<&str>) 
 }
 
 /// Parses "<base>.tgdpart<NNN>-<TTT>[#<sha256 hex>]" into (base, idx, total, hash).
-/// Strict: exactly 3 digits each side of '-', 1 <= idx <= total; hash, when
-/// present, is exactly 64 lowercase hex chars. Parts uploaded before checksums
-/// existed have no hash and stay valid.
+/// Strict: canonical decimal numbers padded to at least 3 digits, 1 <= idx
+/// <= total; hash, when present, is exactly 64 lowercase hex chars.
 pub fn parse_part_name(name: &str) -> Option<(&str, u32, u32, Option<&str>)> {
     let pos = name.rfind(SPLIT_MARKER)?;
     let suffix = &name[pos + SPLIT_MARKER.len()..];
@@ -1562,17 +1677,18 @@ pub fn parse_part_name(name: &str) -> Option<(&str, u32, u32, Option<&str>)> {
         }
         None => (suffix, None),
     };
-    let bytes = nums.as_bytes();
-    if bytes.len() != 7 || bytes[3] != b'-' {
-        return None;
-    }
-    if !nums[..3].bytes().all(|b| b.is_ascii_digit())
-        || !nums[4..].bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let idx: u32 = nums[..3].parse().ok()?;
-    let total: u32 = nums[4..].parse().ok()?;
+    let (idx_text, total_text) = nums.split_once('-')?;
+    let parse_number = |text: &str| -> Option<u32> {
+        if !(3..=10).contains(&text.len())
+            || !text.bytes().all(|b| b.is_ascii_digit())
+            || (text.len() > 3 && text.starts_with('0'))
+        {
+            return None;
+        }
+        text.parse().ok()
+    };
+    let idx = parse_number(idx_text)?;
+    let total = parse_number(total_text)?;
     if idx == 0 || total == 0 || idx > total || name[..pos].is_empty() {
         return None;
     }
@@ -1658,29 +1774,6 @@ impl tokio::io::AsyncRead for ProgressReader {
 }
 
 /// Delete a partial file with retries (best-effort cleanup)
-fn cleanup_partial_file(path: &str) {
-    let path = path.to_string();
-    std::thread::spawn(move || {
-        for attempt in 0..5 {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    log::info!("Cleaned up partial file: {}", path);
-                    return;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(e) => {
-                    log::warn!(
-                        "Cleanup attempt {}/5 failed for {}: {}",
-                        attempt + 1,
-                        path,
-                        e
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            }
-        }
-    });
-}
 
 #[tauri::command]
 pub async fn cmd_cancel_transfer(
@@ -1848,115 +1941,130 @@ async fn cmd_upload_file_inner(
         }
     };
 
-    // Files above the part size are split into multiple documents named
-    // "<name>.tgdpart<NNN>-<TTT>"; the listing collapses them back into one.
+    // Multipart numbering is checked independently of file size. The
+    // manifest preflight runs before any data upload or large allocation.
     let part_size = split_part_size().max(1);
-    let total_parts = size.div_ceil(part_size).max(1);
-    if total_parts > 999 {
+    let total_parts = checked_upload_part_count(size, part_size).map_err(|error| {
         bw_state.release_up(size);
-        return Err(format!(
-            "File too large: would need {} parts (max 999)",
-            total_parts
-        ));
+        error
+    })?;
+    crate::commands::logical_files::ensure_upload_manifest_capacity(
+        logical_channel_id.as_deref().unwrap_or("saved-messages"),
+        &file_name,
+        size,
+        total_parts,
+    )
+    .map_err(|error| {
+        bw_state.release_up(size);
+        error
+    })?;
+
+    let mut journal = crate::commands::transfers::UploadJournal::open(
+        db_pool.inner().clone(),
+        &path,
+        &tid,
+        folder_id,
+        part_size,
+        logical_file_id,
+    )
+    .await
+    .map_err(|error| {
+        bw_state.release_up(size);
+        error
+    })?;
+    let logical_file_id = journal.snapshot.logical_file_id.clone();
+    if journal.snapshot.source.size != size {
+        bw_state.release_up(size);
+        return Err(
+            "Upload source changed since this transfer was saved. Select the file as a new upload."
+                .to_string(),
+        );
     }
 
-    // Upload resume: reuse parts already on Telegram from a previous
-    // interrupted upload of the same file (matched by name + part layout,
-    // validated by exact part size). Mismatched parts are replaced.
-    let (upload_indices, done_bytes, existing_parts) = if total_parts > 1 {
-        let resume_result: Result<
-            (Vec<u32>, u64, HashMap<u32, (i32, u64, Option<String>)>),
-            String,
-        > = async {
-            let existing = find_parts(&client, &peer, &file_name, total_parts as u32).await?;
-            let (to_upload, to_delete, done) =
-                parts_to_upload(size, part_size, total_parts as u32, &existing);
-            if !to_delete.is_empty() {
-                log::info!(
-                    "Resume: replacing {} mismatched part(s) of {}",
-                    to_delete.len(),
-                    file_name
-                );
-                client
-                    .delete_messages(&peer, &to_delete)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok((to_upload, done, existing))
-        }
-        .await;
-        let (to_upload, done, existing) = match resume_result {
-            Ok(r) => r,
-            Err(e) => {
-                bw_state.release_up(size);
-                return Err(e);
-            }
-        };
-        if done > 0 {
-            log::info!(
-                "Resume: {}/{} parts of {} already uploaded ({} bytes)",
-                total_parts - to_upload.len() as u64,
-                total_parts,
-                file_name,
-                done
-            );
-            // Only the remaining bytes will actually transfer
-            bw_state.release_up(done);
-        }
-        (to_upload, done, existing)
-    } else {
-        (vec![1u32], 0u64, HashMap::new())
-    };
-
-    // Build the future manifest from already-valid resumed chunks first. New
-    // chunks are added below as Telegram returns their exact message IDs.
+    // Locally journaled parts are tied to this unchanged source. Legacy
+    // caption checksums must match the actual local range before reuse.
+    let existing_parts = verified_upload_parts(
+        &client,
+        &peer,
+        &path,
+        &file_name,
+        total_parts,
+        part_size,
+        &journal,
+    )
+    .await
+    .map_err(|error| {
+        bw_state.release_up(size);
+        error
+    })?;
+    let (upload_indices, _, done_bytes) =
+        parts_to_upload(size, part_size, total_parts, &existing_parts);
     let mut manifest_chunks: std::collections::BTreeMap<
         u32,
         crate::commands::logical_files::ManifestChunkV1,
-    > = std::collections::BTreeMap::new();
-    for (idx, (message_id, chunk_size, sha256)) in &existing_parts {
-        let expected_size = part_size.min(size - (*idx as u64 - 1) * part_size);
-        if *chunk_size == expected_size {
-            manifest_chunks.insert(
-                *idx,
+    > = existing_parts
+        .iter()
+        .map(|(index, (message_id, chunk_size, hash))| {
+            (
+                *index,
                 crate::commands::logical_files::ManifestChunkV1 {
-                    index: *idx,
-                    message_id: *message_id as i64,
+                    index: *index,
+                    message_id: i64::from(*message_id),
                     size: *chunk_size,
-                    sha256: sha256.clone(),
+                    sha256: hash.clone(),
                 },
-            );
-        }
-    }
+            )
+        })
+        .collect();
+    journal
+        .replace_chunks(manifest_chunks.clone())
+        .map_err(|error| {
+            bw_state.release_up(size);
+            error
+        })?;
+    journal.verify_source(&path).await.map_err(|error| {
+        bw_state.release_up(size);
+        error
+    })?;
+    bw_state.release_up(done_bytes);
 
-    // Cumulative Telegram-acknowledged byte counter shared by every upload
-    // chunk, so progress and speed cover the whole file. It starts at bytes
-    // already verified on Telegram by resume and advances only after an upload
-    // part RPC returns true.
+    // Authoritative file-byte counter shared by every upload chunk. It starts
+    // at bytes already verified on Telegram by resume. TDLib progress updates
+    // come from getFile/updateFile, never from protocol/network overhead.
     let file_size = size;
     let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(done_bytes));
+    // Separate live network byte counter for throughput only. On Linux TDLib
+    // this advances from getNetworkStatistics; fallback transports continue to
+    // derive speed from their authoritative file-byte counter.
+    let network_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let use_tdlib_network_speed = cfg!(all(target_os = "linux", target_arch = "x86_64"));
 
-    // Report progress at a readable cadence. Speed is a rolling throughput
-    // measurement over real Telegram-acknowledged bytes only; no interpolation,
-    // guessed carry-forward, or frontend animation is used.
     let cancelled = state.cancelled_transfers.clone();
     let progress_tid = tid.clone();
     let progress_handle = app_handle.clone();
     let progress_counter = bytes_counter.clone();
+    let progress_network_counter = network_counter.clone();
     let progress_task = if !tid.is_empty() {
         Some(tokio::spawn(async move {
-            // Start the speed baseline at the resumed byte count so the first
-            // sample cannot include bytes from a previous upload attempt.
-            let mut last_bytes: u64 = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
+            let mut last_speed_bytes: u64 = if use_tdlib_network_speed {
+                progress_network_counter.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                progress_counter.load(std::sync::atomic::Ordering::Relaxed)
+            };
             let mut last_time = std::time::Instant::now();
             let mut speed_window = SpeedWindow::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let speed_bytes = if use_tdlib_network_speed {
+                    progress_network_counter.load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    current
+                };
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last_time).as_secs_f64();
-                let acknowledged = current.saturating_sub(last_bytes);
-                let speed = speed_window.update(acknowledged, dt);
+                let transferred = speed_bytes.saturating_sub(last_speed_bytes);
+                let speed = speed_window.update(transferred, dt);
                 let percent = if file_size > 0 {
                     ((current as f64 / file_size as f64) * 100.0).min(99.0) as u8
                 } else {
@@ -1974,7 +2082,7 @@ async fn cmd_upload_file_inner(
                     },
                 );
 
-                last_bytes = current;
+                last_speed_bytes = speed_bytes;
                 last_time = now;
 
                 if current >= file_size {
@@ -2059,25 +2167,27 @@ async fn cmd_upload_file_inner(
                         );
                     }
 
+                    journal.verify_source(&path).await?;
                     let message_id = crate::tdlib_fast::upload_document(
                         tdlib_state.inner(),
                         destination,
                         path.clone(),
                         String::new(),
                         bytes_counter.clone(),
+                        network_counter.clone(),
                         cancel_rx.clone(),
                     )
                     .await?;
 
-                    manifest_chunks.insert(
-                        idx,
-                        crate::commands::logical_files::ManifestChunkV1 {
-                            index: idx,
-                            message_id,
-                            size,
-                            sha256: None,
-                        },
-                    );
+                    journal.verify_source(&path).await?;
+                    let chunk = crate::commands::logical_files::ManifestChunkV1 {
+                        index: idx,
+                        message_id,
+                        size,
+                        sha256: None,
+                    };
+                    journal.record(chunk.clone())?;
+                    manifest_chunks.insert(idx, chunk);
                 }
                 return Ok(());
             }
@@ -2086,11 +2196,15 @@ async fn cmd_upload_file_inner(
             // first part is prepared/hashed before upload; while TDLib uploads
             // it, the next part is copied+hashed concurrently. This removes the
             // prepare/upload/prepare gap without changing the split format.
+            let expected_source = journal.snapshot.source.clone();
             let prepare_part = |idx: u32| {
                 let app_handle = app_handle.clone();
                 let source_path = path.clone();
                 let logical_name = file_name.clone();
+                let expected_source = expected_source.clone();
                 async move {
+                    crate::commands::transfers::verify_source(&source_path, &expected_source)
+                        .await?;
                     let offset = (idx as u64 - 1) * part_size;
                     let len = part_size.min(size - offset);
                     let doc_name = split_part_name(&logical_name, idx, total_parts as u32);
@@ -2102,6 +2216,17 @@ async fn cmd_upload_file_inner(
                         &doc_name,
                     )
                     .await?;
+                    if let Err(error) =
+                        crate::commands::transfers::verify_source(&source_path, &expected_source)
+                            .await
+                    {
+                        let parent = temp_path.parent().map(|p| p.to_path_buf());
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        if let Some(parent) = parent {
+                            let _ = tokio::fs::remove_dir(parent).await;
+                        }
+                        return Err(error);
+                    }
                     let caption = format!("{}#{}", doc_name, hash);
                     Ok::<_, String>((idx, len, temp_path, caption, hash))
                 }
@@ -2152,6 +2277,7 @@ async fn cmd_upload_file_inner(
                         upload_path,
                         caption,
                         bytes_counter.clone(),
+                        network_counter.clone(),
                         cancel_rx.clone(),
                     );
                     let prepare_future = prepare_part(next_idx);
@@ -2170,16 +2296,19 @@ async fn cmd_upload_file_inner(
                         }
                     };
 
-                    manifest_chunks.insert(
-                        idx,
-                        crate::commands::logical_files::ManifestChunkV1 {
-                            index: idx,
-                            message_id,
-                            size: len,
-                            sha256: Some(hash),
-                        },
-                    );
-
+                    let chunk = crate::commands::logical_files::ManifestChunkV1 {
+                        index: idx,
+                        message_id,
+                        size: len,
+                        sha256: Some(hash),
+                    };
+                    if let Err(error) = journal.record(chunk.clone()) {
+                        if let Ok((_, _, next_temp, _, _)) = next_result {
+                            cleanup_temp(next_temp).await;
+                        }
+                        return Err(error);
+                    }
+                    manifest_chunks.insert(idx, chunk);
                     current = next_result?;
                     continue;
                 }
@@ -2190,6 +2319,7 @@ async fn cmd_upload_file_inner(
                     upload_path,
                     caption,
                     bytes_counter.clone(),
+                    network_counter.clone(),
                     cancel_rx.clone(),
                 )
                 .await;
@@ -2197,15 +2327,14 @@ async fn cmd_upload_file_inner(
                 cleanup_temp(temp_path).await;
 
                 let message_id = result?;
-                manifest_chunks.insert(
-                    idx,
-                    crate::commands::logical_files::ManifestChunkV1 {
-                        index: idx,
-                        message_id,
-                        size: len,
-                        sha256: Some(hash),
-                    },
-                );
+                let chunk = crate::commands::logical_files::ManifestChunkV1 {
+                    index: idx,
+                    message_id,
+                    size: len,
+                    sha256: Some(hash),
+                };
+                journal.record(chunk.clone())?;
+                manifest_chunks.insert(idx, chunk);
                 break;
             }
 
@@ -2291,15 +2420,15 @@ async fn cmd_upload_file_inner(
                     &peer,
                 )
                 .await?;
-                manifest_chunks.insert(
-                    idx,
-                    crate::commands::logical_files::ManifestChunkV1 {
-                        index: idx,
-                        message_id,
-                        size: len,
-                        sha256: chunk_hash,
-                    },
-                );
+                journal.verify_source(&path).await?;
+                let chunk = crate::commands::logical_files::ManifestChunkV1 {
+                    index: idx,
+                    message_id,
+                    size: len,
+                    sha256: chunk_hash,
+                };
+                journal.record(chunk.clone())?;
+                manifest_chunks.insert(idx, chunk);
             }
             Ok(())
         }
@@ -2335,6 +2464,12 @@ async fn cmd_upload_file_inner(
         return Err(err);
     }
 
+    journal.verify_source(&path).await.map_err(|error| {
+        bw_state.release_up(size.saturating_sub(done_bytes));
+        error
+    })?;
+    let mut published_manifest_id = None;
+
     // TeraRelay channels publish one small hidden manifest after all physical
     // Telegram documents are present. The manifest is the cross-device source
     // of truth for the logical filename, size, chunk order, IDs and checksums.
@@ -2364,18 +2499,29 @@ async fn cmd_upload_file_inner(
             chunks,
         };
 
-        upload_logical_manifest_document(
-            &client,
-            &app_handle,
-            &manifest,
-            &peer,
-        )
-        .await
-        .map_err(|error| {
-            format!(
-                "File data is stored, but TeraRelay could not publish its logical manifest: {error}. Retry the upload to recover without re-uploading valid chunks."
+        // A crash after publication but before queue removal must recover the
+        // same logical file rather than publish a second logical file ID.
+        let existing_manifest = if journal.resumed {
+            matching_upload_manifest(
+                &client,
+                &peer,
+                &manifest,
+                journal.snapshot.manifest_message_id,
             )
-        })?;
+            .await?
+        } else {
+            None
+        };
+        published_manifest_id = Some(match existing_manifest {
+            Some(id) => id,
+            None => upload_logical_manifest_document(
+                &client, &app_handle, &manifest, &peer,
+            ).await.map_err(|error| {
+                format!(
+                    "File data is stored, but TeraRelay could not publish its logical manifest: {error}. Retry the upload to recover without re-uploading valid chunks."
+                )
+            })?,
+        });
 
         let persist_result = {
             let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
@@ -2391,6 +2537,8 @@ async fn cmd_upload_file_inner(
             );
         }
     }
+
+    journal.complete(published_manifest_id)?;
 
     // Bandwidth was already reserved by try_reserve_up at start
     if !tid.is_empty() {
@@ -2624,6 +2772,40 @@ async fn find_logical_manifest_message_ids(
     Ok(ids)
 }
 
+async fn matching_upload_manifest(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    manifest: &crate::commands::logical_files::LogicalFileManifestV1,
+    known_message_id: Option<i64>,
+) -> Result<Option<i64>, String> {
+    let ids = match known_message_id {
+        Some(id) => {
+            vec![i32::try_from(id).map_err(|_| "Invalid saved manifest message ID".to_string())?]
+        }
+        None => find_logical_manifest_message_ids(client, peer, &manifest.file_id).await?,
+    };
+    let messages = get_messages_in_batches(client, peer, &ids).await?;
+    for message in messages.into_iter().flatten() {
+        let Some(media @ Media::Document(_)) = message.media() else {
+            continue;
+        };
+        let mut existing = crate::commands::logical_files::download_manifest(
+            client,
+            &media,
+            Some(&manifest.file_id),
+            Some(&manifest.logical_channel_id),
+        )
+        .await?;
+        // Retry time is not file identity. All data, order and checksum fields
+        // must still agree before an already-published manifest is accepted.
+        existing.created_at = manifest.created_at;
+        if &existing == manifest {
+            return Ok(Some(i64::from(message.id())));
+        }
+    }
+    Ok(None)
+}
+
 async fn upload_logical_manifest_document(
     client: &grammers_client::Client,
     app_handle: &tauri::AppHandle,
@@ -2672,11 +2854,54 @@ fn message_display_name(msg: &grammers_client::types::Message) -> String {
 /// Scans the chat for part messages matching (base, total).
 /// Returns part index -> (message id, document size, optional SHA-256).
 /// Same O(n) cost as the folder listing.
+fn legacy_source_part_matches(
+    expected_size: u64,
+    expected_hash: Option<&str>,
+    actual_size: u64,
+    actual_hash: Option<&str>,
+    owned: bool,
+) -> Result<(), String> {
+    let hash_agrees = match (expected_hash, actual_hash) {
+        (Some(a), Some(b)) => a == b,
+        (_, None) => owned,
+        _ => false,
+    };
+    if expected_size == actual_size && hash_agrees {
+        Ok(())
+    } else {
+        Err("A different or unverified multipart file already uses this filename. Choose another filename before uploading.".to_string())
+    }
+}
+
+fn insert_part_candidate(
+    found: &mut HashMap<u32, (i32, u64, Option<String>)>,
+    index: u32,
+    candidate: (i32, u64, Option<String>),
+    reject_conflicts: bool,
+) -> Result<(), String> {
+    if let Some(existing) = found.get(&index) {
+        let same_data = existing.1 == candidate.1
+            && match (&existing.2, &candidate.2) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+        if reject_conflicts && existing.0 != candidate.0 && !same_data {
+            return Err(format!(
+                "Multipart part {index} has conflicting versions with the same filename. Cannot safely combine these parts; use the original logical file or upload with a different filename."
+            ));
+        }
+    } else {
+        found.insert(index, candidate);
+    }
+    Ok(())
+}
+
 async fn find_parts(
     client: &grammers_client::Client,
     peer: &Peer,
     base: &str,
     total: u32,
+    reject_conflicts: bool,
 ) -> Result<HashMap<u32, (i32, u64, Option<String>)>, String> {
     let mut found: HashMap<u32, (i32, u64, Option<String>)> = HashMap::new();
     let mut msgs = client.iter_messages(peer);
@@ -2687,9 +2912,17 @@ async fn find_parts(
         };
         if let Some((b, i, t, hash)) = parse_part_name(&message_display_name(&m)) {
             if b == base && t == total {
-                found
-                    .entry(i)
-                    .or_insert((m.id(), doc_size, hash.map(str::to_string)));
+                insert_part_candidate(
+                    &mut found,
+                    i,
+                    (m.id(), doc_size, hash.map(str::to_string)),
+                    reject_conflicts,
+                )?;
+                // Explicit manifest uploads can select the newest candidates.
+                // Legacy reconstruction must scan older duplicates as well.
+                if !reject_conflicts && found.len() == total as usize {
+                    break;
+                }
             }
         }
     }
@@ -2729,7 +2962,39 @@ fn parts_to_upload(
 /// [message_id] for regular files, all sibling ".tgdpart" messages (sorted by
 /// part index) for split files. With require_complete, errors if a part is
 /// missing; otherwise returns whatever parts exist (used by delete).
-async fn resolve_parts(
+fn ordered_part_ids(
+    base: &str,
+    total: u32,
+    found: &HashMap<u32, (i32, u64, Option<String>)>,
+    require_complete: bool,
+) -> Result<Vec<i32>, String> {
+    // Allocate and iterate only actual messages, never an untrusted caption's
+    // declared total (which can now contain more than three digits).
+    let mut parts: Vec<_> = found.iter().collect();
+    parts.sort_unstable_by_key(|(index, _)| **index);
+    if require_complete {
+        for (position, (index, _)) in parts.iter().enumerate() {
+            let expected = position as u64 + 1;
+            if u64::from(**index) != expected {
+                return Err(format!(
+                    "Split file '{}': part {}/{} is missing",
+                    base, expected, total
+                ));
+            }
+        }
+        if parts.len() as u64 != u64::from(total) {
+            return Err(format!(
+                "Split file '{}': part {}/{} is missing",
+                base,
+                parts.len() as u64 + 1,
+                total
+            ));
+        }
+    }
+    Ok(parts.into_iter().map(|(_, (id, _, _))| *id).collect())
+}
+
+pub(crate) async fn resolve_parts(
     client: &grammers_client::Client,
     peer: &Peer,
     message_id: i32,
@@ -2750,22 +3015,9 @@ async fn resolve_parts(
         None => return Ok(vec![message_id]),
     };
 
-    let found = find_parts(client, peer, base, total).await?;
+    let found = find_parts(client, peer, base, total, true).await?;
 
-    let mut ids = Vec::with_capacity(total as usize);
-    for i in 1..=total {
-        match found.get(&i) {
-            Some((id, _, _)) => ids.push(*id),
-            None if require_complete => {
-                return Err(format!(
-                    "Split file '{}': part {}/{} is missing",
-                    base, i, total
-                ));
-            }
-            None => {}
-        }
-    }
-    Ok(ids)
+    ordered_part_ids(base, total, &found, require_complete)
 }
 
 #[tauri::command]
@@ -3386,10 +3638,7 @@ pub async fn cmd_download_file(
     } else {
         resolve_parts(&client, &peer, message_id, true).await?
     };
-    let messages = client
-        .get_messages_by_id(&peer, &part_ids)
-        .await
-        .map_err(|e| e.to_string())?;
+    let messages = get_messages_in_batches(&client, &peer, &part_ids).await?;
 
     // Telegram normally returns requested messages in order, but logical file
     // reconstruction must not depend on that implementation detail. Reorder
@@ -3455,12 +3704,17 @@ pub async fn cmd_download_file(
             (telegram_size, hash)
         };
 
-        total_size += part_expected.unwrap_or(match &media {
-            Media::Photo(_) => 1024 * 1024,
-            _ => 0,
-        });
+        total_size = total_size
+            .checked_add(part_expected.unwrap_or(match &media {
+                Media::Photo(_) => 1024 * 1024,
+                _ => 0,
+            }))
+            .ok_or_else(|| "Download file size overflow".to_string())?;
         expected_total = match (expected_total, part_expected) {
-            (Some(acc), Some(size)) => Some(acc + size),
+            (Some(acc), Some(size)) => Some(
+                acc.checked_add(size)
+                    .ok_or_else(|| "Download file size overflow".to_string())?,
+            ),
             _ => None,
         };
         parts.push((media, part_expected, part_hash));
@@ -3471,6 +3725,14 @@ pub async fn cmd_download_file(
         .or(expected_total);
 
     bw_state.try_reserve_down(total_size)?;
+
+    let mut output = crate::download_output::DownloadOutput::create(&actual_save_path, &tid)
+        .await
+        .map_err(|error| {
+            bw_state.release_down(total_size);
+            error
+        })?;
+    let staged_save_path = output.path().to_string();
 
     // Emit start
     if !tid.is_empty() {
@@ -3518,20 +3780,25 @@ pub async fn cmd_download_file(
         };
 
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let network_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let emitter = if !tid.is_empty() {
             let emit_counter = counter.clone();
+            let emit_network_counter = network_counter.clone();
             let emit_tid = tid.clone();
             let emit_handle = app_handle.clone();
             Some(tokio::spawn(async move {
-                let mut last_bytes = 0u64;
+                let mut last_speed_bytes = 0u64;
                 let mut last_time = std::time::Instant::now();
                 let mut speed_smoother = SpeedWindow::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
+                    let speed_bytes =
+                        emit_network_counter.load(std::sync::atomic::Ordering::Relaxed);
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(last_time).as_secs_f64();
-                    let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
+                    let speed =
+                        speed_smoother.update(speed_bytes.saturating_sub(last_speed_bytes), dt);
                     let percent = if total_size > 0 {
                         ((current as f64 / total_size as f64) * 100.0).min(99.0) as u8
                     } else {
@@ -3547,7 +3814,7 @@ pub async fn cmd_download_file(
                             speed_bytes_per_sec: speed,
                         },
                     );
-                    last_bytes = current;
+                    last_speed_bytes = speed_bytes;
                     last_time = now;
                     if current >= total_size {
                         break;
@@ -3583,9 +3850,10 @@ pub async fn cmd_download_file(
         let result = crate::tdlib_fast::download_documents(
             tdlib_state.inner(),
             destination,
-            actual_save_path.clone(),
+            staged_save_path.clone(),
             chunks,
             counter,
+            network_counter,
             cancel_rx,
             false,
         )
@@ -3606,7 +3874,6 @@ pub async fn cmd_download_file(
                 Some(outcome.bytes_downloaded)
             }
             Err(error) => {
-                cleanup_partial_file(&actual_save_path);
                 bw_state.release_down(total_size);
                 return Err(error);
             }
@@ -3625,7 +3892,7 @@ pub async fn cmd_download_file(
             &net_config,
             &app_handle,
             &tid,
-            &actual_save_path,
+            &staged_save_path,
             &parts,
             total_size,
         )
@@ -3636,7 +3903,6 @@ pub async fn cmd_download_file(
                 if e == "Transfer cancelled" {
                     state.cancelled_transfers.write().await.remove(&tid);
                 }
-                cleanup_partial_file(&actual_save_path);
                 bw_state.release_down(total_size);
                 return Err(e);
             }
@@ -3645,7 +3911,7 @@ pub async fn cmd_download_file(
         // Single document/photo: stream sequentially with inline progress
         // (photos have no exact expected size, so no preallocation here)
         let (media, part_expected, _) = &parts[0];
-        let mut file = tokio::fs::File::create(&actual_save_path)
+        let mut file = tokio::fs::File::create(&staged_save_path)
             .await
             .map_err(|e| {
                 bw_state.release_down(total_size);
@@ -3664,7 +3930,6 @@ pub async fn cmd_download_file(
             if state.cancelled_transfers.read().await.contains(&tid) {
                 state.cancelled_transfers.write().await.remove(&tid);
                 drop(file);
-                cleanup_partial_file(&actual_save_path);
                 bw_state.release_down(total_size);
                 return Err("Transfer cancelled".to_string());
             }
@@ -3692,7 +3957,6 @@ pub async fn cmd_download_file(
                         continue;
                     }
                     drop(file);
-                    cleanup_partial_file(&actual_save_path);
                     bw_state.release_down(total_size);
                     return Err(format!("Download chunk error: {}", err));
                 }
@@ -3747,7 +4011,6 @@ pub async fn cmd_download_file(
         if let Some(expected) = part_expected {
             if *expected > 0 && downloaded != *expected {
                 drop(file);
-                cleanup_partial_file(&actual_save_path);
                 bw_state.release_down(total_size);
                 return Err(format!(
                     "Incomplete download before saving: expected {} bytes, received {} bytes",
@@ -3759,13 +4022,11 @@ pub async fn cmd_download_file(
         // Explicitly flush, sync, and close the file before JNI/MediaStore copies it.
         if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
             drop(file);
-            cleanup_partial_file(&actual_save_path);
             bw_state.release_down(total_size);
             return Err(format!("Failed to flush downloaded file: {}", e));
         }
         if let Err(e) = file.sync_all().await {
             drop(file);
-            cleanup_partial_file(&actual_save_path);
             bw_state.release_down(total_size);
             return Err(format!("Failed to sync downloaded file: {}", e));
         }
@@ -3773,17 +4034,15 @@ pub async fn cmd_download_file(
         downloaded
     };
 
-    let actual_written = tokio::fs::metadata(&actual_save_path)
+    let actual_written = tokio::fs::metadata(&staged_save_path)
         .await
         .map_err(|e| format!("Downloaded file missing before save: {}", e))?
         .len();
     if actual_written == 0 {
-        cleanup_partial_file(&actual_save_path);
         bw_state.release_down(total_size);
         return Err("Downloaded file was empty before saving".to_string());
     }
     if actual_written != downloaded {
-        cleanup_partial_file(&actual_save_path);
         bw_state.release_down(total_size);
         return Err(format!(
             "Downloaded file size mismatch before saving: streamed {} bytes, file has {} bytes",
@@ -3792,7 +4051,6 @@ pub async fn cmd_download_file(
     }
     if let Some(expected) = expected_file_size {
         if expected > 0 && downloaded != expected {
-            cleanup_partial_file(&actual_save_path);
             bw_state.release_down(total_size);
             return Err(format!(
                 "Incomplete download before saving: expected {} bytes, received {} bytes",
@@ -3800,6 +4058,11 @@ pub async fn cmd_download_file(
             ));
         }
     }
+    output.publish().await.map_err(|error| {
+        bw_state.release_down(total_size);
+        error
+    })?;
+
     log::info!(
         "Download completed to cache path {} ({} bytes)",
         actual_save_path,
@@ -4489,7 +4752,7 @@ pub async fn cmd_scan_folders(
                         is_public,
                         group_id: None,
                         display_order: 0,
-                        role: None,
+                        role: Some(if c.raw.creator { "owner" } else { "member" }.to_string()),
                     });
                     continue;
                 }
@@ -4521,7 +4784,7 @@ pub async fn cmd_scan_folders(
                                         is_public,
                                         group_id: None,
                                         display_order: 0,
-                                        role: None,
+                                        role: Some("owner".to_string()),
                                     });
                                 }
                             }
@@ -4580,22 +4843,29 @@ pub async fn cmd_zip_folder(folder_path: String) -> Result<String, String> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "folder".to_string());
 
-    let zip_path = std::env::temp_dir().join(format!("{}.zip", folder_name));
+    let zip_dir =
+        std::env::temp_dir().join(format!("terarelay-zip-{:032x}", rand::random::<u128>()));
+    std::fs::create_dir(&zip_dir)
+        .map_err(|e| format!("Failed to create archive directory: {e}"))?;
+    let zip_path = zip_dir.join(format!("{}.zip", folder_name));
     let src_owned = src.clone();
     let out_path = zip_path.clone();
+    let archive_dir = zip_dir.clone();
 
     // Run blocking I/O on a dedicated thread so we don't stall the async runtime
-    let (zip_path_str, zip_size) = tokio::task::spawn_blocking(move || {
+    let archive_result = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::create(&out_path)
             .map_err(|e| format!("Failed to create zip file: {}", e))?;
         let mut zip_writer = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
 
         for entry in walkdir::WalkDir::new(&src_owned)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_entry(|entry| entry.path() != archive_dir)
         {
+            let entry = entry.map_err(|e| format!("Failed to read folder entry: {e}"))?;
             let path = entry.path();
             let relative = path.strip_prefix(&src_owned).unwrap_or(path);
 
@@ -4622,9 +4892,20 @@ pub async fn cmd_zip_folder(folder_path: String) -> Result<String, String> {
         let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
         Ok::<(String, u64), String>((out_path.to_string_lossy().to_string(), size))
     })
-    .await
-    .map_err(|e| format!("Zip task panicked: {}", e))?
-    .map_err(|e: String| e)?;
+    .await;
+    let (zip_path_str, zip_size) = match archive_result {
+        Ok(Ok(archive)) => archive,
+        result => {
+            // Only remove the output owned by this archive attempt.
+            let _ = std::fs::remove_file(&zip_path);
+            let _ = std::fs::remove_dir(&zip_dir);
+            return Err(match result {
+                Ok(Err(error)) => error,
+                Err(error) => format!("Zip task panicked: {}", error),
+                Ok(Ok(_)) => unreachable!(),
+            });
+        }
+    };
 
     log::info!(
         "Zipped '{}' -> '{}' ({} bytes)",
@@ -4655,11 +4936,177 @@ pub async fn cmd_delete_temp_zip(path: String) -> Result<(), String> {
             return Err("Refusing to delete file outside temp directory".to_string());
         }
         std::fs::remove_file(&canonical_p).map_err(|e| e.to_string())?;
+        if let Some(parent) = canonical_p.parent() {
+            if parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("terarelay-zip-"))
+            {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
         log::info!("Cleaned up temp zip: {}", path_clone);
         Ok(())
     })
     .await
     .map_err(|e| format!("Task panicked: {}", e))?
+}
+
+#[cfg(test)]
+mod focused_transfer_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bursty_network_updates_keep_a_measured_average_between_reports() {
+        let now = Instant::now();
+        let bytes = 32 * 1024 * 1024;
+        let samples: VecDeque<_> = (0..=48)
+            .map(|tick| {
+                (
+                    now - Duration::from_millis((48 - tick) * 250),
+                    if tick < 8 { 0 } else { bytes },
+                )
+            })
+            .collect();
+        let mut window = SpeedWindow {
+            total: bytes,
+            samples,
+        };
+        let speed = window.update(0, 0.25);
+        assert!(
+            speed > 2 * 1024 * 1024 && speed < 4 * 1024 * 1024,
+            "Coalesced reporting gap produced {speed} B/s instead of the measured average"
+        );
+    }
+
+    #[test]
+    fn measured_average_eventually_reaches_zero_after_a_real_stall() {
+        let now = Instant::now();
+        let bytes = 32 * 1024 * 1024;
+        let samples: VecDeque<_> = (0..=80)
+            .map(|tick| {
+                (
+                    now - Duration::from_millis((80 - tick) * 250),
+                    if tick < 8 { 0 } else { bytes },
+                )
+            })
+            .collect();
+        let mut window = SpeedWindow {
+            total: bytes,
+            samples,
+        };
+        assert_eq!(window.update(0, 0.25), 0);
+    }
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        archives: Vec<std::path::PathBuf>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            for path in &self.archives {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_archives_reserve_zip64_and_preserve_large_entry_contents() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut fixture = Fixture {
+            root: std::env::temp_dir()
+                .join(format!("terarelay-zip64-qa-{}", rand::random::<u64>())),
+            archives: Vec::new(),
+        };
+        std::fs::create_dir_all(&fixture.root).unwrap();
+        // The normal suite verifies the ZIP64 wire format with a small file.
+        // A targeted run can exercise the real 4 GiB boundary with a sparse source.
+        let size = std::env::var("TERA_QA_ZIP64_BYTES")
+            .ok()
+            .map(|value| value.parse::<u64>().unwrap())
+            .unwrap_or(1024);
+        let first = b"zip64-first";
+        let last = b"zip64-last";
+        assert!(size > (first.len() + last.len()) as u64);
+        let mut source = std::fs::File::create(fixture.root.join("large.bin")).unwrap();
+        source.set_len(size).unwrap();
+        source.write_all(first).unwrap();
+        source.seek(SeekFrom::End(-(last.len() as i64))).unwrap();
+        source.write_all(last).unwrap();
+        drop(source);
+        let path = cmd_zip_folder(fixture.root.to_string_lossy().into())
+            .await
+            .unwrap();
+        fixture.archives.push(path.clone().into());
+        let encoded = std::fs::read(&path).unwrap();
+        assert_eq!(&encoded[..4], b"PK\x03\x04");
+        assert_eq!(
+            u32::from_le_bytes(encoded[18..22].try_into().unwrap()),
+            u32::MAX,
+            "Folder archive lacks the ZIP64 compressed-size reservation"
+        );
+        assert_eq!(
+            u32::from_le_bytes(encoded[22..26].try_into().unwrap()),
+            u32::MAX,
+            "Folder archive lacks the ZIP64 uncompressed-size reservation"
+        );
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entry = archive.by_name("large.bin").unwrap();
+        assert_eq!(entry.size(), size);
+        let mut prefix = vec![0; first.len()];
+        entry.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, first);
+        let middle = size - (first.len() + last.len()) as u64;
+        assert_eq!(
+            std::io::copy(&mut (&mut entry).take(middle), &mut std::io::sink()).unwrap(),
+            middle
+        );
+        let mut suffix = vec![0; last.len()];
+        entry.read_exact(&mut suffix).unwrap();
+        assert_eq!(suffix, last);
+        assert_eq!(entry.read(&mut [0]).unwrap(), 0);
+        println!("PASS actual folder ZIP64 round trip: {size} bytes");
+    }
+
+    #[tokio::test]
+    async fn folder_uploads_with_the_same_name_keep_independent_archives() {
+        let name = format!("terarelay-folder-qa-{}", rand::random::<u64>());
+        let mut fixture = Fixture {
+            root: std::env::temp_dir().join(format!("{name}-root")),
+            archives: Vec::new(),
+        };
+        let first = fixture.root.join("one").join(&name);
+        let second = fixture.root.join("two").join(&name);
+        std::fs::create_dir_all(first.join("nested")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("nested/data.txt"), b"first folder").unwrap();
+        std::fs::write(second.join("other.txt"), b"second folder").unwrap();
+        let first_zip = cmd_zip_folder(first.to_string_lossy().into())
+            .await
+            .unwrap();
+        fixture.archives.push(first_zip.clone().into());
+        let second_zip = cmd_zip_folder(second.to_string_lossy().into())
+            .await
+            .unwrap();
+        fixture.archives.push(second_zip.clone().into());
+        assert_ne!(
+            first_zip, second_zip,
+            "Second folder overwrote an archive queued for upload"
+        );
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(first_zip).unwrap()).unwrap();
+        let mut contents = String::new();
+        archive
+            .by_name("nested/data.txt")
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "first folder");
+    }
 }
 
 /// Toggle a folder (channel) between private and public.
@@ -5598,10 +6045,11 @@ pub async fn cmd_upload_from_url(
 #[cfg(test)]
 mod split_tests {
     use super::{
-        adapt_upload_parallelism, clean_file_uri, parse_part_name, split_part_caption,
-        split_part_name, telegram_upload_chunk_size, upload_pool_plan, SPLIT_PART_SIZE,
-        UPLOAD_MAIN_SINGLE_WORKERS, UPLOAD_PART_WORKERS,
+        adapt_upload_parallelism, checked_upload_part_count, clean_file_uri, ordered_part_ids,
+        parse_part_name, split_part_caption, split_part_name, telegram_upload_chunk_size,
+        upload_pool_plan, SPLIT_PART_SIZE, UPLOAD_MAIN_SINGLE_WORKERS, UPLOAD_PART_WORKERS,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn file_uri_normalization_decodes_ios_paths() {
@@ -5691,6 +6139,135 @@ mod split_tests {
         assert_eq!(binary_4gib, 4_294_967_296);
         assert_eq!(binary_4gib.div_ceil(SPLIT_PART_SIZE), 3);
         assert_eq!(binary_4gib - (2 * SPLIT_PART_SIZE), 294_967_296);
+    }
+
+    #[test]
+    fn large_part_numbers_round_trip_without_a_three_digit_ceiling() {
+        for (caption, index, total) in [
+            ("movie.mkv.tgdpart1000-1001", 1000, 1001),
+            ("backup.tar.zst.tgdpart001-5000", 1, 5000),
+            ("backup.tar.zst.tgdpart5000-5000", 5000, 5000),
+            ("data.bin.tgdpart4294967295-4294967295", u32::MAX, u32::MAX),
+        ] {
+            let base = caption.split(".tgdpart").next().unwrap();
+            assert_eq!(parse_part_name(caption), Some((base, index, total, None)));
+            assert_eq!(split_part_name(base, index, total), caption);
+        }
+        let hash = "b".repeat(64);
+        let caption = format!("movie.mkv.tgdpart1100-1100#{hash}");
+        assert_eq!(
+            parse_part_name(&caption),
+            Some(("movie.mkv", 1100, 1100, Some(hash.as_str())))
+        );
+        assert_eq!(
+            parse_part_name("data.bin.tgdpart4294967296-4294967296"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn large_sparse_file_ranges_keep_offsets_above_two_terabytes() {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("terarelay-sparse-{}.bin", rand::random::<u64>()));
+        let _cleanup = Cleanup(path.clone());
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        file.set_len(2_199_023_255_552).await.unwrap();
+        let offset = 2_199_023_255_520;
+        let marker = b"terarelay-large-offset-marker-12";
+        assert_eq!(marker.len(), 32);
+        file.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
+        file.write_all(marker).await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut reader = super::ProgressReader::new_range(
+            path.to_str().unwrap(),
+            offset,
+            32,
+            counter.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, marker);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 32);
+        use sha2::Digest;
+        let expected = format!("{:x}", sha2::Sha256::digest(marker));
+        assert_eq!(reader.finalize_hash(), Some(expected));
+        assert_eq!(
+            tokio::fs::metadata(&path).await.unwrap().len(),
+            2_199_023_255_552
+        );
+    }
+
+    #[test]
+    fn legacy_part_candidates_reject_mixed_generations_and_unproven_duplicates() {
+        let mut found = HashMap::new();
+        super::insert_part_candidate(&mut found, 1, (20, 10, Some("b".repeat(64))), true).unwrap();
+        super::insert_part_candidate(&mut found, 2, (12, 5, Some("a".repeat(64))), true).unwrap();
+        // An older conflicting candidate must still be checked after all
+        // declared indices were found in the newest messages.
+        assert!(
+            super::insert_part_candidate(&mut found, 1, (11, 10, Some("a".repeat(64))), true)
+                .is_err()
+        );
+        let mut identical = HashMap::new();
+        super::insert_part_candidate(&mut identical, 1, (20, 10, Some("a".repeat(64))), true)
+            .unwrap();
+        super::insert_part_candidate(&mut identical, 1, (11, 10, Some("a".repeat(64))), true)
+            .unwrap();
+        assert_eq!(identical[&1].0, 20);
+        assert!(super::insert_part_candidate(
+            &mut identical,
+            1,
+            (10, 9, Some("a".repeat(64))),
+            true
+        )
+        .is_err());
+        assert!(super::insert_part_candidate(&mut identical, 1, (9, 10, None), true).is_err());
+        let mut old = HashMap::new();
+        super::insert_part_candidate(&mut old, 1, (10, 10, None), true).unwrap();
+        assert!(super::insert_part_candidate(&mut old, 1, (9, 10, None), true).is_err());
+        assert!(super::legacy_source_part_matches(10, Some("a"), 10, Some("b"), false).is_err());
+        assert!(super::legacy_source_part_matches(10, Some("a"), 10, None, false).is_err());
+        super::legacy_source_part_matches(10, Some("a"), 10, Some("a"), false).unwrap();
+        super::legacy_source_part_matches(10, None, 10, None, true).unwrap();
+    }
+
+    #[test]
+    fn large_part_ordering_uses_actual_messages_and_reports_gaps() {
+        let mut found = HashMap::new();
+        found.insert(u32::MAX, (99, 1, None));
+        found.insert(2, (22, 1, None));
+        found.insert(1, (11, 1, None));
+        assert_eq!(
+            ordered_part_ids("file", u32::MAX, &found, false).unwrap(),
+            vec![11, 22, 99]
+        );
+        assert!(ordered_part_ids("file", u32::MAX, &found, true)
+            .unwrap_err()
+            .contains("part 3/"));
+        let complete: HashMap<_, _> = (1..=5000).rev().map(|i| (i, (i as i32, 1, None))).collect();
+        assert_eq!(
+            ordered_part_ids("file", 5000, &complete, true).unwrap(),
+            (1..=5000).collect::<Vec<i32>>()
+        );
+        assert_eq!(
+            checked_upload_part_count(10_000_000_000_000, 2_000_000_000).unwrap(),
+            5000
+        );
+        assert!(checked_upload_part_count(u64::MAX, 1).is_err());
+        assert!(checked_upload_part_count(1, 0).is_err());
     }
 
     #[test]

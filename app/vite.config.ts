@@ -12,6 +12,10 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  build: {
+    // DesktopDashboard intentionally bundles the file-management and media-player UI.
+    chunkSizeWarningLimit: 1700,
+  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

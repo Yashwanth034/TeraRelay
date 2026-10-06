@@ -63,7 +63,7 @@ export function ExternalDropBlocker({ onFilesDropped, onUploadClick, disabled = 
             } catch (error) {
                 // Native drag/drop is intentionally disabled on some platforms;
                 // the DOM fallback below remains available there.
-                console.debug('[ExternalDropBlocker] Native drag/drop unavailable:', error);
+                void error;
             }
         })();
 

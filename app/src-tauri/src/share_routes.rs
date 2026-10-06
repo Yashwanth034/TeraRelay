@@ -92,7 +92,7 @@ fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLin
 /// NOTE: This HTML contains an inline `<style>` block which requires
 /// `style-src 'unsafe-inline'` in the Tauri CSP (tauri.conf.json).
 /// This is acceptable because the page is served only over the local
-/// Actix streaming server (127.0.0.1/0.0.0.0:14201), not the public internet,
+/// Actix streaming server on the loopback interface (127.0.0.1:14201), not the public internet,
 /// so the XSS attack surface is minimal.
 fn render_password_form(file_name: &str, token: &str, error: Option<&str>) -> HttpResponse {
     let error_html = match error {
@@ -317,10 +317,9 @@ async fn verify_shared_file_password(
 
     if verify_password(&form.password, hash) {
         // Set session cookie (30 min).
-        // NOTE: The streaming share server binds to 0.0.0.0 over plain HTTP (not HTTPS),
-        // so the cookie cannot use `.secure(true)` without becoming unusable.
-        // The cookie is protected by `.http_only(true)` and `.same_site(Strict)`
-        // to mitigate XSS and CSRF within the constraints of a local-network HTTP service.
+        // The streaming share server is loopback-only and uses plain HTTP, so the
+        // cookie cannot use `.secure(true)` without becoming unusable. It remains
+        // protected by `.http_only(true)` and `.same_site(Strict)`.
         let val = generate_cookie_val(&token, hash);
         let cookie = Cookie::build(format!("share_auth_{}", token), val)
             .path(format!("/d/{}", token))

@@ -259,9 +259,7 @@ export function AdaptiveMediaPlayer({
     }, []);
 
     // ── Logging helpers ─────────────────────────────────────────────
-    const log = useCallback((msg: string, ...args: unknown[]) => {
-        console.log(`[AdaptivePlayer] ${msg}`, ...args);
-    }, []);
+    const log = useCallback((_msg: string, ..._args: unknown[]) => {}, []);
     // Wire late-bound refs for the progressive handler
     logRef.current = log;
 
@@ -909,7 +907,7 @@ export function AdaptiveMediaPlayer({
         const onHlsMetadata = () => {
             const v = hlsVideoRef.current;
             if (v) {
-                console.log('[AdaptivePlayer] HLS metadata', {
+                log('HLS metadata', {
                     width: v.videoWidth,
                     height: v.videoHeight,
                     src: v.currentSrc,

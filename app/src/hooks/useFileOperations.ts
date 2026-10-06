@@ -162,9 +162,9 @@ export function useFileOperations(
         };
         try {
             const dirPath = await pickWithFallback(
-                () => import('@tauri-apps/plugin-dialog').then(d => d.open({
+                () => open({
                     directory: true, multiple: false, title: "Download Folder To..."
-                })),
+                }),
                 () => handleDownloadFolder(),
                 {
                     errorTitle: 'Folder picker failed',

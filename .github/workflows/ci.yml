@@ -2,6 +2,11 @@ name: Cross-platform CI
 
 on:
   workflow_dispatch:
+    inputs:
+      source_only:
+        description: Run source checks without rebuilding installers
+        type: boolean
+        default: false
   push:
     branches: [main]
   pull_request:
@@ -26,7 +31,14 @@ jobs:
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y             libwebkit2gtk-4.1-dev             libayatana-appindicator3-dev             librsvg2-dev             patchelf             xdg-utils
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            ffmpeg
+          ffmpeg -version
 
       - uses: actions/setup-node@v7
         with:
@@ -65,6 +77,7 @@ jobs:
         run: cargo check --locked
 
       - name: Rust tests
+        timeout-minutes: 10
         working-directory: app/src-tauri
         run: cargo test --locked
 
@@ -72,6 +85,7 @@ jobs:
         run: python3 -m py_compile src-tauri/src/tdlib_fast_worker.py
 
   desktop:
+    if: ${{ !inputs.source_only }}
     name: Desktop package / ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -146,6 +160,7 @@ jobs:
           path: app/src-tauri/target/**/release/bundle/**/*
 
   android:
+    if: ${{ !inputs.source_only }}
     name: Android ARM64 build
     runs-on: ubuntu-24.04
     defaults:
@@ -207,6 +222,7 @@ jobs:
           exit 1
 
   ios-simulator:
+    if: ${{ !inputs.source_only }}
     name: iOS simulator build
     runs-on: macos-latest
     defaults:

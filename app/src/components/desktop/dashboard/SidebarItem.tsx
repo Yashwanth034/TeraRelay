@@ -153,11 +153,11 @@ export function SidebarItem({
                 if (onDrop) onDrop(e);
             }}
             onContextMenu={openContextMenu}
-            className={`group w-full flex items-center transition-all duration-150 cursor-pointer select-none ${collapsed ? 'justify-center p-2.5' : 'gap-3 px-3 py-2'} ${active
-                ? 'bg-telegram-primary/10 text-telegram-primary'
+            className={`tr-sidebar-item group w-full flex items-center cursor-pointer select-none ${collapsed ? 'justify-center p-2.5' : 'gap-3 px-3 py-2'} ${active
+                ? 'tr-sidebar-item--active'
                 : isOver
-                    ? 'bg-telegram-primary/30 text-telegram-text ring-2 ring-telegram-primary scale-[1.02] shadow-lg'
-                    : 'text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text'
+                    ? 'tr-sidebar-item--drop'
+                    : ''
                 }`}
         >
             <Icon className={`w-4 h-4 flex-shrink-0 ${isOver ? 'text-telegram-primary' : ''}`} />
@@ -174,7 +174,7 @@ export function SidebarItem({
                 <div
                     ref={settingsBtnRef}
                     onClick={openSettingsPopover}
-                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-telegram-hover transition-all"
+                    className="tr-sidebar-item__more opacity-0 group-hover:opacity-100"
                     title={t('files.folder_settings')}
                 >
                     <MoreVertical className="w-3.5 h-3.5 text-telegram-subtext hover:text-telegram-text" />
@@ -185,7 +185,7 @@ export function SidebarItem({
             {contextMenu && (
                 <div
                     ref={menuRef}
-                    className="fixed z-[300] min-w-[200px] bg-telegram-surface/95 backdrop-blur-xl border border-telegram-border rounded-lg shadow-2xl p-1.5 flex flex-col gap-0.5 animate-in fade-in zoom-in-95 duration-100"
+                    className="tr-popover fixed z-[300] min-w-[210px] p-1.5 flex flex-col gap-0.5 animate-in fade-in zoom-in-95 duration-100"
                     style={{ left: contextMenu.x, top: contextMenu.y }}
                     onClick={(e) => e.stopPropagation()}
                     onContextMenu={(e) => e.preventDefault()}

@@ -48,22 +48,22 @@ export function RenameFolderModal({ folderId, currentName, onRename, onClose }: 
 
     return (
         <div
-            className="fixed inset-0 z-[250] flex items-center justify-center bg-black/50 backdrop-blur-sm"
+            className="tr-modal-backdrop fixed inset-0 z-[250] flex items-center justify-center p-4"
             onClick={onClose}
         >
             <div
-                className="bg-telegram-surface border border-telegram-border rounded-xl w-[360px] shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150"
+                className="tr-modal w-full max-w-[380px] overflow-hidden animate-in fade-in zoom-in-95 duration-150"
                 onClick={e => e.stopPropagation()}
             >
                 {/* Header */}
-                <div className="p-4 border-b border-telegram-border flex items-center justify-between">
+                <div className="tr-modal-header p-4 flex items-center justify-between">
                     <h3 className="text-telegram-text font-medium flex items-center gap-2">
                         <Pencil className="w-4 h-4 text-blue-400" />
                         {t('files.rename_folder')}
                     </h3>
                     <button
                         onClick={onClose}
-                        className="text-telegram-subtext hover:text-telegram-text transition-colors"
+                        className="tr-modal-close"
                         disabled={isSubmitting}
                     >
                         <X className="w-4 h-4" />
@@ -82,17 +82,17 @@ export function RenameFolderModal({ folderId, currentName, onRename, onClose }: 
                         onChange={e => setName(e.target.value)}
                         onKeyDown={handleKeyDown}
                         maxLength={100}
-                        className="w-full bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-sm text-telegram-text placeholder:text-telegram-subtext/50 focus:outline-none focus:ring-2 focus:ring-telegram-primary/50 focus:border-telegram-primary/50 transition-all"
+                        className="tr-modal-input w-full px-3 py-2 text-sm placeholder:text-telegram-subtext/50"
                         placeholder={t('files.folder_name')}
                         disabled={isSubmitting}
                     />
                 </div>
 
                 {/* Footer */}
-                <div className="p-4 border-t border-telegram-border flex justify-end gap-2 bg-telegram-hover/10">
+                <div className="tr-modal-footer">
                     <button
                         onClick={onClose}
-                        className="px-4 py-2 text-sm font-medium text-telegram-subtext hover:text-telegram-text bg-telegram-hover/50 hover:bg-telegram-hover rounded-lg transition-colors"
+                        className="tr-button tr-button--secondary tr-button--sm"
                         disabled={isSubmitting}
                     >
                         {t('common.cancel')}
@@ -100,7 +100,7 @@ export function RenameFolderModal({ folderId, currentName, onRename, onClose }: 
                     <button
                         onClick={handleSubmit}
                         disabled={isSubmitting || !name.trim() || name.trim() === currentName}
-                        className="px-4 py-2 text-sm font-medium text-white bg-telegram-primary hover:bg-telegram-primary/90 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors"
+                        className="tr-button tr-button--primary tr-button--sm disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                         {isSubmitting ? t('files.renaming') : t('files.rename')}
                     </button>

@@ -1,12 +1,10 @@
 import { useState } from 'react';
-import { Folder, MoreVertical, Check } from 'lucide-react';
+import { Check, Folder, MoreVertical } from 'lucide-react';
 import { TelegramFile } from '../../../types';
-import { createDragGhost, displayFileName, formatCompactTimestamp } from '../../../utils';
-import { FileTypeIcon } from '../../shared/FileTypeIcon';
-import { useVideoMetadata } from '../../../hooks/useVideoMetadata';
-import { useCachedVariants } from '../../../hooks/useCachedVariants';
-import { VideoMetaBadge } from '../../shared/VideoMetaBadge';
-
+import { createDragGhost, displayFileName } from '../../../utils';
+import { getPremiumFileTitle } from '../../../filePresentation';
+import { PremiumFileThumbnail } from '../../shared/PremiumFileThumbnail';
+import { RichFileMetaText } from '../../shared/RichFileMetaText';
 
 interface FileListItemProps {
     file: TelegramFile;
@@ -19,105 +17,108 @@ interface FileListItemProps {
 }
 
 export function FileListItem({
-    file, selectedIds, onFileClick, handleContextMenu,
-    onDragStart, onDragEnd, onDrop
+    file,
+    selectedIds,
+    onFileClick,
+    handleContextMenu,
+    onDragStart,
+    onDragEnd,
+    onDrop,
 }: FileListItemProps) {
     const [isDragOver, setIsDragOver] = useState(false);
     const isFolder = file.type === 'folder';
-
-    // Lazy video metadata badge (.mp4 only)
-    const { data: videoMeta, isLoading: videoMetaLoading } = useVideoMetadata(
-        file.id,
-        file.folder_id ?? null,
-        file.name,
-    );
-
-    // Cached HLS variants
-    const { data: cachedVariants } = useCachedVariants(
-        file.id,
-        file.folder_id ?? null,
-        file.name,
-    );
-    const cachedQualities = (cachedVariants || []).filter(v => v.available).map(v => v.quality);
+    const isSelected = selectedIds.includes(file.id);
+    const title = getPremiumFileTitle(file);
 
     return (
         <div
-            onClick={(e) => onFileClick(e, file.id)}
-            onContextMenu={(e) => handleContextMenu(e, file)}
+            onClick={(event) => onFileClick(event, file.id)}
+            onContextMenu={(event) => handleContextMenu(event, file)}
             draggable
-            onDragStart={(e) => {
-                const idsToDrag = selectedIds.includes(file.id) ? selectedIds : [file.id];
-                if (onDragStart) onDragStart(idsToDrag);
-                e.dataTransfer.setData("application/x-telegram-file-ids", JSON.stringify(idsToDrag));
-                e.dataTransfer.effectAllowed = 'move';
-                const dragCount = idsToDrag.length;
-                const ghost = createDragGhost(file.name, isFolder, dragCount);
-                e.dataTransfer.setDragImage(ghost, 0, 0);
+            onDragStart={(event) => {
+                const idsToDrag = isSelected ? selectedIds : [file.id];
+                onDragStart?.(idsToDrag);
+                event.dataTransfer.setData('application/x-telegram-file-ids', JSON.stringify(idsToDrag));
+                event.dataTransfer.effectAllowed = 'move';
+                const ghost = createDragGhost(file.name, isFolder, idsToDrag.length);
+                event.dataTransfer.setDragImage(ghost, 0, 0);
                 requestAnimationFrame(() => ghost.remove());
             }}
-            onDragEnd={() => {
-                if (onDragEnd) onDragEnd();
+            onDragEnd={() => onDragEnd?.()}
+            onDragOver={(event) => {
+                if (!isFolder) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (!isDragOver) setIsDragOver(true);
             }}
-            onDragOver={(e) => {
-                if (isFolder) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!isDragOver) setIsDragOver(true);
-                }
+            onDragLeave={(event) => {
+                if (!isFolder) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
             }}
-            onDragLeave={(e) => {
-                if (isFolder) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setIsDragOver(false);
-                }
+            onDrop={(event) => {
+                if (!isFolder || !onDrop) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
+                onDrop(event, file.id);
             }}
-            onDrop={(e) => {
-                if (isFolder && onDrop) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setIsDragOver(false);
-                    onDrop(e, file.id);
-                }
-            }}
-            className={`group grid grid-cols-[2rem_minmax(0,1fr)_2.5rem] sm:grid-cols-[2rem_minmax(0,2fr)_6rem_8rem_2.5rem] gap-4 items-center px-4 py-3 rounded-lg cursor-pointer border border-transparent transition-all hover:bg-telegram-hover
-                ${selectedIds.includes(file.id) ? 'bg-telegram-primary/10 border-telegram-primary/20' : ''}
-                ${isDragOver ? 'ring-2 ring-telegram-primary bg-telegram-primary/20' : ''}
-            `}
+            className={[
+                'tr-library-list-row group grid grid-cols-[2rem_minmax(0,1fr)_5rem_2rem] gap-2.5 items-center px-2.5 py-1.5 cursor-pointer',
+                isSelected ? 'tr-library-list-row--selected' : '',
+                isDragOver ? 'tr-library-list-row--drop' : '',
+            ].join(' ')}
         >
-            <div className="flex justify-center">
-                {isFolder ? <Folder className="w-5 h-5 text-telegram-primary" /> : <FileTypeIcon filename={file.name} className="w-5 h-5" />}
-            </div>
-            <div className="min-w-0 truncate text-sm text-telegram-text font-medium">
-                <span>{displayFileName(file.name)}</span>
-                <VideoMetaBadge metadata={videoMeta} isLoading={videoMetaLoading} />
-                {cachedQualities.length > 0 && (
-                    <span className="inline-flex items-center gap-0.5 ml-1.5">
-                        {cachedQualities.map(q => (
-                            <span key={q} className="inline-flex items-center gap-0.5 text-[9px] font-medium text-emerald-400 bg-emerald-500/10 px-1 py-0.5 rounded">
-                                <Check className="w-2.5 h-2.5" />
-                                {q}
-                            </span>
-                        ))}
+            <div className="relative flex justify-center">
+                {isFolder ? (
+                    <span className="tr-library-list-folder">
+                        <Folder className="h-4 w-4" />
+                    </span>
+                ) : (
+                    <PremiumFileThumbnail
+                        file={file}
+                        folderId={file.folder_id ?? null}
+                        className="tr-library-list-thumb"
+                    />
+                )}
+                {isSelected && (
+                    <span className="tr-library-list-check" aria-hidden="true">
+                        <Check className="h-2.5 w-2.5" />
                     </span>
                 )}
             </div>
-            <div className="hidden sm:block text-right text-xs text-telegram-subtext truncate">{file.sizeStr}</div>
-            <div className="hidden sm:block text-right text-xs text-telegram-subtext truncate">{formatCompactTimestamp(file.created_at) || '—'}</div>
 
-            {/* 3-dot Menu Button — in grid flow, not absolutely positioned */}
-            <div className="flex justify-end">
-                <button
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        handleContextMenu(e, file);
-                    }}
-                    className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1 bg-telegram-surface hover:bg-telegram-hover border border-telegram-border shadow-md rounded text-telegram-subtext hover:text-telegram-text transition-all"
-                    aria-label="File actions"
+            <div className="min-w-0">
+                <div
+                    className="truncate text-[12px] font-semibold text-telegram-text"
+                    title={file.stack_name || displayFileName(file.name)}
                 >
-                    <MoreVertical className="w-4 h-4" />
-                </button>
+                    {title}
+                </div>
+                <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[9px] text-telegram-subtext">
+                    <span className="tr-file-quality truncate">
+                        <RichFileMetaText file={file} folderId={file.folder_id ?? null} />
+                    </span>
+
+                </div>
             </div>
+
+            <div className="truncate text-right text-[10px] font-medium text-telegram-subtext">
+                {file.sizeStr}
+            </div>
+
+            <button
+                type="button"
+                onClick={(event) => {
+                    event.stopPropagation();
+                    handleContextMenu(event, file);
+                }}
+                className="tr-library-list-more"
+                aria-label="File actions"
+            >
+                <MoreVertical className="h-3.5 w-3.5" />
+            </button>
         </div>
     );
 }

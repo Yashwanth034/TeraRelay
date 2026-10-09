@@ -28,6 +28,22 @@ interface ApiSettings {
     running: boolean;
 }
 
+interface DriveCryptoStatus {
+    configured: boolean;
+    unlocked: boolean;
+    version: number | null;
+}
+
+interface DriveTrashItem {
+    kind: 'file' | 'folder';
+    id: string;
+    name: string;
+    deleted_at: number;
+    original_directory_id: string | null;
+    size: number | null;
+    restorable: boolean;
+}
+
 type SettingsTab = 'general' | 'themes' | 'proxy' | 'vpn' | 'sharing' | 'about';
 
 const SHOW_ADVANCED_SETTINGS = false;
@@ -48,6 +64,17 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const [vpnDetected, setVpnDetected] = useState<boolean | null>(null);
     const [proxyStatus, setProxyStatus] = useState<{ reachable: boolean; latency_ms: number } | null>(null);
     const [isTestingProxy, setIsTestingProxy] = useState(false);
+
+    const [driveCryptoStatus, setDriveCryptoStatus] = useState<DriveCryptoStatus | null>(null);
+    const [driveCryptoBusy, setDriveCryptoBusy] = useState(false);
+    const [drivePassphrase, setDrivePassphrase] = useState('');
+    const [driveCurrentPassphrase, setDriveCurrentPassphrase] = useState('');
+    const [driveNewPassphrase, setDriveNewPassphrase] = useState('');
+    const [driveConfirmPassphrase, setDriveConfirmPassphrase] = useState('');
+    const [driveTrashOpen, setDriveTrashOpen] = useState(false);
+    const [driveTrash, setDriveTrash] = useState<DriveTrashItem[]>([]);
+    const [driveTrashBusy, setDriveTrashBusy] = useState(false);
+    const [restoringDriveItem, setRestoringDriveItem] = useState<string | null>(null);
 
     // Update check state
     // Reconnect state
@@ -119,6 +146,55 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const [generatedAccessValue, setGeneratedAccessValue] = useState<string | null>(null);
     const [keyCopied, setKeyCopied] = useState(false);
 
+    const fetchDriveCryptoStatus = useCallback(async () => {
+        try {
+            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_status');
+            setDriveCryptoStatus(status);
+        } catch {
+            setDriveCryptoStatus(null);
+        }
+    }, []);
+
+    const clearDrivePassphrases = useCallback(() => {
+        setDrivePassphrase('');
+        setDriveCurrentPassphrase('');
+        setDriveNewPassphrase('');
+        setDriveConfirmPassphrase('');
+    }, []);
+
+    const fetchDriveTrash = useCallback(async () => {
+        setDriveTrashBusy(true);
+        try {
+            const entries = await invoke<DriveTrashItem[]>('cmd_drive_list_trash');
+            setDriveTrash(entries);
+        } catch (error) {
+            toast.error('Could not load TeraRelay Drive recently deleted items: ' + String(error));
+        } finally {
+            setDriveTrashBusy(false);
+        }
+    }, []);
+
+    const restoreDriveTrashItem = async (entry: DriveTrashItem) => {
+        setRestoringDriveItem(entry.id);
+        try {
+            const restoredName = await invoke<string>('cmd_drive_restore_trash_item', {
+                kind: entry.kind,
+                id: entry.id,
+            });
+            await fetchDriveTrash();
+            try {
+                await invoke('cmd_drive_sync_metadata');
+                toast.success('Restored ' + restoredName + ' to TeraRelay Drive');
+            } catch {
+                toast.warning('Restored locally. Remote Drive layout will sync when Telegram is available.');
+            }
+        } catch (error) {
+            toast.error('Could not restore ' + entry.name + ': ' + String(error));
+        } finally {
+            setRestoringDriveItem(null);
+        }
+    };
+
     const fetchApiSettings = useCallback(async () => {
         try {
             const result = await invoke<ApiSettings>('cmd_get_api_settings');
@@ -137,6 +213,12 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             setKeyCopied(false);
         }
     }, [isOpen, fetchApiSettings]);
+
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'general') return;
+        void fetchDriveCryptoStatus();
+        clearDrivePassphrases();
+    }, [isOpen, activeTab, fetchDriveCryptoStatus, clearDrivePassphrases]);
 
     // Fetch transcode cache info
     const fetchTranscodeCache = useCallback(async () => {
@@ -347,6 +429,115 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         }
     };
 
+    const handleDriveCryptoSetup = async () => {
+        if (drivePassphrase.length < 12) {
+            toast.error('Drive passphrase must contain at least 12 characters');
+            return;
+        }
+        if (drivePassphrase !== driveConfirmPassphrase) {
+            toast.error('Drive passphrases do not match');
+            return;
+        }
+        const ok = await confirm({
+            title: 'Enable TeraRelay Drive encryption?',
+            message: 'New and edited Drive file contents will be encrypted before upload. Keep this passphrase safe: another computer needs it to unlock the same Drive.',
+            confirmText: 'Enable encryption',
+            variant: 'info',
+        });
+        if (!ok) return;
+
+        setDriveCryptoBusy(true);
+        try {
+            // Encryption setup is intentionally online-first. Reconcile the
+            // Telegram-synced Drive manifest before generating a new master key
+            // so a second computer cannot accidentally create a competing key.
+            await invoke('cmd_drive_sync_metadata');
+            const current = await invoke<DriveCryptoStatus>('cmd_drive_crypto_status');
+            if (current.configured) {
+                setDriveCryptoStatus(current);
+                clearDrivePassphrases();
+                toast.info('Drive encryption is already configured. Unlock it with the existing passphrase.');
+                return;
+            }
+
+            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_setup', {
+                passphrase: drivePassphrase,
+            });
+            setDriveCryptoStatus(status);
+            clearDrivePassphrases();
+            toast.success('TeraRelay Drive encryption enabled and synced');
+        } catch (error) {
+            void fetchDriveCryptoStatus();
+            toast.error('Could not finish Drive encryption setup: ' + String(error));
+        } finally {
+            setDriveCryptoBusy(false);
+        }
+    };
+
+    const handleDriveCryptoUnlock = async () => {
+        if (!drivePassphrase) {
+            toast.error('Enter your Drive passphrase');
+            return;
+        }
+        setDriveCryptoBusy(true);
+        try {
+            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_unlock', {
+                passphrase: drivePassphrase,
+            });
+            setDriveCryptoStatus(status);
+            clearDrivePassphrases();
+            toast.success('TeraRelay Drive unlocked');
+        } catch (error) {
+            toast.error('Could not unlock Drive: ' + String(error));
+        } finally {
+            setDriveCryptoBusy(false);
+        }
+    };
+
+    const handleDriveCryptoChangePassphrase = async () => {
+        if (!driveCurrentPassphrase) {
+            toast.error('Enter your current Drive passphrase');
+            return;
+        }
+        if (driveNewPassphrase.length < 12) {
+            toast.error('New Drive passphrase must contain at least 12 characters');
+            return;
+        }
+        if (driveNewPassphrase !== driveConfirmPassphrase) {
+            toast.error('New Drive passphrases do not match');
+            return;
+        }
+        setDriveCryptoBusy(true);
+        try {
+            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_change_passphrase', {
+                currentPassphrase: driveCurrentPassphrase,
+                newPassphrase: driveNewPassphrase,
+            });
+            setDriveCryptoStatus(status);
+            clearDrivePassphrases();
+            toast.success('Drive passphrase changed and synced');
+        } catch (error) {
+            void fetchDriveCryptoStatus();
+            toast.error('Could not finish Drive passphrase change: ' + String(error));
+        } finally {
+            setDriveCryptoBusy(false);
+        }
+    };
+
+    const handleDriveCryptoLock = async () => {
+        setDriveCryptoBusy(true);
+        try {
+            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_lock');
+            setDriveCryptoStatus(status);
+            clearDrivePassphrases();
+            toast.success('TeraRelay Drive locked');
+        } catch (error) {
+            toast.error('Could not lock Drive: ' + String(error));
+        } finally {
+            setDriveCryptoBusy(false);
+        }
+    };
+
     return (
         <AnimatePresence>
             {isOpen && (
@@ -354,7 +545,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm"
+                    className="tr-modal-backdrop fixed inset-0 z-[100] flex items-center justify-center p-4"
                     onClick={onClose}
                 >
                     <motion.div
@@ -363,30 +554,30 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         animate={{ opacity: 1, scale: 1, y: 0 }}
                         exit={{ opacity: 0, scale: 0.95, y: 10 }}
                         transition={{ type: 'spring', damping: 25, stiffness: 220 }}
-                        className="bg-telegram-surface border border-telegram-border rounded-xl w-[640px] max-w-[calc(100vw-2rem)] shadow-2xl overflow-hidden flex flex-col"
+                        className="tr-modal tr-settings-modal w-[700px] max-w-[calc(100vw-2rem)] overflow-hidden flex flex-col"
                         onClick={e => e.stopPropagation()}
                     >
                         {/* Header */}
-                        <div className="px-5 py-4 border-b border-telegram-border flex justify-between items-center">
+                        <div className="tr-modal-header px-5 py-4 flex justify-between items-center">
                             <h2 className="text-telegram-text font-semibold text-base">{t('settings.title')}</h2>
                             <button
                                 onClick={onClose}
-                                className="p-1.5 hover:bg-telegram-hover rounded-lg text-telegram-subtext hover:text-telegram-text transition"
+                                className="tr-modal-close"
                             >
                                 <X className="w-4 h-4" />
                             </button>
                         </div>
 
                         {/* Tab Bar */}
-                        <div className="px-5 pt-3 pb-0 grid grid-cols-5 gap-1 border-b border-telegram-border">
+                        <div className="tr-settings-tabs px-4 pt-3 pb-0 grid grid-cols-5 gap-1">
                             {([['general', Globe], ['themes', Palette], ['proxy', Shield], ['sharing', Link], ['about', Info]] as const).map(([key, Icon]) => (
                                 <button
                                     key={key}
                                     onClick={() => setActiveTab(key as SettingsTab)}
-                                    className={`flex min-w-0 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium rounded-t-lg transition-colors ${
+                                    className={`tr-settings-tab flex min-w-0 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium ${
                                         activeTab === key
-                                            ? 'text-telegram-primary border-b-2 border-telegram-primary bg-telegram-primary/5'
-                                            : 'text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover/50'
+                                            ? 'tr-settings-tab--active text-telegram-primary'
+                                            : 'text-telegram-subtext'
                                     }`}
                                 >
                                     <Icon className="w-3.5 h-3.5" />
@@ -396,7 +587,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         </div>
 
                         {/* Body */}
-                        <motion.div layout className="px-5 py-4 max-h-[70vh] overflow-y-auto overflow-x-hidden relative">
+                        <motion.div layout className="tr-settings-body px-5 py-4 max-h-[72vh] overflow-y-auto overflow-x-hidden relative">
                             <AnimatePresence mode="popLayout" initial={false}>
 
                                 {activeTab === 'general' && (
@@ -411,13 +602,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Transfers Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <Upload className="w-3.5 h-3.5" />
                                     {t('settings.transfers')}
                                 </h3>
 
                                 {/* Max Concurrent Uploads */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Upload className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -445,7 +636,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* Max Concurrent Downloads */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Download className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -474,7 +665,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {SHOW_ADVANCED_SETTINGS && (<>
                                 {/* Zip Folders */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <FolderArchive className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -493,7 +684,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             </>)}
 
                                 {/* Hide Folder Groups */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Tag className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -511,7 +702,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {SHOW_ADVANCED_SETTINGS && (<>
                                 {/* Performance Mode */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Zap className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -531,7 +722,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {SHOW_ADVANCED_SETTINGS && (<>
                                 {/* Linux Rendering Fix */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Monitor className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -554,12 +745,12 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Language & Region Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <Languages className="w-3.5 h-3.5" />
                                     {t('settings.language_region')}
                                 </h3>
 
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Globe className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -571,7 +762,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         <select
                                             value={settings.language}
                                             onChange={e => updateSetting('language', e.target.value as any)}
-                                            className="appearance-none bg-telegram-bg border border-telegram-border rounded-md pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
+                                            className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
                                         >
                                             {LANGUAGES.map(lang => (
                                                 <option key={lang.code} value={lang.code}>
@@ -587,13 +778,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                             {SHOW_ADVANCED_SETTINGS && (<>
                             {/* REST API Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <Globe className="w-3.5 h-3.5" />
                                     {t('settings.rest_api')}
                                 </h3>
 
                                 {/* Enable Toggle */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <div className={`w-2 h-2 rounded-full ${apiSettings.running ? 'bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.5)]' : 'bg-gray-500'}`} />
                                         <div>
@@ -613,7 +804,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* Port */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.port')}</p>
                                         <p className="text-xs text-telegram-subtext">1024 - 65535</p>
@@ -680,10 +871,209 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Storage Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <HardDrive className="w-3.5 h-3.5" />
                                     {t('settings.storage')}
                                 </h3>
+
+                                <div className="tr-setting-row p-3 space-y-3">
+                                    <div className="flex items-start justify-between gap-4">
+                                        <div className="flex items-start gap-2.5 min-w-0">
+                                            <Shield className="w-4 h-4 text-telegram-subtext mt-0.5 flex-shrink-0" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-telegram-text font-medium">TeraRelay Drive encryption</p>
+                                                <p className="text-xs text-telegram-subtext mt-0.5 leading-relaxed">
+                                                    Files written after encryption is enabled are protected before Telegram upload. The passphrase is never stored.
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div className="text-xs flex-shrink-0 pt-0.5">
+                                            {driveCryptoStatus === null ? (
+                                                <span className="text-telegram-subtext">Unavailable</span>
+                                            ) : driveCryptoStatus.configured ? (
+                                                <span className={driveCryptoStatus.unlocked ? 'text-emerald-400' : 'text-amber-400'}>
+                                                    {driveCryptoStatus.unlocked ? 'Unlocked' : 'Locked'}
+                                                </span>
+                                            ) : (
+                                                <span className="text-telegram-subtext">Not enabled</span>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {driveCryptoStatus && !driveCryptoStatus.configured && (
+                                        <div className="space-y-2.5 pl-6">
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                <input
+                                                    type="password"
+                                                    value={drivePassphrase}
+                                                    onChange={e => setDrivePassphrase(e.target.value)}
+                                                    placeholder="Passphrase (12+ characters)"
+                                                    autoComplete="new-password"
+                                                    className="bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                                <input
+                                                    type="password"
+                                                    value={driveConfirmPassphrase}
+                                                    onChange={e => setDriveConfirmPassphrase(e.target.value)}
+                                                    placeholder="Confirm passphrase"
+                                                    autoComplete="new-password"
+                                                    onKeyDown={e => { if (e.key === 'Enter') void handleDriveCryptoSetup(); }}
+                                                    className="bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                            </div>
+                                            <div className="flex items-center justify-between gap-3">
+                                                <p className="text-[11px] text-telegram-subtext">
+                                                    Existing unencrypted Drive files stay readable; new and edited files use encryption.
+                                                </p>
+                                                <button
+                                                    onClick={() => void handleDriveCryptoSetup()}
+                                                    disabled={driveCryptoBusy}
+                                                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary text-white hover:opacity-90 transition disabled:opacity-50 flex items-center gap-1.5 flex-shrink-0"
+                                                >
+                                                    {driveCryptoBusy && <Loader2 className="w-3 h-3 animate-spin" />}
+                                                    Enable
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {driveCryptoStatus?.configured && !driveCryptoStatus.unlocked && (
+                                        <div className="flex items-center gap-2 pl-6">
+                                            <input
+                                                type="password"
+                                                value={drivePassphrase}
+                                                onChange={e => setDrivePassphrase(e.target.value)}
+                                                placeholder="Drive passphrase"
+                                                autoComplete="current-password"
+                                                onKeyDown={e => { if (e.key === 'Enter') void handleDriveCryptoUnlock(); }}
+                                                className="flex-1 bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                            />
+                                            <button
+                                                onClick={() => void handleDriveCryptoUnlock()}
+                                                disabled={driveCryptoBusy}
+                                                className="px-3 py-2 rounded-lg text-xs font-medium bg-telegram-primary text-white hover:opacity-90 transition disabled:opacity-50 flex items-center gap-1.5"
+                                            >
+                                                {driveCryptoBusy && <Loader2 className="w-3 h-3 animate-spin" />}
+                                                Unlock
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {driveCryptoStatus?.configured && driveCryptoStatus.unlocked && (
+                                        <div className="space-y-2.5 pl-6">
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                <input
+                                                    type="password"
+                                                    value={driveCurrentPassphrase}
+                                                    onChange={e => setDriveCurrentPassphrase(e.target.value)}
+                                                    placeholder="Current passphrase"
+                                                    autoComplete="current-password"
+                                                    className="bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                                <input
+                                                    type="password"
+                                                    value={driveNewPassphrase}
+                                                    onChange={e => setDriveNewPassphrase(e.target.value)}
+                                                    placeholder="New passphrase"
+                                                    autoComplete="new-password"
+                                                    className="bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                                <input
+                                                    type="password"
+                                                    value={driveConfirmPassphrase}
+                                                    onChange={e => setDriveConfirmPassphrase(e.target.value)}
+                                                    placeholder="Confirm new passphrase"
+                                                    autoComplete="new-password"
+                                                    onKeyDown={e => { if (e.key === 'Enter') void handleDriveCryptoChangePassphrase(); }}
+                                                    className="bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-xs text-telegram-text placeholder:text-telegram-subtext/70 focus:outline-none focus:border-telegram-primary/50"
+                                                />
+                                            </div>
+                                            <div className="flex items-center justify-end gap-2">
+                                                <button
+                                                    onClick={() => void handleDriveCryptoLock()}
+                                                    disabled={driveCryptoBusy}
+                                                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-hover text-telegram-text hover:bg-telegram-border/60 transition disabled:opacity-50"
+                                                >
+                                                    Lock now
+                                                </button>
+                                                <button
+                                                    onClick={() => void handleDriveCryptoChangePassphrase()}
+                                                    disabled={driveCryptoBusy}
+                                                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary/10 text-telegram-primary hover:bg-telegram-primary/20 transition disabled:opacity-50 flex items-center gap-1.5"
+                                                >
+                                                    {driveCryptoBusy && <Loader2 className="w-3 h-3 animate-spin" />}
+                                                    Change passphrase
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="tr-setting-row p-3 space-y-2">
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div className="flex items-center gap-2.5 min-w-0">
+                                            <RotateCcw className="w-4 h-4 text-telegram-subtext flex-shrink-0" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-telegram-text font-medium">TeraRelay Drive · Recently deleted</p>
+                                                <p className="text-xs text-telegram-subtext">
+                                                    Restore files removed from the Drive without deleting their Telegram content.
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={() => {
+                                                if (!driveTrashOpen) void fetchDriveTrash();
+                                                setDriveTrashOpen(value => !value);
+                                            }}
+                                            className="px-3 py-1.5 rounded-lg text-xs bg-telegram-hover text-telegram-text hover:bg-telegram-border/60 transition flex-shrink-0"
+                                            aria-expanded={driveTrashOpen}
+                                        >
+                                            {driveTrashOpen ? 'Hide' : 'View'}
+                                        </button>
+                                    </div>
+                                    {driveTrashOpen && (
+                                        <div className="pl-6 space-y-2">
+                                            <div className="flex justify-end">
+                                                <button
+                                                    onClick={() => void fetchDriveTrash()}
+                                                    disabled={driveTrashBusy || restoringDriveItem !== null}
+                                                    className="inline-flex items-center gap-1 text-xs text-telegram-subtext hover:text-telegram-text disabled:opacity-50"
+                                                >
+                                                    <RefreshCw className={`w-3 h-3 ${driveTrashBusy ? 'animate-spin' : ''}`} />
+                                                    Refresh
+                                                </button>
+                                            </div>
+                                            {!driveTrashBusy && driveTrash.length === 0 && (
+                                                <p className="text-xs text-telegram-subtext py-2">No recently deleted Drive items.</p>
+                                            )}
+                                            <div className="space-y-1 max-h-48 overflow-y-auto">
+                                                {driveTrash.map(entry => (
+                                                    <div key={entry.kind + ':' + entry.id} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 bg-telegram-hover/40">
+                                                        <div className="min-w-0">
+                                                            <p className="text-xs text-telegram-text truncate" title={entry.name}>{entry.name}</p>
+                                                            <p className="text-[11px] text-telegram-subtext">
+                                                                {entry.kind === 'folder' ? 'Folder' : 'File'} · {new Date(entry.deleted_at).toLocaleDateString()}
+                                                            </p>
+                                                        </div>
+                                                        {entry.restorable ? (
+                                                            <button
+                                                                onClick={() => void restoreDriveTrashItem(entry)}
+                                                                disabled={restoringDriveItem !== null}
+                                                                className="text-xs text-telegram-primary hover:opacity-80 disabled:opacity-50 flex-shrink-0"
+                                                            >
+                                                                {restoringDriveItem === entry.id ? 'Restoring…' : 'Restore'}
+                                                            </button>
+                                                        ) : (
+                                                            <span className="text-xs text-telegram-subtext flex-shrink-0" title="The original cloud file is no longer available">
+                                                                File unavailable
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
 
                             {SHOW_ADVANCED_SETTINGS && (<>
                                 {/* Transcode Cache Size */}
@@ -709,7 +1099,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             </>)}
 
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <Trash2 className="w-4 h-4 text-telegram-subtext" />
                                         <div>
@@ -890,13 +1280,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         transition={{ type: 'spring', damping: 25, stiffness: 220, opacity: { duration: 0.15 } }}
                                         className="space-y-3 w-full"
                                     >
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <Shield className="w-3.5 h-3.5" />
                                     {t('settings.proxy_config')}
                                 </h3>
 
                                 {/* Enable Proxy */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <div className={`w-2.5 h-2.5 rounded-full ${
                                             !settings.proxyEnabled || !settings.proxyLiveStateEnabled
@@ -935,7 +1325,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                                 {/* Live Connection Monitoring */}
                                 {settings.proxyEnabled && (
-                                    <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                    <div className="tr-setting-row flex items-center justify-between p-3">
                                         <div>
                                             <p className="text-sm text-telegram-text font-medium">{t('settings.live_state') || 'Live Connection Monitoring'}</p>
                                             <p className="text-xs text-telegram-subtext">{t('settings.live_state_desc') || 'Periodically check connectivity and display latency'}</p>
@@ -950,7 +1340,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 )}
 
                                 {/* Proxy Type */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.proxy_type')}</p>
                                         <p className="text-xs text-telegram-subtext">
@@ -963,7 +1353,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         <select
                                             value={settings.proxyType}
                                             onChange={e => updateSetting('proxyType', e.target.value as 'socks5' | 'http' | 'https')}
-                                            className="appearance-none bg-telegram-bg border border-telegram-border rounded-md pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
+                                            className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
                                         >
                                             <option value="socks5">SOCKS5</option>
                                             <option value="http">HTTP</option>
@@ -974,7 +1364,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* Host */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.host')}</p>
                                         <p className="text-xs text-telegram-subtext">{t('settings.host_desc')}</p>
@@ -989,7 +1379,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* Port */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.port')}</p>
                                         <p className="text-xs text-telegram-subtext">{t('settings.port_desc')}</p>
@@ -1005,7 +1395,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* SOCKS5/HTTP auth fields */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.username')}</p>
                                         <p className="text-xs text-telegram-subtext">{t('settings.optional')}</p>
@@ -1018,7 +1408,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         className="w-40 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-right focus:outline-none focus:border-telegram-primary/50 transition placeholder:text-telegram-subtext/40"
                                     />
                                 </div>
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div>
                                         <p className="text-sm text-telegram-text font-medium">{t('common.password')}</p>
                                         <p className="text-xs text-telegram-subtext">{t('settings.optional')}</p>
@@ -1114,7 +1504,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         transition={{ type: 'spring', damping: 25, stiffness: 220, opacity: { duration: 0.15 } }}
                                         className="space-y-3 w-full"
                                     >
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="tr-setting-section-title flex items-center gap-2">
                                     <Zap className="w-3.5 h-3.5" />
                                     {t('settings.vpn_optimizer')}
                                     {latencyMs !== null && (
@@ -1131,7 +1521,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </h3>
 
                                 {/* Master Toggle */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="tr-setting-row flex items-center justify-between p-3">
                                     <div className="flex items-center gap-2">
                                         <div className={`w-2 h-2 rounded-full ${settings.vpnMode ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]' : 'bg-gray-500'}`} />
                                         <div>
@@ -1228,7 +1618,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
 
                                     {/* Preferred DC */}
-                                    <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                    <div className="tr-setting-row flex items-center justify-between p-3">
                                         <div>
                                             <p className="text-sm text-telegram-text font-medium">{t('settings.preferred_dc')}</p>
                                             <p className="text-xs text-telegram-subtext">{t('settings.preferred_dc_desc')}</p>
@@ -1237,7 +1627,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             <select
                                                 value={settings.preferredDC}
                                                 onChange={e => updateSetting('preferredDC', e.target.value as typeof settings.preferredDC)}
-                                                className="appearance-none bg-telegram-bg border border-telegram-border rounded-md pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
+                                                className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
                                             >
                                                 <option value="auto">{t('settings.auto')}</option>
                                                 <option value="dc1">DC 1</option>
@@ -1265,7 +1655,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
 
                                     {/* Flood Wait */}
-                                    <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                    <div className="tr-setting-row flex items-center justify-between p-3">
                                         <div>
                                             <p className="text-sm text-telegram-text font-medium">{t('settings.respect_flood')}</p>
                                             <p className="text-xs text-telegram-subtext">{t('settings.respect_flood_desc')}</p>
@@ -1319,7 +1709,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
 
                                     {/* Chunk Size */}
-                                    <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                    <div className="tr-setting-row flex items-center justify-between p-3">
                                         <div>
                                             <p className="text-sm text-telegram-text font-medium">{t('settings.transfer_chunk_size')}</p>
                                             <p className="text-xs text-telegram-subtext">{t('settings.chunk_size_desc')}</p>
@@ -1328,7 +1718,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             <select
                                                 value={settings.chunkSizeKb}
                                                 onChange={e => updateSetting('chunkSizeKb', parseInt(e.target.value))}
-                                                className="appearance-none bg-telegram-bg border border-telegram-border rounded-md pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
+                                                className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
                                             >
                                                 <option value={128}>128 KB</option>
                                                 <option value={256}>256 KB</option>
@@ -1371,7 +1761,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
 
                                     {/* Auto-Detect VPN */}
-                                    <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                    <div className="tr-setting-row flex items-center justify-between p-3">
                                         <div className="flex items-center gap-2">
                                             <Wifi className="w-4 h-4 text-telegram-subtext" />
                                             <div>
@@ -1402,7 +1792,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         className="space-y-4 w-full"
                                     >
                                         <div className="flex items-center justify-between">
-                                            <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                            <h3 className="tr-setting-section-title flex items-center gap-2">
                                                 <Link className="w-3.5 h-3.5 text-telegram-primary" />
                                                 {t('settings.shared_links', { count: shares.length })}
                                             </h3>
@@ -1698,7 +2088,7 @@ function ThemesTab() {
         >
             {/* Presets */}
             <div className="space-y-2">
-                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                <h3 className="tr-setting-section-title flex items-center gap-2">
                     <Palette className="w-3.5 h-3.5" />
                     {t('settings.presets')}
                 </h3>
@@ -1735,7 +2125,7 @@ function ThemesTab() {
 
             {/* Custom Themes */}
             <div className="space-y-2">
-                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                <h3 className="tr-setting-section-title flex items-center gap-2">
                     <Sparkles className="w-3.5 h-3.5" />
                     {t('settings.custom_themes')}
                 </h3>

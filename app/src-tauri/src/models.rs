@@ -34,6 +34,24 @@ pub struct FileMetadata {
     /// True when this entry aggregates multiple ".tgdpart" messages (file > 2GB).
     #[serde(default)]
     pub is_split: bool,
+    /// Stable TeraRelay logical-file identity. Present for manifest-backed
+    /// channel files and used by higher-level metadata such as version stacks.
+    #[serde(default)]
+    pub logical_file_id: Option<String>,
+    /// Optional version-stack identity. When present, this visible entry is the
+    /// stack's current primary file.
+    #[serde(default)]
+    pub stack_id: Option<String>,
+    /// User-facing stack name. The physical primary filename remains in `name`
+    /// so preview/download/type detection continue to use the real file.
+    #[serde(default)]
+    pub stack_name: Option<String>,
+    /// Number of currently available versions represented by this entry.
+    #[serde(default)]
+    pub stack_version_count: u32,
+    /// Optional label attached to the primary version (for example "4K HDR").
+    #[serde(default)]
+    pub stack_label: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

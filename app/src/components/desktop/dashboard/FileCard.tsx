@@ -1,10 +1,10 @@
 import { motion } from 'framer-motion';
-import { useState, useEffect } from 'react';
-import { Folder, Eye, Trash2, Link, Check } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { useState } from 'react';
+import { Check, Download, Eye, Folder, Link, Trash2 } from 'lucide-react';
 import { TelegramFile } from '../../../types';
 import { createDragGhost, displayFileName } from '../../../utils';
-import { FileTypeIcon } from '../../shared/FileTypeIcon';
+import { getPremiumFileMeta, getPremiumFileTitle } from '../../../filePresentation';
+import { PremiumFileThumbnail } from '../../shared/PremiumFileThumbnail';
 import { useVideoMetadata } from '../../../hooks/useVideoMetadata';
 import { useCachedVariants } from '../../../hooks/useCachedVariants';
 import { VideoMetaBadge } from '../../shared/VideoMetaBadge';
@@ -27,56 +27,39 @@ interface FileCardProps {
     selectedIds?: number[];
 }
 
-// Check if file is an image type that can have a thumbnail
-function isImageFile(filename: string): boolean {
-    const ext = filename.split('.').pop()?.toLowerCase() || '';
-    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
-}
-
-
-export function FileCard({ file, onDelete, onDownload, onPreview, onShare, isSelected, onClick, onContextMenu, onDrop, onDragStart, onDragEnd, activeFolderId, height, onToggleSelection, selectedIds }: FileCardProps) {
+export function FileCard({
+    file,
+    onDelete,
+    onDownload,
+    onPreview,
+    onShare,
+    isSelected,
+    onClick,
+    onContextMenu,
+    onDrop,
+    onDragStart,
+    onDragEnd,
+    activeFolderId,
+    height,
+    onToggleSelection,
+    selectedIds,
+}: FileCardProps) {
     const isFolder = file.type === 'folder';
     const [isDragOver, setIsDragOver] = useState(false);
-    const [thumbnail, setThumbnail] = useState<string | null>(null);
-    const [thumbnailLoading, setThumbnailLoading] = useState(false);
 
-    // Lazy video metadata badge (.mp4 only)
     const { data: videoMeta, isLoading: videoMetaLoading } = useVideoMetadata(
         file.id,
         file.folder_id ?? null,
         file.name,
     );
-
-    // Cached HLS variants
     const { data: cachedVariants } = useCachedVariants(
         file.id,
         file.folder_id ?? null,
         file.name,
     );
     const cachedQualities = (cachedVariants || []).filter(v => v.available).map(v => v.quality);
-
-    // Lazy load thumbnail for image files
-    useEffect(() => {
-        if (isFolder || !isImageFile(file.name)) return;
-
-        let cancelled = false;
-        setThumbnailLoading(true);
-
-        invoke<string>('cmd_get_thumbnail', {
-            messageId: file.id,
-            folderId: activeFolderId
-        }).then((result) => {
-            if (!cancelled && result) {
-                setThumbnail(result);
-            }
-        }).catch(() => {
-            // Silently fail - will show icon instead
-        }).finally(() => {
-            if (!cancelled) setThumbnailLoading(false);
-        });
-
-        return () => { cancelled = true; };
-    }, [file.id, file.name, activeFolderId, isFolder]);
+    const premiumTitle = getPremiumFileTitle(file);
+    const premiumMeta = getPremiumFileMeta(file);
 
     return (
         <div
@@ -84,120 +67,162 @@ export function FileCard({ file, onDelete, onDownload, onPreview, onShare, isSel
             draggable={!isFolder}
             onContextMenu={onContextMenu}
             onClick={onClick}
-            onDragStart={!isFolder ? (e: any) => {
+            onDragStart={!isFolder ? (event) => {
                 const idsToDrag = selectedIds && selectedIds.includes(file.id) ? selectedIds : [file.id];
-                if (onDragStart) onDragStart(idsToDrag);
-                e.dataTransfer.setData("application/x-telegram-file-ids", JSON.stringify(idsToDrag));
-                e.dataTransfer.effectAllowed = 'move';
-                const dragCount = idsToDrag.length;
-                const ghost = createDragGhost(file.name, isFolder, dragCount);
-                e.dataTransfer.setDragImage(ghost, 0, 0);
+                onDragStart?.(idsToDrag);
+                event.dataTransfer.setData('application/x-telegram-file-ids', JSON.stringify(idsToDrag));
+                event.dataTransfer.effectAllowed = 'move';
+                const ghost = createDragGhost(file.name, false, idsToDrag.length);
+                event.dataTransfer.setDragImage(ghost, 0, 0);
                 requestAnimationFrame(() => ghost.remove());
             } : undefined}
-            onDragEnd={!isFolder ? () => {
-                if (onDragEnd) onDragEnd();
-            } : undefined}
-            onDragOver={(e) => {
-                if (isFolder) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!isDragOver) setIsDragOver(true);
-                }
+            onDragEnd={!isFolder ? onDragEnd : undefined}
+            onDragOver={(event) => {
+                if (!isFolder) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (!isDragOver) setIsDragOver(true);
             }}
-            onDragLeave={(e) => {
-                if (isFolder) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setIsDragOver(false);
-                }
+            onDragLeave={(event) => {
+                if (!isFolder) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
             }}
-            onDrop={(e) => {
-                if (isFolder && onDrop) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setIsDragOver(false);
-                    onDrop(e, file.id);
-                }
+            onDrop={(event) => {
+                if (!isFolder || !onDrop) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
+                onDrop(event, file.id);
             }}
         >
             <motion.div
-                whileHover={{ y: -4 }}
-                className={`tr-file-card group cursor-pointer bg-telegram-surface rounded-2xl overflow-hidden border hover:shadow-[0_14px_34px_rgba(0,0,0,0.22)] transition-all relative
-                ${isSelected ? 'border-telegram-primary bg-telegram-primary/5 ring-1 ring-telegram-primary' : 'border-telegram-border hover:border-telegram-primary/50'}
-                ${isDragOver ? 'ring-2 ring-telegram-primary bg-telegram-primary/20 scale-105' : ''}`}
-                style={height ? { height: `${height}px` } : { aspectRatio: '4/3' }}
+                whileHover={{ y: -2 }}
+                className={[
+                    'tr-library-card group relative cursor-pointer overflow-hidden',
+                    isSelected ? 'tr-library-card--selected' : '',
+                    isDragOver ? 'tr-library-card--drop' : '',
+                ].join(' ')}
+                style={height ? { height: `${height}px` } : undefined}
             >
-                {/* Thumbnail or Icon */}
-                {thumbnail ? (
-                    <div className="absolute inset-0">
-                        <img
-                            src={thumbnail}
-                            alt={file.name}
-                            className="w-full h-full object-contain"
+                <div className="tr-library-card__media">
+                    {isFolder ? (
+                        <div className="tr-library-folder-cover">
+                            <span className="tr-library-folder-cover__glow" />
+                            <Folder className="h-10 w-10" />
+                            <span>Folder</span>
+                        </div>
+                    ) : (
+                        <PremiumFileThumbnail
+                            file={file}
+                            folderId={activeFolderId ?? file.folder_id ?? null}
+                            variant="grid"
+                            onOpen={onPreview}
                         />
-                        {/* Gradient overlay for text readability */}
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent" />
-                    </div>
-                ) : (
-                    <div className="absolute inset-0 flex items-center justify-center p-4">
-                        {isFolder ? (
-                            <Folder className="w-12 h-12 text-telegram-primary" />
-                        ) : thumbnailLoading && isImageFile(file.name) ? (
-                            <div className="w-8 h-8 border-2 border-telegram-primary/30 border-t-telegram-primary rounded-full animate-spin" />
-                        ) : (
-                            <FileTypeIcon filename={file.name} size="lg" />
-                        )}
-                    </div>
-                )}
-
-                {/* Selection Checkmark */}
-                <div
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        if (onToggleSelection) onToggleSelection();
-                    }}
-                    className={`absolute top-2 left-2 w-5 h-5 rounded-full border flex items-center justify-center transition-all z-10 cursor-pointer ${isSelected ? 'bg-telegram-primary border-telegram-primary' : 'border-white/50 bg-black/30 opacity-0 group-hover:opacity-100'}`}
-                >
-                    {isSelected && <div className="w-1.5 h-1.5 bg-black rounded-full" />}
-                </div>
-
-                {/* File info overlay at bottom */}
-                <div className={`absolute bottom-0 left-0 right-0 p-3 ${thumbnail ? 'text-white' : 'text-telegram-text'}`}>
-                    <h3 className="text-sm font-medium truncate w-full" title={displayFileName(file.name)}>{displayFileName(file.name)}</h3>
-                    <div className="flex items-center gap-2 mt-0.5">
-                        <p className={`text-xs ${thumbnail ? 'text-white/70' : 'text-telegram-subtext'}`}>{file.sizeStr}</p>
-                        <VideoMetaBadge metadata={videoMeta} isLoading={videoMetaLoading} />
-                        {cachedQualities.length > 0 && (
-                            <span className="inline-flex items-center gap-0.5">
-                                {cachedQualities.map(q => (
-                                    <span key={q} className="inline-flex items-center gap-0.5 text-[9px] font-medium text-emerald-400 bg-emerald-500/10 px-1 py-0.5 rounded">
-                                        <Check className="w-2.5 h-2.5" />
-                                        {q}
-                                    </span>
-                                ))}
-                            </span>
-                        )}
-                    </div>
-                </div>
-
-                {/* Quick actions on hover */}
-                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 z-10">
-                    <button onClick={(e) => { e.stopPropagation(); if (onPreview) onPreview() }} className="file-action-btn p-1 bg-black/50 rounded-full hover:bg-telegram-primary hover:text-white text-white/70" title="Preview">
-                        <Eye className="w-3 h-3" />
-                    </button>
-                    <button onClick={(e) => { e.stopPropagation(); onDownload() }} className="file-action-btn p-1 bg-black/50 rounded-full hover:bg-green-500 hover:text-white text-white/70" title="Download">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                    </button>
-                    {!isFolder && onShare && (
-                        <button onClick={(e) => { e.stopPropagation(); onShare() }} className="file-action-btn p-1 bg-black/50 rounded-full hover:bg-telegram-primary hover:text-white text-white/70" title="Share">
-                            <Link className="w-3 h-3" />
-                        </button>
                     )}
-                    <button onClick={(e) => { e.stopPropagation(); onDelete() }} className="file-action-btn p-1 bg-black/50 rounded-full hover:bg-red-500 hover:text-white text-white/70" title="Delete">
-                        <Trash2 className="w-3 h-3" />
+
+                    <button
+                        type="button"
+                        className={[
+                            'tr-library-select',
+                            isSelected ? 'tr-library-select--active' : '',
+                        ].join(' ')}
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onToggleSelection?.();
+                        }}
+                        aria-label={isSelected ? 'Deselect file' : 'Select file'}
+                    >
+                        {isSelected && <Check className="h-3 w-3" />}
                     </button>
+
+                    {!isFolder && (
+                        <div className="tr-library-card__actions">
+                            {onPreview && (
+                                <button
+                                    type="button"
+                                    className="tr-library-card__action"
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        onPreview();
+                                    }}
+                                    title="Preview"
+                                    aria-label="Preview"
+                                >
+                                    <Eye />
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                className="tr-library-card__action"
+                                onClick={(event) => {
+                                    event.stopPropagation();
+                                    onDownload();
+                                }}
+                                title="Download"
+                                aria-label="Download"
+                            >
+                                <Download />
+                            </button>
+                            {onShare && (
+                                <button
+                                    type="button"
+                                    className="tr-library-card__action"
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        onShare();
+                                    }}
+                                    title="Share"
+                                    aria-label="Share"
+                                >
+                                    <Link />
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                className="tr-library-card__action tr-library-card__action--danger"
+                                onClick={(event) => {
+                                    event.stopPropagation();
+                                    onDelete();
+                                }}
+                                title="Delete"
+                                aria-label="Delete"
+                            >
+                                <Trash2 />
+                            </button>
+                        </div>
+                    )}
+                </div>
+
+                <div className="tr-library-card__footer">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                        <h3
+                            className="min-w-0 flex-1 truncate text-[12px] font-semibold text-telegram-text"
+                            title={file.stack_name || displayFileName(file.name)}
+                        >
+                            {premiumTitle}
+                        </h3>
+
+                    </div>
+
+                    <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-telegram-subtext">
+                        <span className="tr-file-quality truncate">{premiumMeta}</span>
+                        <span className="tr-file-meta-dot">•</span>
+                        <span className="shrink-0">{file.sizeStr}</span>
+                    </div>
+
+                    <div className="mt-1 flex min-h-[16px] items-center gap-1.5 overflow-hidden">
+                        <VideoMetaBadge metadata={videoMeta} isLoading={videoMetaLoading} />
+                        {cachedQualities.map(quality => (
+                            <span key={quality} className="tr-library-quality">
+                                <Check className="h-2.5 w-2.5" />
+                                {quality}
+                            </span>
+                        ))}
+                    </div>
                 </div>
             </motion.div>
         </div>
-    )
+    );
 }

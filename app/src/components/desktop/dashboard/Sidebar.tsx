@@ -7,6 +7,12 @@ import { BandwidthWidget } from './BandwidthWidget';
 import { TelegramFolder, BandwidthStats, FolderGroup } from '../../../types';
 import { useSettings } from '../../../context/SettingsContext';
 import {
+    PremiumBadge,
+    PremiumButton,
+    PremiumIconButton,
+    PremiumSurface,
+} from '../../ui/PremiumPrimitives';
+import {
     DndContext,
     closestCenter,
     KeyboardSensor,
@@ -73,11 +79,7 @@ function GroupTab({ id, groupId, label, colorHex, active, onClick, onEdit, isSor
             {...attributes}
             {...listeners}
             onClick={onClick}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold select-none cursor-pointer transition-all duration-150 flex-shrink-0 border ${
-                active
-                    ? 'bg-telegram-primary/20 border-telegram-primary text-telegram-primary'
-                    : 'bg-telegram-surface border-telegram-border text-telegram-subtext hover:text-telegram-text hover:border-telegram-primary/40'
-            }`}
+            className={`tr-group-tab flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold select-none cursor-pointer flex-shrink-0 ${active ? 'tr-group-tab--active' : ''}`}
         >
             {colorHex && (
                 <span
@@ -92,7 +94,7 @@ function GroupTab({ id, groupId, label, colorHex, active, onClick, onEdit, isSor
                         e.stopPropagation();
                         onEdit();
                     }}
-                    className="p-0.5 hover:bg-telegram-hover rounded text-telegram-subtext hover:text-telegram-text transition-colors"
+                    className="tr-group-tab__edit"
                 >
                     <Settings2 className="w-3 h-3" />
                 </button>
@@ -246,18 +248,17 @@ export function Sidebar({
 
     return (
         <aside 
-            className={`tr-sidebar transition-all duration-300 ${settings.sidebarCollapsed ? 'w-14' : 'w-64'} bg-telegram-surface border-r border-telegram-border flex flex-col`} 
+            className={`tr-sidebar transition-all duration-300 ${settings.sidebarCollapsed ? 'w-14' : 'w-64'} flex flex-col`}
             onClick={e => e.stopPropagation()}
         >
-            <div className={`p-4 flex ${settings.sidebarCollapsed ? 'flex-col items-center gap-2' : 'items-center justify-between'} min-h-[64px]`}>
+            <div className={`tr-sidebar-brand-row p-4 flex ${settings.sidebarCollapsed ? 'flex-col items-center gap-2' : 'items-center justify-between'} min-h-[64px]`}>
                 <TeraRelayBrand size="sm" showName={!settings.sidebarCollapsed} />
-                <button
+                <PremiumIconButton
+                    label={settings.sidebarCollapsed ? t('common.expand_sidebar') || "Expand Sidebar" : t('common.collapse_sidebar') || "Collapse Sidebar"}
                     onClick={() => updateSetting('sidebarCollapsed', !settings.sidebarCollapsed)}
-                    className="p-1 rounded-md hover:bg-telegram-hover text-telegram-subtext hover:text-telegram-text transition-colors"
-                    title={settings.sidebarCollapsed ? t('common.expand_sidebar') || "Expand Sidebar" : t('common.collapse_sidebar') || "Collapse Sidebar"}
                 >
-                    {settings.sidebarCollapsed ? <ChevronRight className="w-4.5 h-4.5" /> : <ChevronLeft className="w-4.5 h-4.5" />}
-                </button>
+                    {settings.sidebarCollapsed ? <ChevronRight /> : <ChevronLeft />}
+                </PremiumIconButton>
             </div>
 
             <DndContext
@@ -266,38 +267,37 @@ export function Sidebar({
                 onDragEnd={handleDragEnd}
             >
                 {!settings.sidebarCollapsed && (
-                    <div className="px-4 py-2 border-b border-telegram-border flex flex-col gap-2">
+                    <div className="px-3 py-3 border-b border-telegram-border flex flex-col gap-2.5">
                         <div className="flex items-center justify-between">
                             <span className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-1.5">
                                 {t('common.groups') || "Groups"}
                             </span>
                             <div className="flex items-center gap-1">
-                                <button
+                                <PremiumIconButton
+                                    label={settings.hideGroups ? t('common.show_groups') || "Show Groups" : t('common.hide_groups') || "Hide Groups"}
                                     onClick={() => updateSetting('hideGroups', !settings.hideGroups)}
-                                    className="p-1 rounded-md hover:bg-telegram-hover text-telegram-subtext hover:text-telegram-text transition-all"
-                                    title={settings.hideGroups ? t('common.show_groups') || "Show Groups" : t('common.hide_groups') || "Hide Groups"}
                                 >
-                                    {settings.hideGroups ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                                </button>
+                                    {settings.hideGroups ? <EyeOff /> : <Eye />}
+                                </PremiumIconButton>
                                 {!settings.hideGroups && (
-                                    <button
+                                    <PremiumIconButton
+                                        label={t('common.create_group') || "Create Group"}
+                                        tone="primary"
                                         onClick={() => {
                                             setEditingGroup(null);
                                             setGroupName("");
                                             setGroupColor("#3B82F6");
                                             setShowGroupEditor(true);
                                         }}
-                                        className="p-1 rounded-md hover:bg-telegram-hover text-telegram-subtext hover:text-telegram-text transition-all"
-                                        title={t('common.create_group') || "Create Group"}
                                     >
-                                        <Plus className="w-3.5 h-3.5" />
-                                    </button>
+                                        <Plus />
+                                    </PremiumIconButton>
                                 )}
                             </div>
                         </div>
 
                         {!settings.hideGroups && showGroupEditor && (
-                            <div className="p-3 bg-telegram-hover/50 rounded-lg border border-telegram-border flex flex-col gap-3 animate-in fade-in slide-in-from-top-1 duration-150">
+                            <PremiumSurface tone="soft" className="p-3 flex flex-col gap-3 animate-in fade-in slide-in-from-top-1 duration-150">
                                 <div>
                                     <label className="text-[10px] font-semibold text-telegram-subtext uppercase tracking-wider block mb-1">
                                         {editingGroup ? t('common.edit_group_name') : t('common.new_group_name')}
@@ -361,7 +361,7 @@ export function Sidebar({
                                         {t('common.save') || "Save"}
                                     </button>
                                 </div>
-                            </div>
+                            </PremiumSurface>
                         )}
 
                         {!settings.hideGroups && (
@@ -465,7 +465,7 @@ export function Sidebar({
             {!settings.sidebarCollapsed && (
                 <div className="px-2 pb-2 border-b border-telegram-border">
                     {showNewFolderInput ? (
-                        <div className="rounded-xl border border-telegram-border bg-telegram-hover/35 p-3">
+                        <PremiumSurface tone="soft" className="p-3">
                             <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-telegram-subtext">
                                 New channel
                             </div>
@@ -511,76 +511,83 @@ export function Sidebar({
                                     <Check className="h-4 w-4" />
                                 </button>
                             </div>
-                        </div>
+                        </PremiumSurface>
                     ) : (
                         <div className="space-y-1.5">
-                            <button
+                            <PremiumButton
+                                variant="secondary"
+                                className="w-full justify-start"
+                                icon={<Plus />}
                                 onClick={() => setShowNewFolderInput(true)}
-                                className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border"
                             >
-                                <Plus className="w-4 h-4" />
                                 {t('common.create_channel', { defaultValue: 'Create Channel' })}
-                            </button>
-                            <button
+                            </PremiumButton>
+                            <PremiumButton
+                                variant="ghost"
+                                className="w-full justify-start"
+                                icon={<UserPlus />}
                                 onClick={onJoinChannel}
-                                className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-primary/10 hover:text-telegram-primary transition-colors border border-transparent hover:border-telegram-primary/20"
                             >
-                                <UserPlus className="w-4 h-4" />
                                 Join TeraRelay Channel
-                            </button>
+                            </PremiumButton>
                         </div>
                     )}
                 </div>
             )}
 
-            <div className={`p-4 border-t border-telegram-border flex flex-col ${settings.sidebarCollapsed ? 'items-center gap-4' : 'gap-4'}`}>
+            <div className={`tr-sidebar-footer p-3 border-t flex flex-col ${settings.sidebarCollapsed ? 'items-center gap-3' : 'gap-3'}`}>
                 {settings.sidebarCollapsed ? (
                     <>
-                        <div
-                            className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}
+                        <PremiumBadge
+                            tone={isConnected ? 'success' : 'danger'}
+                            dot
+                            className="w-7 justify-center px-0"
                             title={isConnected ? t('common.connected_telegram') : t('common.disconnected_telegram')}
                         />
-                        <button
+                        <PremiumIconButton
+                            label={isSyncing ? t('common.syncing') : t('common.sync')}
+                            tone="primary"
                             onClick={onSync}
                             disabled={isSyncing}
-                            className={`p-2 text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded-lg transition-colors ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                            title={isSyncing ? t('common.syncing') : t('common.sync')}
                         >
-                            <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
-                        </button>
-                        <button
+                            <RefreshCw className={isSyncing ? 'animate-spin' : ''} />
+                        </PremiumIconButton>
+                        <PremiumIconButton
+                            label={t('common.logout')}
+                            tone="danger"
                             onClick={onLogout}
-                            className="p-2 text-red-500 hover:text-red-600 bg-red-500/10 hover:bg-red-500/20 rounded-lg transition-colors"
-                            title={t('common.logout')}
                         >
-                            <LogOut className="w-4 h-4" />
-                        </button>
+                            <LogOut />
+                        </PremiumIconButton>
                     </>
                 ) : (
                     <>
-                        <div className="flex items-center gap-2 text-telegram-subtext text-xs">
-                            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-                            <span>{isConnected ? t('common.connected_telegram') : t('common.disconnected_telegram')}</span>
-                        </div>
+                        <PremiumBadge tone={isConnected ? 'success' : 'danger'} dot className="self-start">
+                            {isConnected ? t('common.connected_telegram') : t('common.disconnected_telegram')}
+                        </PremiumBadge>
 
                         <div className="flex gap-2">
-                            <button
+                            <PremiumButton
+                                variant="secondary"
+                                size="sm"
+                                className="flex-1"
+                                icon={<RefreshCw className={isSyncing ? 'animate-spin' : ''} />}
                                 onClick={onSync}
                                 disabled={isSyncing}
-                                className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded-lg transition-colors ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 title="Scan for existing folders"
                             >
-                                <RefreshCw className={`w-3 h-3 ${isSyncing ? 'animate-spin' : ''}`} />
                                 {isSyncing ? t('common.syncing') : t('common.sync')}
-                            </button>
-                            <button
+                            </PremiumButton>
+                            <PremiumButton
+                                variant="danger"
+                                size="sm"
+                                className="flex-1"
+                                icon={<LogOut />}
                                 onClick={onLogout}
-                                className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-red-500 hover:text-red-600 bg-red-500/10 hover:bg-red-500/20 rounded-lg transition-colors"
                                 title="Sign Out"
                             >
-                                <LogOut className="w-3 h-3" />
                                 {t('common.logout')}
-                            </button>
+                            </PremiumButton>
                         </div>
 
                         {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}

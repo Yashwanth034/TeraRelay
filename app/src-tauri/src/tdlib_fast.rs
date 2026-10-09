@@ -897,6 +897,107 @@ pub async fn cmd_fast_transfer_prepare(
     .await
 }
 
+fn select_fast_transfer_credentials(
+    saved: Result<crate::commands::secure_credentials::StoredTelegramApiCredentials, String>,
+    allow_ephemeral: bool,
+    qa_persisted: Option<crate::commands::secure_credentials::StoredTelegramApiCredentials>,
+    ephemeral: Option<crate::commands::secure_credentials::StoredTelegramApiCredentials>,
+) -> Result<crate::commands::secure_credentials::StoredTelegramApiCredentials, String> {
+    let valid = |credentials: crate::commands::secure_credentials::StoredTelegramApiCredentials| {
+        (credentials.api_id > 0 && !credentials.api_hash.trim().is_empty()).then_some(credentials)
+    };
+    match saved {
+        Ok(credentials) => Ok(credentials),
+        Err(saved_error) if allow_ephemeral => qa_persisted
+            .and_then(valid)
+            .or_else(|| ephemeral.and_then(valid))
+            .ok_or(saved_error),
+        Err(saved_error) => Err(saved_error),
+    }
+}
+
+async fn fast_transfer_credentials(
+    app_handle: &tauri::AppHandle,
+    telegram_state: &crate::commands::TelegramState,
+) -> Result<crate::commands::secure_credentials::StoredTelegramApiCredentials, String> {
+    let saved = crate::commands::secure_credentials::load_api_credentials(app_handle);
+    let allow_ephemeral = crate::commands::auth::real_e2e_qa_ephemeral_login_enabled();
+    let qa_persisted = if allow_ephemeral {
+        match crate::commands::secure_credentials::load_qa_kernel_api_credentials(app_handle) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                log::warn!("QA kernel credential lookup was unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ephemeral = if allow_ephemeral {
+        let api_id = *telegram_state.api_id.lock().await;
+        let api_hash = telegram_state.ephemeral_api_hash.lock().await.clone();
+        match (api_id, api_hash) {
+            (Some(api_id), Some(api_hash)) => Some(
+                crate::commands::secure_credentials::StoredTelegramApiCredentials {
+                    api_id,
+                    api_hash,
+                },
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let credentials =
+        select_fast_transfer_credentials(saved, allow_ephemeral, qa_persisted, ephemeral)?;
+    if allow_ephemeral {
+        log::debug!("TDLib credentials resolved for explicit real-E2E QA mode.");
+    }
+    Ok(credentials)
+}
+
+#[tauri::command]
+pub async fn cmd_fast_transfer_prepare_qa_credentials(
+    app_handle: tauri::AppHandle,
+    state: State<'_, TdlibFastState>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
+    api_hash: String,
+) -> Result<FastTransferStatus, String> {
+    if !crate::commands::auth::real_e2e_qa_ephemeral_login_enabled() {
+        return Err(
+            "TDLib QA credential setup is available only in explicitly enabled debug QA mode."
+                .to_string(),
+        );
+    }
+    let api_hash = api_hash.trim().to_string();
+    if api_hash.is_empty() {
+        return Err("Telegram API Hash cannot be empty.".to_string());
+    }
+    let api_id = telegram_state
+        .api_id
+        .lock()
+        .await
+        .ok_or_else(|| "The active Telegram session has no API ID.".to_string())?;
+
+    crate::commands::secure_credentials::save_qa_kernel_api_credentials(
+        &app_handle,
+        api_id,
+        &api_hash,
+    )?;
+    *telegram_state.ephemeral_api_hash.lock().await = Some(api_hash.clone());
+
+    prepare_with_existing_session(
+        &app_handle,
+        state.inner(),
+        telegram_state.inner(),
+        api_id,
+        api_hash,
+        true,
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn cmd_fast_transfer_prepare_saved(
     app_handle: tauri::AppHandle,
@@ -904,7 +1005,7 @@ pub async fn cmd_fast_transfer_prepare_saved(
     telegram_state: State<'_, crate::commands::TelegramState>,
     install: bool,
 ) -> Result<FastTransferStatus, String> {
-    let credentials = crate::commands::secure_credentials::load_api_credentials(&app_handle)?;
+    let credentials = fast_transfer_credentials(&app_handle, telegram_state.inner()).await?;
     prepare_with_existing_session(
         &app_handle,
         state.inner(),
@@ -920,9 +1021,10 @@ pub async fn cmd_fast_transfer_prepare_saved(
 pub async fn cmd_fast_transfer_prepare_manual_saved(
     app_handle: tauri::AppHandle,
     state: State<'_, TdlibFastState>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
     install: bool,
 ) -> Result<FastTransferStatus, String> {
-    let credentials = crate::commands::secure_credentials::load_api_credentials(&app_handle)?;
+    let credentials = fast_transfer_credentials(&app_handle, telegram_state.inner()).await?;
 
     reset_tdlib_authorization(&app_handle, state.inner()).await?;
 
@@ -1492,6 +1594,41 @@ for event in events:
         assert!(is_tdlib_unauthorized("TDLib error 401: Unauthorized"));
         assert!(is_tdlib_unauthorized("unauthorized"));
         assert!(!is_tdlib_unauthorized("TDLib error 500: Internal"));
+    }
+
+    #[test]
+    fn qa_ephemeral_credentials_only_fallback_when_explicitly_allowed() {
+        let ephemeral = crate::commands::secure_credentials::StoredTelegramApiCredentials {
+            api_id: 12345,
+            api_hash: "ephemeral-hash".to_string(),
+        };
+
+        let persisted = crate::commands::secure_credentials::StoredTelegramApiCredentials {
+            api_id: 12345,
+            api_hash: "kernel-keyring-hash".to_string(),
+        };
+
+        let selected = select_fast_transfer_credentials(
+            Err("secure store unavailable".to_string()),
+            true,
+            Some(persisted.clone()),
+            Some(ephemeral.clone()),
+        )
+        .expect("explicit QA mode prefers restart-safe kernel credentials");
+        assert_eq!(selected, persisted);
+
+        let blocked = select_fast_transfer_credentials(
+            Err("secure store unavailable".to_string()),
+            false,
+            Some(persisted),
+            Some(
+                crate::commands::secure_credentials::StoredTelegramApiCredentials {
+                    api_id: 12345,
+                    api_hash: "ephemeral-hash".to_string(),
+                },
+            ),
+        );
+        assert!(blocked.is_err());
     }
 
     #[test]

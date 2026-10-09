@@ -23,6 +23,7 @@ interface FileExplorerProps {
     onDelete: (id: number) => void;
     onDownload: (id: number, name: string) => void;
     onPreview: (file: TelegramFile, orderedFiles?: TelegramFile[]) => void;
+    onDetails?: (file: TelegramFile) => void;
     onManualUpload: () => void;
     onFolderUpload: () => void;
     showFolderUpload: boolean;
@@ -73,7 +74,7 @@ function useGridColumns(containerRef: React.RefObject<HTMLDivElement | null>) {
 
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
-    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, showFolderUpload, onToggleSelection, onDrop, onDragStart, onDragEnd, onShare, onRename, onFileMove,
+    onFileClick, onDelete, onDownload, onPreview, onDetails, onManualUpload, onFolderUpload, showFolderUpload, onToggleSelection, onDrop, onDragStart, onDragEnd, onShare, onRename, onFileMove,
     folders, cardScale, onCardScaleChange
 }: FileExplorerProps) {
     const [sortField, setSortField] = useState<SortField>('name');
@@ -213,23 +214,23 @@ export function FileExplorer({
             {viewMode === 'grid' ? (
                 <>
 
-                    <div className="flex items-center gap-2 mb-4 text-xs text-telegram-subtext">
+                    <div className="tr-library-toolbar flex items-center gap-2 mb-3 text-xs text-telegram-subtext">
                         <span>Sort by:</span>
                         <button
                             onClick={() => handleSort('name')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'name' ? 'text-telegram-primary' : ''}`}
+                            className={`tr-library-sort flex items-center gap-1 ${sortField === 'name' ? 'tr-library-sort--active' : ''}`}
                         >
                             Name <SortIcon field="name" />
                         </button>
                         <button
                             onClick={() => handleSort('size')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'size' ? 'text-telegram-primary' : ''}`}
+                            className={`tr-library-sort flex items-center gap-1 ${sortField === 'size' ? 'tr-library-sort--active' : ''}`}
                         >
                             Size <SortIcon field="size" />
                         </button>
                         <button
                             onClick={() => handleSort('date')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'date' ? 'text-telegram-primary' : ''}`}
+                            className={`tr-library-sort flex items-center gap-1 ${sortField === 'date' ? 'tr-library-sort--active' : ''}`}
                         >
                             Date <SortIcon field="date" />
                         </button>
@@ -290,7 +291,7 @@ export function FileExplorer({
                                                 <button
                                                     key="upload"
                                                     onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                                    className="border-2 border-dashed border-telegram-border rounded-xl flex flex-col items-center justify-center text-telegram-subtext hover:border-telegram-primary hover:text-telegram-primary transition-all group overflow-hidden"
+                                                    className="tr-library-upload-card flex flex-col items-center justify-center group overflow-hidden"
                                                     style={{ height: `${cardHeight}px` }}
                                                 >
                                                     <Plus className="w-8 h-8 mb-2 group-hover:scale-110 transition-transform" />
@@ -303,7 +304,7 @@ export function FileExplorer({
                                                 <button
                                                     key="upload-folder"
                                                     onClick={(e) => { e.stopPropagation(); onFolderUpload(); }}
-                                                    className="border-2 border-dashed border-telegram-border rounded-xl flex flex-col items-center justify-center text-telegram-subtext hover:border-telegram-primary hover:text-telegram-primary transition-all group overflow-hidden"
+                                                    className="tr-library-upload-card flex flex-col items-center justify-center group overflow-hidden"
                                                     style={{ height: `${cardHeight}px` }}
                                                 >
                                                     <FolderUp className="w-8 h-8 mb-2 group-hover:scale-110 transition-transform" />
@@ -341,17 +342,15 @@ export function FileExplorer({
             ) : (
                 <div className="flex flex-col w-full">
                     {/* List Header */}
-                    <div className="grid grid-cols-[2rem_2fr_6rem_8rem] gap-4 px-4 py-2 text-xs font-semibold text-telegram-subtext border-b border-telegram-border mb-2 select-none items-center">
-                        <div className="text-center">#</div>
+                    <div className="tr-library-list-header grid grid-cols-[2rem_minmax(0,1fr)_5rem_2rem] gap-2.5 px-2.5 py-1.5 select-none items-center">
+                        <div />
                         <button onClick={() => handleSort('name')} className="flex items-center gap-1 hover:text-telegram-text transition-colors">
                             {t('common.name')} <SortIcon field="name" />
                         </button>
                         <button onClick={() => handleSort('size')} className="flex items-center gap-1 justify-end hover:text-telegram-text transition-colors">
                             {t('common.size')} <SortIcon field="size" />
                         </button>
-                        <button onClick={() => handleSort('date')} className="flex items-center gap-1 justify-end hover:text-telegram-text transition-colors">
-                            {t('common.date')} <SortIcon field="date" />
-                        </button>
+                        <div />
                     </div>
 
                     <div
@@ -369,7 +368,7 @@ export function FileExplorer({
                                     >
                                         <button
                                             onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                            className="flex items-center gap-4 px-4 py-3 rounded-lg cursor-pointer border border-dashed border-telegram-border text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover w-full"
+                                            className="tr-library-list-upload flex items-center gap-3 px-3 py-2 cursor-pointer w-full"
                                         >
                                             <div className="w-5 h-5 flex items-center justify-center"><Plus className="w-4 h-4" /></div>
                                             <span className="text-sm font-medium">{t('common.upload_file')}...</span>
@@ -386,7 +385,7 @@ export function FileExplorer({
                                     >
                                         <button
                                             onClick={(e) => { e.stopPropagation(); onFolderUpload(); }}
-                                            className="flex items-center gap-4 px-4 py-3 rounded-lg cursor-pointer border border-dashed border-telegram-border text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover w-full"
+                                            className="tr-library-list-upload flex items-center gap-3 px-3 py-2 cursor-pointer w-full"
                                         >
                                             <div className="w-5 h-5 flex items-center justify-center"><FolderUp className="w-4 h-4" /></div>
                                             <span className="text-sm font-medium">{t('common.upload_folder')}...</span>
@@ -439,6 +438,10 @@ export function FileExplorer({
                         }
                         setContextMenu(null);
                     }}
+                    onDetails={onDetails && contextMenu.file.type !== 'folder' ? () => {
+                        onDetails(contextMenu.file);
+                        setContextMenu(null);
+                    } : undefined}
                     onShare={onShare ? () => {
                         onShare(contextMenu.file);
                         setContextMenu(null);

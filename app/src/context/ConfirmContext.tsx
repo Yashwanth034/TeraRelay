@@ -46,13 +46,13 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
             {children}
             {isOpen && (
                 <div
-                    className="fixed inset-0 z-[260] flex items-center justify-center bg-black/60 p-5 backdrop-blur-sm"
+                    className="tr-modal-backdrop fixed inset-0 z-[260] flex items-center justify-center p-4"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) handleCancel();
                     }}
                 >
                     <div
-                        className="w-full max-w-[420px] overflow-hidden rounded-2xl border border-telegram-border bg-telegram-surface shadow-2xl animate-in zoom-in-95"
+                        className="tr-modal w-full max-w-[420px] overflow-hidden animate-in zoom-in-95"
                         onClick={event => event.stopPropagation()}
                     >
                         <div className="flex gap-3 px-5 pt-5">
@@ -70,19 +70,19 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
                                 <p className="mt-1 text-sm leading-relaxed text-telegram-subtext whitespace-pre-line">{options.message}</p>
                             </div>
                         </div>
-                        <div className="mt-5 flex justify-end gap-2 border-t border-telegram-border bg-telegram-hover/20 px-5 py-4">
+                        <div className="tr-modal-footer mt-5">
                             <button
                                 onClick={handleCancel}
-                                className="rounded-xl border border-telegram-border px-4 py-2 text-sm font-medium text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                                className="tr-button tr-button--secondary tr-button--sm"
                             >
                                 {options.cancelText || 'Cancel'}
                             </button>
                             <button
                                 onClick={handleConfirm}
-                                className={`rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                                className={`tr-button tr-button--sm ${
                                     options.variant === 'danger'
-                                        ? 'bg-red-500/15 text-red-400 hover:bg-red-500/25'
-                                        : 'bg-telegram-primary text-white hover:brightness-110'
+                                        ? 'tr-button--danger'
+                                        : 'tr-button--primary'
                                 }`}
                             >
                                 {options.confirmText || 'Confirm'}

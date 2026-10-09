@@ -428,8 +428,10 @@ pub async fn cmd_clean_cache(app_handle: tauri::AppHandle) -> Result<(), String>
 }
 
 /// Get a small thumbnail for inline display in file cards.
-/// Returns base64 data URL for images, empty string for non-image files.
-/// Uses same cache as cmd_get_preview for consistency.
+/// Returns a base64 data URL for photos plus document thumbnails supplied by
+/// Telegram (images, videos, PDFs, and other document types with a thumb).
+/// Returns an empty string when Telegram has no thumbnail.
+/// Uses the same cache as cmd_get_preview for consistency.
 #[tauri::command]
 pub async fn cmd_get_thumbnail(
     message_id: i32,
@@ -484,28 +486,26 @@ pub async fn cmd_get_thumbnail(
         .map_err(|e| e.to_string())?;
     if let Some(m) = messages.into_iter().flatten().next() {
         if let Some(media) = m.media() {
-            // Only get thumbnails for photos and documents with photo thumbnails
-            let (is_image, ext) = match &media {
+            // Telegram often provides photo thumbnails for video and PDF
+            // documents too. Reuse them instead of restricting cards to image MIME.
+            let (can_render_inline, ext) = match &media {
                 Media::Photo(_) => (true, "jpg".to_string()),
                 Media::Document(d) => {
                     let mime = d.mime_type().unwrap_or("");
-                    if mime.starts_with("image/") {
-                        let e = match mime {
-                            "image/png" => "png",
-                            "image/gif" => "gif",
-                            "image/webp" => "webp",
-                            _ => "jpg",
-                        };
-                        (true, e.to_string())
-                    } else {
-                        // Not an image, return empty - FileCard will show icon
-                        return Ok("".to_string());
-                    }
+                    let e = match mime {
+                        "image/png" => "png",
+                        "image/gif" => "gif",
+                        "image/webp" => "webp",
+                        _ => "jpg",
+                    };
+                    let has_thumb = d.thumbs().iter().any(|thumb| thumb.size() > 0);
+                    let can_fallback_to_full_image = mime.starts_with("image/");
+                    (has_thumb || can_fallback_to_full_image, e.to_string())
                 }
                 _ => return Ok("".to_string()),
             };
 
-            if is_image {
+            if can_render_inline {
                 // Get photo thumbnail (largest available for best quality)
                 let save_path = cache_dir.join(format!("{}_{}.{}", folder_key, message_id, ext));
 
@@ -535,7 +535,9 @@ pub async fn cmd_get_thumbnail(
                     download_ok = true;
                 }
 
-                // Attempt 1: download with original media/thumbs (may have stale file reference)
+                // Attempt 1: prefer Telegram's own small document thumbnail.
+                // Only image documents may fall back to downloading the original
+                // media; never pull an entire video/PDF merely to paint a list row.
                 if !download_ok {
                     let _ = tokio::fs::remove_file(&part_path).await;
                     let ok = if let Some(thumb) = thumbs
@@ -544,8 +546,12 @@ pub async fn cmd_get_thumbnail(
                         .max_by_key(|t| t.size())
                     {
                         download_to_file(&client, thumb, &part_path).await.is_ok()
-                    } else {
+                    } else if matches!(&media, Media::Photo(_))
+                        || matches!(&media, Media::Document(d) if d.mime_type().unwrap_or("").starts_with("image/"))
+                    {
                         download_to_file(&client, &media, &part_path).await.is_ok()
+                    } else {
+                        false
                     };
                     if ok {
                         download_ok = true;

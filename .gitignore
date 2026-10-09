@@ -7,6 +7,8 @@ app/src-tauri/target/
 app/src-tauri/gen/
 
 # Local QA fixtures
+/TeraRelay Drive QA/
+/TeraRelay Drive Telegram QA/
 app/src-tauri/tdlib-one-login-proof-1MiB.bin
 app/src-tauri/tdlib-one-login-restart-proof-1MiB.bin
 app/src-tauri/tdlib-premium-check-1MiB.bin

@@ -44,18 +44,18 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
 
     return (
         <div
-            className="fixed inset-0 z-[240] bg-black/65 backdrop-blur-sm flex items-center justify-center p-5"
+            className="tr-modal-backdrop fixed inset-0 z-[240] flex items-center justify-center p-4"
             onMouseDown={(e) => {
                 if (e.target === e.currentTarget && !busy) onClose();
             }}
         >
             <form
                 onSubmit={submit}
-                className="w-full max-w-[500px] rounded-2xl border border-telegram-border bg-telegram-surface shadow-2xl overflow-hidden"
+                className="tr-modal w-full max-w-[500px] overflow-hidden"
             >
-                <div className="px-5 py-4 border-b border-telegram-border flex items-center justify-between">
+                <div className="tr-modal-header px-5 py-4 flex items-center justify-between">
                     <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-9 h-9 rounded-xl grid place-items-center bg-telegram-primary/10 border border-telegram-primary/20 flex-shrink-0">
+                        <div className="tr-modal-icon w-9 h-9 grid place-items-center flex-shrink-0">
                             <Link2 className="w-4 h-4 text-telegram-primary" />
                         </div>
                         <div className="min-w-0">
@@ -69,7 +69,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                         type="button"
                         onClick={onClose}
                         disabled={busy}
-                        className="p-1.5 rounded-lg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover disabled:opacity-40"
+                        className="tr-modal-close disabled:opacity-40"
                         aria-label="Close"
                     >
                         <X className="w-4 h-4" />
@@ -78,7 +78,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
 
                 <div className="p-5 space-y-4">
                     <div>
-                        <label className="block text-[11px] font-semibold uppercase tracking-wider text-telegram-subtext mb-2">
+                        <label className="tr-modal-label">
                             Channel invite
                         </label>
                         <textarea
@@ -91,16 +91,16 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                             rows={4}
                             spellCheck={false}
                             placeholder="terarelay://join/..."
-                            className="w-full resize-none rounded-xl border border-telegram-border bg-telegram-bg/70 px-3.5 py-3 text-sm text-telegram-text font-mono outline-none focus:border-telegram-primary/60 placeholder:text-telegram-subtext/50"
+                            className="tr-modal-input w-full resize-none px-3.5 py-3 text-sm font-mono placeholder:text-telegram-subtext/50"
                         />
                     </div>
 
-                    <div className="rounded-xl border border-telegram-border/70 bg-telegram-hover/30 px-3.5 py-3 text-xs leading-relaxed text-telegram-subtext">
+                    <div className="tr-modal-note">
                         You’ll join with your current Telegram account. After joining, the channel’s files will appear here automatically.
                     </div>
 
                     {error && (
-                        <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-3.5 py-3 text-xs text-red-400 break-words">
+                        <div className="tr-modal-note tr-modal-note--danger break-words">
                             {error}
                         </div>
                     )}
@@ -110,14 +110,14 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                             type="button"
                             onClick={onClose}
                             disabled={busy}
-                            className="px-4 py-2.5 rounded-xl border border-telegram-border text-sm text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover disabled:opacity-40"
+                            className="tr-button tr-button--secondary tr-button--md disabled:opacity-40"
                         >
                             Cancel
                         </button>
                         <button
                             type="submit"
                             disabled={!invite.trim() || busy}
-                            className="min-w-[120px] px-4 py-2.5 rounded-xl bg-telegram-primary text-white text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="tr-button tr-button--primary tr-button--md min-w-[120px] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             {busy && <Loader2 className="w-4 h-4 animate-spin" />}
                             {busy ? 'Joining…' : 'Join Channel'}

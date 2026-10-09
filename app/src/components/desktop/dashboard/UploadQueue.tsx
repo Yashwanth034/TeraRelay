@@ -9,6 +9,7 @@ interface UploadQueueProps {
     onPauseItem: (id: string) => void;
     onResumeItem: (id: string) => void;
     onRetryItem: (id: string) => void;
+    onDismissItem: (id: string) => void;
 }
 
 export function UploadQueue({
@@ -18,6 +19,7 @@ export function UploadQueue({
     onPauseItem,
     onResumeItem,
     onRetryItem,
+    onDismissItem,
 }: UploadQueueProps) {
     if (items.length === 0) return null;
 
@@ -25,8 +27,8 @@ export function UploadQueue({
     const pausedCount = items.filter(i => i.status === 'paused').length;
 
     return (
-        <div className="tr-transfer-dock w-full bg-telegram-surface border border-telegram-border rounded-2xl shadow-2xl overflow-hidden">
-            <div className="p-3 border-b border-telegram-border bg-telegram-hover flex justify-between items-center">
+        <div className="tr-transfer-dock w-full overflow-hidden">
+            <div className="tr-transfer-header flex justify-between items-center">
                 <div className="flex items-center gap-2">
                     <h4 className="text-sm font-medium text-telegram-text">Uploads</h4>
                     {activeCount > 0 && (
@@ -41,20 +43,20 @@ export function UploadQueue({
                     )}
                 </div>
                 {(activeCount > 0 || pausedCount > 0) && (
-                    <button onClick={onCancelAll} className="text-xs text-red-400 hover:text-red-300 transition-colors">
+                    <button onClick={onCancelAll} className="tr-transfer-cancel-all">
                         Cancel All
                     </button>
                 )}
             </div>
 
-            <div className="max-h-64 overflow-y-auto p-2 space-y-2">
+            <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2">
                 {items.map(item => {
                     const active = item.status === 'uploading' || item.status === 'downloading';
                     const showProgress = active || item.status === 'pausing' || item.status === 'paused';
-                    const filename = (item.url || item.path).split('/').pop();
+                    const filename = item.driveFileName || (item.url || item.path).split('/').pop();
 
                     return (
-                        <div key={item.id} className="flex flex-col gap-1.5 p-2.5 bg-telegram-hover rounded-lg">
+                        <div key={item.id} className="tr-transfer-item flex flex-col gap-1.5 p-2.5">
                             <div className="flex items-center gap-2.5 text-sm">
                                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
                                     item.status === 'pending' ? 'bg-yellow-500' :
@@ -109,11 +111,17 @@ export function UploadQueue({
                                         <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
                                 )}
+
+                                {(item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (
+                                    <button onClick={() => onDismissItem(item.id)} className="p-1 text-gray-400 hover:text-telegram-text transition-colors" title="Dismiss" aria-label={`Dismiss ${filename || 'transfer'}`}>
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
                             </div>
 
                             {showProgress && (
                                 <>
-                                    <div className="relative w-full bg-telegram-border h-1 rounded-full overflow-hidden">
+                                    <div className="tr-transfer-progress relative w-full h-1 overflow-hidden">
                                         {active && (item.uploadedBytes ?? 0) === 0 ? (
                                             <div className="bg-blue-500 h-full w-1/2 animate-progress-indeterminate" />
                                         ) : (

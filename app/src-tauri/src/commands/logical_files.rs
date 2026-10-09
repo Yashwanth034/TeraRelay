@@ -481,6 +481,11 @@ pub fn cached_file_metadata(
                 .read::<i64, _>("chunk_count")
                 .map_err(|e| e.to_string())?
                 > 1,
+            logical_file_id: Some(file_id),
+            stack_id: None,
+            stack_name: None,
+            stack_version_count: 0,
+            stack_label: None,
         });
     }
     Ok(files)

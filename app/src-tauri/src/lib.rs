@@ -59,6 +59,10 @@ use tokio::sync::Mutex;
 pub mod api_routes;
 pub mod db;
 mod download_output;
+pub mod drive_crypto;
+pub mod drive_mount;
+pub mod drive_storage;
+pub mod drive_stream;
 pub mod fmp4_remux;
 pub mod mp4_utils;
 pub mod server;
@@ -348,6 +352,7 @@ pub fn run() {
                 login_token: Arc::new(Mutex::new(None)),
                 password_token: Arc::new(Mutex::new(None)),
                 api_id: Arc::new(Mutex::new(None)),
+                ephemeral_api_hash: Arc::new(Mutex::new(None)),
                 runner_shutdown: Arc::new(std::sync::Mutex::new(None)),
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -415,7 +420,77 @@ pub fn run() {
                 log::error!("Failed to initialize SQLite database: {}", e);
                 e
             })?;
+            {
+                let conn = db_pool
+                    .lock()
+                    .map_err(|_| "Failed to initialize TeraRelay Drive database")?;
+                commands::drive_metadata::init_drive_schema(&conn).map_err(|e| {
+                    log::error!("Failed to initialize TeraRelay Drive metadata: {}", e);
+                    e
+                })?;
+                drive_storage::init_drive_storage_schema(&conn).map_err(|e| {
+                    log::error!(
+                        "Failed to initialize TeraRelay Drive storage registry: {}",
+                        e
+                    );
+                    e
+                })?;
+            }
             app.manage(db_pool.clone());
+            app.manage(drive_storage::DriveStorageState::new());
+
+            let drive_cache_root = app.path().app_cache_dir().map_err(|e| {
+                log::error!("Failed to resolve TeraRelay Drive cache directory: {}", e);
+                e
+            })?;
+            let drive_state = drive_mount::DriveMountState::new(
+                STREAM_PORT,
+                stream_token.clone(),
+                drive_cache_root,
+            )
+            .map_err(|e| {
+                log::error!("Failed to initialize TeraRelay Drive state: {}", e);
+                e
+            })?;
+            app.manage(drive_state);
+
+            // A filesystem must not depend on the React/WebView lifecycle. Mount
+            // it from the native application lifecycle so Nemo/other programs
+            // can see TeraRelay Drive even while the WebView is reloading. The
+            // existing local metadata remains useful while Telegram reconnects.
+            #[cfg(target_os = "linux")]
+            {
+                match drive_mount::cmd_drive_mount(
+                    app.handle().clone(),
+                    app.state::<drive_mount::DriveMountState>(),
+                    app.state::<db::DbConnection>(),
+                    app.state::<commands::TelegramState>(),
+                ) {
+                    Ok(status) => {
+                        log::info!(
+                            "TeraRelay Drive mounted at {:?}",
+                            status.mount_point.as_deref().unwrap_or("<unknown>")
+                        );
+                        #[cfg(debug_assertions)]
+                        if let Ok(cache_dir) = app.path().app_cache_dir() {
+                            let _ = std::fs::remove_file(cache_dir.join("drive-mount-error.txt"));
+                        }
+                    }
+                    Err(error) => {
+                        // Keep the main app usable if FUSE is unavailable on a
+                        // particular machine. The Settings/status command can
+                        // expose the failure and a later retry remains possible.
+                        log::error!("TeraRelay Drive mount failed: {}", error);
+                        #[cfg(debug_assertions)]
+                        if let Ok(cache_dir) = app.path().app_cache_dir() {
+                            let _ = std::fs::write(
+                                cache_dir.join("drive-mount-error.txt"),
+                                error.as_bytes(),
+                            );
+                        }
+                    }
+                }
+            }
 
             // Start Streaming Server on dedicated thread (Actix needs its own runtime).
             // Desktop only: mobile platforms should not create a second Actix/Tokio
@@ -503,6 +578,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::cmd_auth_request_code,
+            commands::cmd_auth_request_code_ephemeral,
             commands::cmd_auth_request_code_saved,
             commands::cmd_auth_sign_in,
             commands::cmd_auth_check_password,
@@ -510,11 +586,38 @@ pub fn run() {
             commands::cmd_secure_credential_status,
             commands::cmd_delete_saved_api_credentials,
             commands::cmd_get_files,
+            commands::cmd_drive_sync_metadata,
+            commands::cmd_drive_get_snapshot,
+            commands::cmd_drive_list_trash,
+            commands::cmd_drive_restore_trash_item,
+            commands::cmd_drive_finalize_upload,
+            drive_crypto::cmd_drive_crypto_status,
+            drive_crypto::cmd_drive_crypto_setup,
+            drive_crypto::cmd_drive_crypto_unlock,
+            drive_crypto::cmd_drive_crypto_change_passphrase,
+            drive_crypto::cmd_drive_crypto_lock,
+            drive_mount::cmd_drive_status,
+            drive_mount::cmd_drive_mount,
+            drive_mount::cmd_drive_recover_pending,
+            drive_mount::cmd_drive_unmount,
+            commands::cmd_qa_feature_a_seed,
+            commands::cmd_get_file_stack,
+            commands::cmd_create_file_stack,
+            commands::cmd_add_file_to_stack,
+            commands::cmd_set_file_stack_primary,
+            commands::cmd_rename_file_stack,
+            commands::cmd_update_file_stack_label,
+            commands::cmd_remove_file_from_stack,
+            commands::cmd_unstack_file_stack,
+            commands::cmd_delete_file_stack_all,
+            commands::cmd_move_file_stack,
+            commands::cmd_preflight_upload_candidate,
             commands::cmd_upload_file,
             commands::transfers::cmd_load_transfer_queue,
             commands::transfers::cmd_save_transfer_queue,
             commands::initiate_upload,
             tdlib_fast::cmd_fast_transfer_status,
+            tdlib_fast::cmd_fast_transfer_prepare_qa_credentials,
             tdlib_fast::cmd_fast_transfer_prepare_saved,
             tdlib_fast::cmd_fast_transfer_prepare_manual_saved,
             tdlib_fast::cmd_fast_transfer_phone,
@@ -535,6 +638,7 @@ pub fn run() {
             commands::cmd_rename_folder,
             commands::cmd_rename_file,
             commands::cmd_get_bandwidth,
+            commands::cmd_tdlib_transfer_supported,
             commands::cmd_delete_preview_for_message,
             commands::cmd_get_preview,
             commands::cmd_clean_preview_cache,
@@ -572,6 +676,7 @@ pub fn run() {
             commands::cmd_get_tera_channel_members,
             cmd_get_system_diagnostics,
             commands::cmd_get_video_metadata,
+            commands::cmd_get_rich_media_metadata,
             commands::cmd_probe_media_tracks,
             commands::cmd_prepare_subtitle_track,
             commands::cmd_get_video_metadata_batch,
@@ -605,6 +710,12 @@ pub fn run() {
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
             log::info!("Application exiting — shutting down background services...");
+
+            // Unmount the user-space cloud drive before its local
+            // streaming/cache services disappear.
+            if let Some(drive_state) = app_handle.try_state::<drive_mount::DriveMountState>() {
+                drive_mount::unmount_best_effort(drive_state.inner());
+            }
 
             // 1. Gracefully close TDLib without logging out. Its local
             // authorization database remains reusable on the next app start.

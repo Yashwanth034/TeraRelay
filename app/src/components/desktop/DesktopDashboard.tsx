@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 
 import { TelegramFile, BandwidthStats, ShareInfo } from '../../types';
 import { formatBytes, getFileCategory, isMediaFile, isVideoFile, isPdfFile, isArchiveFile, nativeShareOrCopy, copyToClipboard, type FileCategory } from '../../utils';
+import { getPremiumFileTitle } from '../../filePresentation';
 
 // Components
 import { Sidebar } from './dashboard/Sidebar';
@@ -24,9 +25,11 @@ import { SettingsModal } from './dashboard/SettingsModal';
 import { ShareDialog } from './dashboard/ShareDialog';
 import { RenameFolderModal } from './dashboard/RenameFolderModal';
 import { RenameFileModal } from './dashboard/RenameFileModal';
+import { VersionStackModal } from './dashboard/VersionStackModal';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { JoinChannelModal } from './dashboard/JoinChannelModal';
 import { ChannelInfoPanel } from './dashboard/ChannelInfoPanel';
+import { MediaDetailsPanel } from './dashboard/MediaDetailsPanel';
 import { Link, Copy, Check, X, Loader2, Share2 } from 'lucide-react';
 
 // Hooks
@@ -85,6 +88,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [channelFileCategory, setChannelFileCategory] = useState<FileCategory>('all');
     const [moveFileTarget, setMoveFileTarget] = useState<TelegramFile | null>(null);
     const [renameFileTarget, setRenameFileTarget] = useState<TelegramFile | null>(null);
+    const [versionTarget, setVersionTarget] = useState<{ file: TelegramFile; mode: 'manage' | 'add' } | null>(null);
+    const [detailsFile, setDetailsFile] = useState<TelegramFile | null>(null);
 
     const activeChannel = activeFolderId === null
         ? null
@@ -94,7 +99,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const { data: allFiles = [], isLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
-        queryFn: () => invoke<Array<{ id: number; name: string; size: number; icon_type: string; folder_id: number | null; created_at: string; mime_type?: string; file_ext?: string; is_split?: boolean }>>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
+        queryFn: () => invoke<Array<{
+            id: number; name: string; size: number; icon_type: string; folder_id: number | null;
+            created_at: string; mime_type?: string; file_ext?: string; is_split?: boolean;
+            logical_file_id?: string; stack_id?: string; stack_name?: string;
+            stack_version_count?: number; stack_label?: string;
+        }>>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
             ...f,
             sizeStr: formatBytes(f.size),
             type: (f.icon_type as TelegramFile['type']) || 'file'
@@ -104,13 +114,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const displayedFiles = activeFolderId !== null
         ? allFiles.filter((f: TelegramFile) =>
-            f.name.toLowerCase().includes(searchTerm.trim().toLowerCase())
+            (f.stack_name || f.name).toLowerCase().includes(searchTerm.trim().toLowerCase())
             && (channelFileCategory === 'all' || getFileCategory(f.name) === channelFileCategory)
         )
         : searchTerm.length > 2
             ? searchResults
             : allFiles.filter((f: TelegramFile) =>
-                f.name.toLowerCase().includes(searchTerm.trim().toLowerCase())
+                (f.stack_name || f.name).toLowerCase().includes(searchTerm.trim().toLowerCase())
             );
 
     const activeCategoryLabel: Record<FileCategory, string | undefined> = {
@@ -134,6 +144,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         uploadQueue,
         handleManualUpload,
         handleFolderUpload,
+        handleVersionUpload,
         handleDropUpload,
         handleUrlUpload,
         cancelAll: cancelUploads,
@@ -141,7 +152,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         pauseItem: pauseUploadItem,
         resumeItem: resumeUploadItem,
         retryItem: retryUploadItem,
-    } = useFileUpload(activeFolderId, store);
+        dismissItem: dismissUploadItem,
+    } = useFileUpload(activeFolderId, store, allFiles);
     const {
         downloadQueue,
         queueDownload,
@@ -151,6 +163,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         pauseItem: pauseDownloadItem,
         resumeItem: resumeDownloadItem,
         retryItem: retryDownloadItem,
+        dismissItem: dismissDownloadItem,
     } = useFileDownload(store);
 
     const {
@@ -235,6 +248,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setPlayingFile(null);
         setPdfFile(null);
         setArchiveViewFile(null);
+        setVersionTarget(null);
+        setDetailsFile(null);
     }, []);
 
     const handleFocusSearch = useCallback(() => {
@@ -274,6 +289,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setPreviewContextIndex(-1);
         setArchiveViewFile(null);
         setShowChannelInfo(false);
+        setDetailsFile(null);
         setChannelFileCategory('all');
     }, [activeFolderId]);
 
@@ -310,28 +326,39 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const clearSelection = useCallback(() => {
         lastClickedIndexRef.current = -1;
         setSelectedIds([]);
+        setDetailsFile(null);
     }, []);
 
     const handleFileClick = (e: React.MouseEvent, id: number) => {
         e.stopPropagation();
         const currentIndex = displayedFiles.findIndex(f => f.id === id);
+        const file = currentIndex >= 0 ? displayedFiles[currentIndex] : null;
 
         if (e.shiftKey && lastClickedIndexRef.current >= 0) {
-            // Shift+Click: range select from last clicked to current
             const start = Math.min(lastClickedIndexRef.current, currentIndex);
             const end = Math.max(lastClickedIndexRef.current, currentIndex);
             const rangeIds = displayedFiles.slice(start, end + 1).map(f => f.id);
             setSelectedIds(rangeIds);
+            setDetailsFile(null);
         } else if (e.metaKey || e.ctrlKey) {
-            // Ctrl/Cmd+Click: toggle individual file
             lastClickedIndexRef.current = currentIndex;
             setSelectedIds(ids => ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]);
+            setDetailsFile(null);
         } else {
-            // Plain click: select single file
             lastClickedIndexRef.current = currentIndex;
             setSelectedIds([id]);
+            setDetailsFile(file && file.type !== 'folder' && !file.stack_id ? file : null);
         }
     }
+
+    const handleShowDetails = useCallback((file: TelegramFile) => {
+        if (file.type === 'folder') return;
+        if (file.stack_id) {
+            toast.info('Choose a version inside this stack to inspect its media details.');
+            return;
+        }
+        setDetailsFile(file);
+    }, []);
 
     const handleToggleSelection = useCallback((id: number) => {
         setSelectedIds(ids => ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]);
@@ -342,9 +369,31 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setShowMoveModal(true);
     }, []);
 
+    const handleVersions = useCallback((file: TelegramFile, mode: 'manage' | 'add' = 'manage') => {
+        if (activeFolderId === null || !file.logical_file_id) {
+            toast.info('File Versions are available for manifest-backed files inside TeraRelay channels.');
+            return;
+        }
+        setVersionTarget({ file, mode });
+    }, [activeFolderId]);
+
+    const handleVisibleDelete = useCallback((id: number) => {
+        const file = displayedFiles.find(candidate => candidate.id === id);
+        if (file?.stack_id) {
+            handleVersions(file, 'manage');
+            toast.info('Choose “Remove stack only”, “Delete version”, or “Delete all versions” from Manage versions.');
+            return;
+        }
+        void handleDelete(id);
+    }, [displayedFiles, handleDelete, handleVersions]);
+
     const handleRename = useCallback((file: TelegramFile) => {
+        if (file.stack_id) {
+            handleVersions(file, 'manage');
+            return;
+        }
         setRenameFileTarget(file);
-    }, []);
+    }, [handleVersions]);
 
     const handleRenameSubmit = useCallback(async (newName: string) => {
         if (!renameFileTarget) return;
@@ -394,7 +443,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         onDownload: handleKeyboardDownload,
         onShare: handleKeyboardShare,
         onRename: handleKeyboardRename,
-        enabled: !previewFile && !playingFile && !pdfFile && !archiveViewFile && !showMoveModal
+        enabled: !previewFile && !playingFile && !pdfFile && !archiveViewFile && !showMoveModal && !versionTarget
     });
 
     const handlePreview = (file: TelegramFile, orderedFiles?: TelegramFile[]) => {
@@ -606,27 +655,45 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {showMoveModal && (
                     <MoveToFolderModal
                         folders={folders}
-                        fileName={moveFileTarget?.name}
+                        fileName={moveFileTarget ? (moveFileTarget.stack_id ? getPremiumFileTitle(moveFileTarget) : moveFileTarget.name) : undefined}
+                        allowPersonalVault={!moveFileTarget?.stack_id}
+                        writableOnly={!!moveFileTarget?.stack_id}
                         onClose={() => { setShowMoveModal(false); setMoveFileTarget(null); }}
                         onSelect={async (targetFolderId: number | null) => {
                             if (moveFileTarget) {
                                 try {
-                                    await invoke('cmd_move_files', {
-                                        messageIds: [moveFileTarget.id],
-                                        sourceFolderId: activeFolderId,
-                                        targetFolderId,
-                                    });
-                                    // Clean up stale thumbnail and preview cache for the old message ID
-                                    await Promise.all([
-                                        invoke('cmd_delete_image_thumbnail', { messageId: moveFileTarget.id, folderId: activeFolderId }).catch(() => {}),
-                                        invoke('cmd_delete_preview_for_message', { messageId: moveFileTarget.id, folderId: activeFolderId }).catch(() => {}),
-                                    ]);
-                                    queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
-                                    toast.success(`Moved "${moveFileTarget.name}"`);
+                                    if (moveFileTarget.stack_id) {
+                                        if (activeFolderId === null || targetFolderId === null) {
+                                            toast.error('Version stacks can currently move only between TeraRelay channels.');
+                                            return;
+                                        }
+                                        await invoke('cmd_move_file_stack', {
+                                            stackId: moveFileTarget.stack_id,
+                                            sourceFolderId: activeFolderId,
+                                            targetFolderId,
+                                        });
+                                        await Promise.all([
+                                            queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] }),
+                                            queryClient.invalidateQueries({ queryKey: ['files', targetFolderId] }),
+                                        ]);
+                                        toast.success(`Moved stack "${getPremiumFileTitle(moveFileTarget)}"`);
+                                    } else {
+                                        await invoke('cmd_move_files', {
+                                            messageIds: [moveFileTarget.id],
+                                            sourceFolderId: activeFolderId,
+                                            targetFolderId,
+                                        });
+                                        await Promise.all([
+                                            invoke('cmd_delete_image_thumbnail', { messageId: moveFileTarget.id, folderId: activeFolderId }).catch(() => {}),
+                                            invoke('cmd_delete_preview_for_message', { messageId: moveFileTarget.id, folderId: activeFolderId }).catch(() => {}),
+                                        ]);
+                                        queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+                                        toast.success(`Moved "${moveFileTarget.name}"`);
+                                    }
                                     setMoveFileTarget(null);
                                     setShowMoveModal(false);
-                                } catch {
-                                    toast.error('Failed to move file');
+                                } catch (error) {
+                                    toast.error(`Failed to move: ${error}`);
                                 }
                             } else {
                                 handleBulkMove(targetFolderId, () => setShowMoveModal(false));
@@ -719,6 +786,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onRemoteUploadClick={() => setShowRemoteUpload(true)}
                     readOnly={activeChannelReadOnly}
                     channelMode={activeFolderId !== null}
+                    channelFileCount={activeFolderId !== null ? allFiles.length : undefined}
+                    channelCategoryLabel={activeFolderId !== null && channelFileCategory !== 'all' ? activeCategoryLabel[channelFileCategory] : undefined}
+                    onChannelInfo={activeFolderId !== null ? () => setShowChannelInfo(true) : undefined}
                 />
                 {activeFolderId === null && searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">
@@ -729,25 +799,22 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {activeFolderId !== null ? (
                     <ChannelFeed
-                        channelName={currentFolderName}
                         files={displayedFiles}
                         loading={isLoading || isSearching}
                         error={error}
                         selectedIds={selectedIds}
                         activeFolderId={activeFolderId}
                         readOnly={activeChannelReadOnly}
-                        searchTerm={searchTerm}
-                        onSearchChange={setSearchTerm}
                         onFileClick={handleFileClick}
                         onToggleSelection={handleToggleSelection}
-                        onDelete={handleDelete}
+                        onDelete={handleVisibleDelete}
                         onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
+                        onDownloadAll={(members) => queueBulkDownload(members, activeFolderId)}
                         onPreview={handlePreview}
+                        onDetails={handleShowDetails}
                         onManualUpload={handleManualUpload}
                         onFolderUpload={handleFolderUpload}
-                        onChannelInfo={() => setShowChannelInfo(true)}
-                        totalFileCount={allFiles.length}
-                        activeCategoryLabel={activeCategoryLabel[channelFileCategory]}
+                        activeCategoryLabel={channelFileCategory !== 'all' ? activeCategoryLabel[channelFileCategory] : undefined}
                         showFolderUpload={true}
                         onDrop={handleDropOnFolder}
                         onShare={(f) => {
@@ -757,6 +824,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                             }
                             setShareFile(f);
                         }}
+                        onAddVersion={(f) => handleVersions(f, 'add')}
+                        onManageVersions={(f) => handleVersions(f, 'manage')}
+                        folders={folders}
                         onRename={handleRename}
                         onFileMove={handleFileMove}
                     />
@@ -773,6 +843,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onDelete={handleDelete}
                         onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                         onPreview={handlePreview}
+                        onDetails={handleShowDetails}
                         onManualUpload={handleManualUpload}
                         onFolderUpload={handleFolderUpload}
                         showFolderUpload={true}
@@ -794,6 +865,44 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     />
                 )}
             </main>
+
+            {detailsFile && (
+                <MediaDetailsPanel
+                    file={detailsFile}
+                    folderId={detailsFile.folder_id ?? activeFolderId}
+                    folderName={
+                        folders.find(folder => folder.id === (detailsFile.folder_id ?? activeFolderId))?.name
+                        || currentFolderName
+                    }
+                    onClose={() => setDetailsFile(null)}
+                    onPreview={() => handlePreview(detailsFile, [detailsFile])}
+                />
+            )}
+
+            {versionTarget && activeFolderId !== null && (
+                <VersionStackModal
+                    file={versionTarget.file}
+                    allFiles={allFiles as TelegramFile[]}
+                    folderId={activeFolderId}
+                    initialMode={versionTarget.mode}
+                    readOnly={activeChannelReadOnly}
+                    onClose={() => setVersionTarget(null)}
+                    onChanged={async () => {
+                        await queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+                    }}
+                    onUploadNew={handleVersionUpload}
+                    onPreview={(member) => {
+                        setVersionTarget(null);
+                        handlePreview(member, [member]);
+                    }}
+                    onDownload={(member) => queueDownload(member.id, member.name, activeFolderId)}
+                    onDownloadAll={(members) => queueBulkDownload(members, activeFolderId)}
+                    onMoveStack={!activeChannelReadOnly ? (stackFile) => {
+                        setVersionTarget(null);
+                        handleFileMove(stackFile);
+                    } : undefined}
+                />
+            )}
 
             {previewFile && (
                 <PreviewModal
@@ -834,6 +943,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onPauseItem={pauseUploadItem}
                         onResumeItem={resumeUploadItem}
                         onRetryItem={retryUploadItem}
+                        onDismissItem={dismissUploadItem}
                     />
                     <DownloadQueue
                         items={downloadQueue}
@@ -842,6 +952,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onPauseItem={pauseDownloadItem}
                         onResumeItem={resumeDownloadItem}
                         onRetryItem={retryDownloadItem}
+                        onDismissItem={dismissDownloadItem}
                     />
                 </div>
             )}
@@ -911,19 +1022,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             {/* Bulk Share Results Modal */}
             {bulkShareLinks && (
                 <div
-                    className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                    className="tr-modal-backdrop fixed inset-0 z-[200] flex items-center justify-center p-4"
                     onClick={() => setBulkShareLinks(null)}
                 >
                     <div
-                        className="bg-telegram-surface border border-telegram-border rounded-xl w-[500px] max-h-[70vh] shadow-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                        className="tr-modal w-full max-w-[520px] max-h-[70vh] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
                         onClick={e => e.stopPropagation()}
                     >
-                        <div className="p-4 border-b border-telegram-border flex items-center justify-between">
+                        <div className="tr-modal-header p-4 flex items-center justify-between">
                             <h3 className="text-telegram-text font-medium flex items-center gap-2">
                                 <Link className="w-5 h-5 text-telegram-primary" />
                                 {bulkShareLinks.length} Share Link{bulkShareLinks.length !== 1 ? 's' : ''}
                             </h3>
-                            <button onClick={() => setBulkShareLinks(null)} className="text-telegram-subtext hover:text-telegram-text">
+                            <button onClick={() => setBulkShareLinks(null)} className="tr-modal-close">
                                 <X className="w-5 h-5" />
                             </button>
                         </div>
@@ -940,7 +1051,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                                     return (
                                         <div
                                             key={file.id}
-                                            className="p-3 rounded-lg bg-telegram-hover/30 border border-telegram-border/30 space-y-2"
+                                            className="tr-modal-note space-y-2"
                                         >
                                             <p className="text-xs font-semibold text-telegram-text truncate">{file.name}</p>
                                             <div className="flex gap-2">
@@ -948,7 +1059,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                                                     type="text"
                                                     readOnly
                                                     value={link}
-                                                    className="flex-1 bg-telegram-bg border border-telegram-border rounded-lg px-2.5 py-1.5 text-xs text-telegram-text focus:outline-none select-all truncate"
+                                                    className="tr-modal-input flex-1 px-2.5 py-2 text-xs select-all truncate"
                                                 />
                                                 <button
                                                     onClick={() => handleCopyBulkLink(link)}
@@ -977,7 +1088,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
                         <button
                             onClick={() => setBulkShareLinks(null)}
-                            className="w-full px-4 py-2.5 border-t border-telegram-border bg-telegram-hover/20 hover:bg-telegram-hover/40 text-telegram-text text-sm font-medium transition-colors"
+                            className="tr-button tr-button--secondary tr-button--md m-4 mt-0"
                         >
                             Done
                         </button>

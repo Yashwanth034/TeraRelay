@@ -97,13 +97,13 @@ export function ChannelInfoPanel({
     };
 
     return (
-        <div className="fixed inset-0 z-[230] flex justify-end bg-black/35" onClick={onClose}>
+        <div className="tr-side-panel-backdrop fixed inset-0 z-[230] flex justify-end" onClick={onClose}>
             <aside
-                className="h-full w-full max-w-[390px] overflow-y-auto border-l border-telegram-border bg-telegram-surface shadow-2xl"
+                className="tr-side-panel w-full max-w-[390px]"
                 onClick={(event) => event.stopPropagation()}
                 aria-label="Channel information"
             >
-                <div className="sticky top-0 z-10 flex items-center justify-between border-b border-telegram-border bg-telegram-surface/95 px-5 py-4 backdrop-blur">
+                <div className="tr-side-panel__header sticky top-0 z-10 flex items-center justify-between px-5 py-4">
                     <div className="min-w-0">
                         <h2 className="truncate text-base font-semibold text-telegram-text">{channelName}</h2>
                         <p className="mt-0.5 text-xs font-medium text-telegram-subtext">
@@ -113,7 +113,7 @@ export function ChannelInfoPanel({
                     <button
                         type="button"
                         onClick={onClose}
-                        className="rounded-lg p-2 text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text"
+                        className="tr-modal-close"
                         aria-label="Close channel info"
                     >
                         <X className="h-4 w-4" />
@@ -136,11 +136,11 @@ export function ChannelInfoPanel({
                                 ))}
                             </div>
                         ) : membersQuery.isError ? (
-                            <div className="rounded-xl border border-telegram-border bg-telegram-bg/50 px-3.5 py-3 text-xs leading-relaxed text-telegram-subtext">
+                            <div className="tr-modal-note">
                                 Member list isn’t available for this account.
                             </div>
                         ) : members.length === 0 ? (
-                            <div className="rounded-xl border border-telegram-border bg-telegram-bg/50 px-3.5 py-3 text-xs text-telegram-subtext">
+                            <div className="tr-modal-note">
                                 No members found.
                             </div>
                         ) : (
@@ -148,7 +148,7 @@ export function ChannelInfoPanel({
                                 {visibleMembers.map((member, index) => (
                                     <div
                                         key={(member.username ?? member.display_name) + '-' + index}
-                                        className="flex min-w-0 items-center gap-3 rounded-xl px-2 py-2"
+                                        className="tr-side-panel-row flex min-w-0 items-center gap-3 px-2.5 py-2"
                                     >
                                         <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-telegram-primary/10 text-sm font-semibold text-telegram-primary">
                                             {member.display_name.trim().charAt(0).toUpperCase() || '?'}
@@ -184,7 +184,7 @@ export function ChannelInfoPanel({
                         <button
                             type="button"
                             onClick={() => selectCategory('all')}
-                            className={'mb-2 flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left transition hover:bg-telegram-hover ' + (activeCategory === 'all' ? 'bg-telegram-primary/10' : '')}
+                            className={'tr-side-panel-row mb-1 flex w-full items-center justify-between px-3 py-2.5 text-left ' + (activeCategory === 'all' ? 'tr-side-panel-row--active' : '')}
                         >
                             <span className="flex items-center gap-2 text-sm font-semibold text-telegram-text">
                                 <Files className="h-4 w-4 text-telegram-subtext" />
@@ -199,7 +199,7 @@ export function ChannelInfoPanel({
                                     key={key}
                                     type="button"
                                     onClick={() => selectCategory(key)}
-                                    className={'flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left transition hover:bg-telegram-hover ' + (activeCategory === key ? 'bg-telegram-primary/10' : '')}
+                                    className={'tr-side-panel-row flex w-full items-center justify-between px-3 py-2.5 text-left ' + (activeCategory === key ? 'tr-side-panel-row--active' : '')}
                                 >
                                     <span className="flex items-center gap-2 text-sm text-telegram-text">
                                         <Icon className="h-4 w-4 text-telegram-subtext" />
@@ -216,7 +216,7 @@ export function ChannelInfoPanel({
                             <button
                                 type="button"
                                 onClick={onInvite}
-                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-telegram-primary py-2.5 text-sm font-semibold text-white transition hover:brightness-110"
+                                className="tr-button tr-button--primary tr-button--md w-full"
                             >
                                 <UserPlus className="h-4 w-4" />
                                 Invite member

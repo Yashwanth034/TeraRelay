@@ -180,6 +180,24 @@ pub async fn verify_source(path: &str, expected: &SourceIdentity) -> Result<(), 
     }
 }
 
+pub async fn hash_file_with_identity(path: &str) -> Result<(String, String, u64), String> {
+    let before = source_identity(path).await?;
+    let hash = hash_file_range(path, 0, before.size).await?;
+    let after = source_identity(path).await?;
+    if before != after {
+        return Err(SOURCE_CHANGED.to_string());
+    }
+    let identity = serde_json::to_string(&before)
+        .map_err(|e| format!("Cannot serialize upload source identity: {e}"))?;
+    Ok((hash, identity, before.size))
+}
+
+pub async fn verify_serialized_source_identity(path: &str, serialized: &str) -> Result<(), String> {
+    let expected: SourceIdentity = serde_json::from_str(serialized)
+        .map_err(|e| format!("Invalid upload source identity: {e}"))?;
+    verify_source(path, &expected).await
+}
+
 /// Bounded-memory verification for legacy parts without a local checkpoint.
 pub async fn hash_file_range(path: &str, offset: u64, len: u64) -> Result<String, String> {
     let mut file = tokio::fs::File::open(path)
@@ -462,6 +480,32 @@ mod tests {
             .unwrap();
         assert_eq!(statement.next().unwrap(), sqlite::State::Row);
         assert_eq!(statement.read::<String, _>(0).unwrap(), "broken");
+    }
+
+    #[tokio::test]
+    async fn full_file_fingerprint_hashes_every_byte_and_binds_to_source_identity() {
+        let dir = scratch();
+        let path = dir.join("fingerprint.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let (hash, identity, size) = hash_file_with_identity(path_str).await.unwrap();
+        assert_eq!(size, 3);
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        verify_serialized_source_identity(path_str, &identity)
+            .await
+            .unwrap();
+
+        std::fs::write(&path, b"abd").unwrap();
+        assert!(verify_serialized_source_identity(path_str, &identity)
+            .await
+            .unwrap_err()
+            .contains("Upload source changed"));
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

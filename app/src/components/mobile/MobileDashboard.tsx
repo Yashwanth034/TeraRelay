@@ -2,13 +2,16 @@ import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Folder, Download, Menu, LogOut, RefreshCw, UploadCloud, MoreVertical, Trash2, Pencil, Globe, Shield, Lock, ChevronDown, Wifi, Activity, Zap, Eye, EyeOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { BottomNavBar } from './BottomNavBar';
 import { TouchFileList } from './TouchFileList';
 import { ThemeToggle } from '../shared/ThemeToggle';
 import { TeraRelayBrand } from '../shared/TeraRelayBrand';
 import { ChannelInfoPanel } from '../desktop/dashboard/ChannelInfoPanel';
+import { MediaDetailsPanel } from '../desktop/dashboard/MediaDetailsPanel';
+import { VersionStackModal } from '../desktop/dashboard/VersionStackModal';
+import { MoveToFolderModal } from '../desktop/dashboard/MoveToFolderModal';
 import { ActionPopover, ActionItem } from './ActionPopover';
 import { RenameFolderSheet } from './RenameFolderSheet';
 import { usePlatform } from '../../hooks/usePlatform';
@@ -26,6 +29,7 @@ import { useTranslation } from 'react-i18next';
 
 export default function MobileDashboard({ onLogout }: { onLogout?: () => void }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'files' | 'downloads' | 'settings'>('files');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const { isAndroid } = usePlatform();
@@ -72,12 +76,17 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
   useEffect(() => {
     setShowChannelInfo(false);
     setChannelFileCategory('all');
+    setVersionTarget(null);
+    setMoveStackTarget(null);
+    setDetailsFile(null);
   }, [activeFolderId]);
 
-  const { handleManualUpload } = useFileUpload(activeFolderId, store);
   const { queueDownload, queueBulkDownload } = useFileDownload(store);
 
   const [previewFile, setPreviewFile] = useState<TelegramFile | null>(null);
+  const [versionTarget, setVersionTarget] = useState<{ file: TelegramFile; mode: 'manage' | 'add' } | null>(null);
+  const [moveStackTarget, setMoveStackTarget] = useState<TelegramFile | null>(null);
+  const [detailsFile, setDetailsFile] = useState<TelegramFile | null>(null);
 
   // ── Connection diagnostics state ──────────────────────────────────────
   const [checkingLatency, setCheckingLatency] = useState(false);
@@ -120,6 +129,8 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
     }))),
     enabled: !!store,
   });
+
+  const { handleManualUpload, handleVersionUpload } = useFileUpload(activeFolderId, store, allFiles);
 
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [fileRenames, setFileRenames] = useState<Map<number, string>>(new Map());
@@ -213,10 +224,23 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
     queueDownload(file.id, file.name, activeFolderId);
   }, [queueDownload, activeFolderId]);
 
+  const handleVersions = useCallback((file: TelegramFile, mode: 'manage' | 'add' = 'manage') => {
+    if (activeFolderId === null || !file.logical_file_id) {
+      toast.info('File Versions are available for TeraRelay channel files with stable metadata.');
+      return;
+    }
+    setVersionTarget({ file, mode });
+  }, [activeFolderId]);
+
   const handleDeleteFile = useCallback((file: TelegramFile) => {
     if (activeChannelReadOnly) return;
+    if (file.stack_id) {
+      handleVersions(file, 'manage');
+      toast.info('Manage versions lets you unstack safely or delete specific/all versions.');
+      return;
+    }
     handleDeleteOp(file.id);
-  }, [activeChannelReadOnly, handleDeleteOp]);
+  }, [activeChannelReadOnly, handleDeleteOp, handleVersions]);
 
   const handlePreview = useCallback((file: TelegramFile) => {
     if (isImageFile(file.name)) {
@@ -228,6 +252,10 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
 
   const handleRenameFile = useCallback((file: TelegramFile) => {
     if (activeChannelReadOnly) return;
+    if (file.stack_id) {
+      handleVersions(file, 'manage');
+      return;
+    }
     const currentName = fileRenames.get(file.id) || file.name;
     const newName = prompt(`Rename "${currentName}":`, currentName);
     if (!newName || !newName.trim() || newName.trim() === currentName) return;
@@ -237,7 +265,7 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
       return next;
     });
     toast.success(`Renamed to "${newName.trim()}"`);
-  }, [activeChannelReadOnly, fileRenames]);
+  }, [activeChannelReadOnly, fileRenames, handleVersions]);
 
   // ── Copy Telegram native t.me link ────────────────────────────────────
   const handleCopyTelegramLink = useCallback((file: TelegramFile) => {
@@ -268,8 +296,8 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
   }, [renamedFiles, activeFolderId, channelFileCategory]);
 
   return (
-    <div className="absolute inset-0 flex flex-col bg-telegram-bg text-telegram-text overflow-hidden select-none font-sans">
-      <header className="sticky top-0 z-40 flex items-center justify-between border-b border-telegram-border/60 bg-telegram-surface/95 px-5 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top,24px))] backdrop-blur-md">
+    <div className="tr-mobile-shell absolute inset-0 flex flex-col text-telegram-text overflow-hidden select-none font-sans">
+      <header className="tr-mobile-topbar sticky top-0 z-40 flex items-center justify-between px-5 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top,24px))]">
         <TeraRelayBrand size="sm" />
         <div className="flex items-center gap-2">
           <ThemeToggle />
@@ -300,10 +328,10 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
       )}
 
       {/* Main Viewport Container */}
-      <main className="flex-1 overflow-y-auto px-4 py-3 space-y-4 pb-40 scroll-smooth">
+      <main className="tr-mobile-main flex-1 overflow-y-auto px-4 py-3 space-y-4 pb-40 scroll-smooth">
         {activeTab === 'files' && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between rounded-2xl border border-telegram-border/40 bg-telegram-surface/80 p-3">
+            <div className="tr-mobile-folder-card flex items-center justify-between p-3">
               <button
                 type="button"
                 onClick={() => {
@@ -351,9 +379,11 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
               onDownload={handleDownload}
               onDelete={handleDeleteFile}
               onPreview={handlePreview}
+              onDetails={setDetailsFile}
               onRename={handleRenameFile}
               onShare={undefined}
               onCopyTelegramLink={handleCopyTelegramLink}
+              onVersions={handleVersions}
               onBulkShare={undefined}
               selectedIds={selectedIds}
               onToggleSelection={handleToggleSelection}
@@ -640,14 +670,14 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
       {/* Slide-out Sidebar Drawer Overlay */}
       {isSidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/60 z-[100] backdrop-blur-sm transition-opacity duration-300"
+          className="tr-mobile-backdrop fixed inset-0 z-[100] transition-opacity duration-300"
           onClick={() => setIsSidebarOpen(false)}
         />
       )}
 
       {/* Slide-out Sidebar Drawer Panel */}
       <div
-        className={`fixed top-0 left-0 bottom-0 w-[280px] bg-telegram-surface border-r border-telegram-border/60 z-[110] shadow-2xl flex flex-col pt-[calc(1rem+env(safe-area-inset-top,24px))] pb-28 transition-transform duration-300 ease-out transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        className={`tr-mobile-drawer fixed top-0 left-0 bottom-0 w-[280px] z-[110] flex flex-col pt-[calc(1rem+env(safe-area-inset-top,24px))] pb-28 transition-transform duration-300 ease-out transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
           }`}
         onClick={e => e.stopPropagation()}
       >
@@ -756,6 +786,73 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
 
       {/* Floating Bottom Nav Bar */}
       <BottomNavBar activeTab={activeTab} setActiveTab={setActiveTab} isAndroid={isAndroid} />
+
+      {detailsFile && (
+        <MediaDetailsPanel
+          file={detailsFile}
+          folderId={detailsFile.folder_id ?? activeFolderId}
+          folderName={
+            folders.find(folder => folder.id === (detailsFile.folder_id ?? activeFolderId))?.name
+            || activeFolder
+          }
+          onClose={() => setDetailsFile(null)}
+          onPreview={() => handlePreview(detailsFile)}
+        />
+      )}
+
+      {versionTarget && activeFolderId !== null && (
+        <VersionStackModal
+          file={versionTarget.file}
+          allFiles={allFiles as TelegramFile[]}
+          folderId={activeFolderId}
+          initialMode={versionTarget.mode}
+          readOnly={activeChannelReadOnly}
+          onClose={() => setVersionTarget(null)}
+          onChanged={async () => {
+            await queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+          }}
+          onUploadNew={handleVersionUpload}
+          onPreview={(member) => {
+            setVersionTarget(null);
+            handlePreview(member);
+          }}
+          onDownload={handleDownload}
+          onDownloadAll={(members) => queueBulkDownload(members, activeFolderId)}
+          onMoveStack={!activeChannelReadOnly ? (stackFile) => {
+            setVersionTarget(null);
+            setMoveStackTarget(stackFile);
+          } : undefined}
+        />
+      )}
+
+      {moveStackTarget && activeFolderId !== null && (
+        <MoveToFolderModal
+          folders={folders}
+          activeFolderId={activeFolderId}
+          fileName={moveStackTarget.stack_name || moveStackTarget.name}
+          allowPersonalVault={false}
+          writableOnly
+          onClose={() => setMoveStackTarget(null)}
+          onSelect={async (targetFolderId) => {
+            if (targetFolderId === null || !moveStackTarget.stack_id) return;
+            try {
+              await invoke('cmd_move_file_stack', {
+                stackId: moveStackTarget.stack_id,
+                sourceFolderId: activeFolderId,
+                targetFolderId,
+              });
+              await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] }),
+                queryClient.invalidateQueries({ queryKey: ['files', targetFolderId] }),
+              ]);
+              toast.success(`Moved stack “${moveStackTarget.stack_name || moveStackTarget.name}”`);
+              setMoveStackTarget(null);
+            } catch (error) {
+              toast.error(`Could not move version stack: ${error}`);
+            }
+          }}
+        />
+      )}
 
       {/* Image preview */}
       {previewFile && (

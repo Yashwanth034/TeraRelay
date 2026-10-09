@@ -1,9 +1,11 @@
 import { useRef, useState, useCallback } from 'react';
-import { DownloadCloud, Trash2, Pencil, CheckSquare, X, Check, FolderInput, MoreVertical, Eye, Link, Copy } from 'lucide-react';
-import { FileTypeIcon } from '../shared/FileTypeIcon';
+import { DownloadCloud, Trash2, Pencil, CheckSquare, X, Check, FolderInput, MoreVertical, Eye, Link, Copy, Layers3, Info } from 'lucide-react';
+import { PremiumFileThumbnail } from '../shared/PremiumFileThumbnail';
 import { ActionPopover, ActionItem } from './ActionPopover';
 import { TelegramFile, TelegramFolder } from '../../types';
-import { displayFileName, formatCompactTimestamp } from '../../utils';
+import { displayFileName } from '../../utils';
+import { getPremiumFileTitle } from '../../filePresentation';
+import { RichFileMetaText } from '../shared/RichFileMetaText';
 
 interface TouchFileListProps {
   files: TelegramFile[];
@@ -11,6 +13,7 @@ interface TouchFileListProps {
   onDownload: (file: TelegramFile) => void;
   onDelete: (file: TelegramFile) => void;
   onPreview: (file: TelegramFile) => void;
+  onDetails?: (file: TelegramFile) => void;
   onRename: (file: TelegramFile) => void;
   selectedIds: number[];
   onToggleSelection: (id: number) => void;
@@ -22,12 +25,13 @@ interface TouchFileListProps {
   onBulkShare?: () => void;
   onShare?: (file: TelegramFile) => void;
   onCopyTelegramLink?: (file: TelegramFile) => void;
+  onVersions?: (file: TelegramFile, mode: 'manage' | 'add') => void;
   folders: TelegramFolder[];
   activeFolderId: number | null;
   readOnly?: boolean;
 }
 
-export function TouchFileList({ files, isLoading, onDownload, onDelete, onPreview, onRename, selectedIds, onToggleSelection, onSelectAll, onClearSelection, onBulkDelete, onBulkDownload, onBulkMove, onBulkShare, onShare, onCopyTelegramLink, folders, activeFolderId, readOnly = false }: TouchFileListProps) {
+export function TouchFileList({ files, isLoading, onDownload, onDelete, onPreview, onDetails, onRename, selectedIds, onToggleSelection, onSelectAll, onClearSelection, onBulkDelete, onBulkDownload, onBulkMove, onBulkShare, onShare, onCopyTelegramLink, onVersions, folders, activeFolderId, readOnly = false }: TouchFileListProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   const [showMovePicker, setShowMovePicker] = useState(false);
   const [actionMenuFile, setActionMenuFile] = useState<TelegramFile | null>(null);
@@ -87,12 +91,36 @@ export function TouchFileList({ files, isLoading, onDownload, onDelete, onPrevie
       },
     ];
 
+    if (!file.stack_id && onDetails) {
+      actions.push({
+        label: 'File details',
+        icon: <Info className="w-4 h-4" />,
+        onClick: () => onDetails(file),
+      });
+    }
+
+    if (file.stack_id && onVersions) {
+      actions.push({
+        label: 'Manage versions',
+        icon: <Layers3 className="w-4 h-4" />,
+        onClick: () => onVersions(file, 'manage'),
+      });
+    }
+
     if (readOnly) {
       return actions;
     }
 
+    if (!file.stack_id && file.logical_file_id && onVersions) {
+      actions.push({
+        label: 'Add version',
+        icon: <Layers3 className="w-4 h-4" />,
+        onClick: () => onVersions(file, 'add'),
+      });
+    }
+
     actions.push({
-      label: 'Rename',
+      label: file.stack_id ? 'Rename stack' : 'Rename',
       icon: <Pencil className="w-4 h-4" />,
       onClick: () => onRename(file),
     });
@@ -123,7 +151,7 @@ export function TouchFileList({ files, isLoading, onDownload, onDelete, onPrevie
       destructive: true,
     });
     return actions;
-  }, [readOnly, onPreview, onDownload, onRename, onDelete, onShare, onCopyTelegramLink, folders, activeFolderId]);
+  }, [readOnly, onPreview, onDetails, onDownload, onRename, onDelete, onShare, onCopyTelegramLink, onVersions, folders, activeFolderId]);
 
   return (
     <>
@@ -300,11 +328,11 @@ export function TouchFileList({ files, isLoading, onDownload, onDelete, onPrevie
                       onPreview(file);
                     }
                   }}
-                  className={`flex items-center justify-between p-3.5 rounded-2xl bg-telegram-hover/15 border transition-all duration-200 cursor-pointer active:bg-telegram-hover/35 ${
-                    isSelected ? 'border-telegram-primary/50 bg-telegram-primary/10' : 'border-telegram-border/20'
+                  className={`tr-mobile-file-row flex items-center justify-between p-2.5 cursor-pointer ${
+                    isSelected ? 'tr-mobile-file-row--selected' : ''
                   }`}
                 >
-                  <div className="flex items-center gap-3.5 min-w-0">
+                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
                     {/* Selection checkbox in selection mode */}
                     {isSelectionActive && (
                       <div className={`flex-shrink-0 w-5 h-5 rounded-md border-2 flex items-center justify-center transition-all duration-200 ${
@@ -315,15 +343,24 @@ export function TouchFileList({ files, isLoading, onDownload, onDelete, onPrevie
                         {isSelected && <Check className="w-3.5 h-3.5" />}
                       </div>
                     )}
-                    <div className="flex-shrink-0">
-                      <FileTypeIcon filename={file.name} />
-                    </div>
+                    <PremiumFileThumbnail
+                      file={file}
+                      folderId={activeFolderId}
+                      onOpen={() => onPreview(file)}
+                    />
                     <div className="min-w-0">
-                      <p className="text-xs font-semibold text-telegram-text truncate max-w-[150px] leading-snug">{displayFileName(file.name)}</p>
-                      <div className="flex items-center gap-2 mt-1">
-                        <span className="text-[10px] text-telegram-subtext/80 font-medium font-mono">{file.sizeStr}</span>
-                        <span className="w-1 h-1 bg-telegram-border rounded-full" />
-                        <span className="text-[10px] text-telegram-subtext/80 font-medium">{formatCompactTimestamp(file.created_at)}</span>
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <p className="truncate max-w-[180px] text-[13px] font-semibold leading-snug text-telegram-text" title={file.stack_name || displayFileName(file.name)}>
+                          {getPremiumFileTitle(file)}
+                        </p>
+
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
+                        <span className="tr-file-quality truncate text-[10px]">
+                          <RichFileMetaText file={file} folderId={activeFolderId} />
+                        </span>
+                        <span className="tr-file-meta-dot">•</span>
+                        <span className="text-[10px] text-telegram-subtext/80 font-medium shrink-0">{file.sizeStr}</span>
                       </div>
                     </div>
                   </div>

@@ -9,28 +9,30 @@ interface MoveToFolderModalProps {
     onSelect: (id: number | null) => void;
     activeFolderId: number | null;
     fileName?: string;
+    allowPersonalVault?: boolean;
+    writableOnly?: boolean;
 }
 
-export function MoveToFolderModal({ folders, onClose, onSelect, activeFolderId, fileName }: MoveToFolderModalProps) {
+export function MoveToFolderModal({ folders, onClose, onSelect, activeFolderId, fileName, allowPersonalVault = true, writableOnly = false }: MoveToFolderModalProps) {
     const { t } = useTranslation();
     useEscapeToClose(true, onClose);
 
     return (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
-            <div className="bg-telegram-surface border border-telegram-border rounded-xl w-80 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
-                <div className="p-4 border-b border-telegram-border flex justify-between items-center">
+        <div className="tr-modal-backdrop fixed inset-0 z-[100] flex items-center justify-center p-4" onClick={onClose}>
+            <div className="tr-modal w-full max-w-[360px] overflow-hidden flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
+                <div className="tr-modal-header p-4 flex justify-between items-center">
                     <h3 className="text-telegram-text font-medium truncate max-w-[220px]">
                         {fileName ? t('files.move_file_to_folder', { name: fileName }) : t('files.move_to_folder')}
                     </h3>
-                    <button onClick={onClose} className="rounded-lg p-1.5 text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-text" aria-label="Close"><X className="w-4 h-4" /></button>
+                    <button onClick={onClose} className="tr-modal-close" aria-label="Close"><X className="w-4 h-4" /></button>
                 </div>
                 <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                    {activeFolderId !== null && (
+                    {allowPersonalVault && activeFolderId !== null && (
                         <button
                             onClick={() => onSelect(null)}
-                            className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm text-left text-telegram-text hover:bg-telegram-hover transition-colors"
+                            className="tr-modal-option tr-modal-option--primary w-full flex items-center gap-3 px-3 py-3 text-sm text-left text-telegram-text"
                         >
-                            <div className="w-8 h-8 rounded bg-telegram-primary/20 flex items-center justify-center text-telegram-primary">
+                            <div className="tr-modal-icon w-9 h-9 flex items-center justify-center">
                                 <HardDrive className="w-4 h-4" />
                             </div>
                             <span className="font-medium">{t('common.personal_vault')}</span>
@@ -38,14 +40,14 @@ export function MoveToFolderModal({ folders, onClose, onSelect, activeFolderId, 
                     )}
 
                     {folders.map((f: any) => {
-                        if (f.id === activeFolderId) return null;
+                        if (f.id === activeFolderId || (writableOnly && f.role === 'member')) return null;
                         return (
                             <button
                                 key={f.id}
                                 onClick={() => onSelect(f.id)}
-                                className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm text-left text-telegram-text hover:bg-telegram-hover transition-colors"
+                                className="tr-modal-option w-full flex items-center gap-3 px-3 py-3 text-sm text-left text-telegram-text"
                             >
-                                <div className="w-8 h-8 rounded bg-telegram-hover flex items-center justify-center text-telegram-text">
+                                <div className="tr-modal-icon w-9 h-9 flex items-center justify-center">
                                     <Folder className="w-4 h-4" />
                                 </div>
                                 <span className="font-medium">{f.name}</span>

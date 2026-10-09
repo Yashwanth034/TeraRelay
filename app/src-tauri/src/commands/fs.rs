@@ -848,6 +848,197 @@ struct ProgressPayload {
     speed_bytes_per_sec: u64,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct UploadFileResult {
+    pub message: String,
+    pub logical_file_id: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct UploadCandidateFile {
+    pub logical_file_id: String,
+    pub message_id: i64,
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct UploadPreflightResult {
+    pub file_name: String,
+    pub size: u64,
+    pub source_sha256: String,
+    pub source_identity: String,
+    pub exact_duplicate: Option<UploadCandidateFile>,
+    pub similar_files: Vec<UploadCandidateFile>,
+}
+
+fn upload_similarity_key(file_name: &str) -> String {
+    let stem = std::path::Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    let normalized = stem
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>();
+    let technical = [
+        "2160p",
+        "1080p",
+        "720p",
+        "480p",
+        "4k",
+        "uhd",
+        "hdr",
+        "hdr10",
+        "hdr10plus",
+        "dv",
+        "dolbyvision",
+        "bluray",
+        "brrip",
+        "bdrip",
+        "webdl",
+        "webrip",
+        "remux",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "hevc",
+        "av1",
+        "aac",
+        "dts",
+        "atmos",
+    ];
+
+    let mut kept = Vec::new();
+    for token in normalized.split_whitespace() {
+        if technical.contains(&token) {
+            break;
+        }
+        kept.push(token);
+    }
+    if kept.is_empty() {
+        normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        kept.join(" ")
+    }
+}
+
+fn upload_media_kind(file_name: &str) -> &'static str {
+    let extension = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" => "video",
+        "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" => "audio",
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "heic" => "image",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" => "document",
+        "zip" | "7z" | "rar" | "tar" | "gz" => "archive",
+        _ => "other",
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_preflight_upload_candidate(
+    path: String,
+    folder_id: i64,
+    db_pool: State<'_, DbConnection>,
+) -> Result<UploadPreflightResult, String> {
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let (source_sha256, source_identity, size) =
+        crate::commands::transfers::hash_file_with_identity(&path).await?;
+
+    let logical_channel_id = {
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        crate::commands::logical_channels::logical_channel_id_for_backing(&conn, folder_id)?
+            .ok_or_else(|| {
+                "TeraRelay logical channel metadata is missing. Sync channels and retry."
+                    .to_string()
+            })?
+    };
+
+    let source_key = upload_similarity_key(&file_name);
+    let source_kind = upload_media_kind(&file_name);
+    let mut exact_duplicate = None;
+    let mut similar_files = Vec::new();
+
+    {
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_id, first_message_id, display_name, total_size, whole_sha256
+                 FROM logical_files
+                 WHERE logical_channel_id = ? AND status = 'complete'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        stmt.bind((1, logical_channel_id.as_str()))
+            .map_err(|e: sqlite::Error| e.to_string())?;
+
+        while let sqlite::State::Row = stmt.next().map_err(|e: sqlite::Error| e.to_string())? {
+            let logical_file_id = stmt
+                .read::<String, _>("file_id")
+                .map_err(|e| e.to_string())?;
+            let message_id = stmt
+                .read::<i64, _>("first_message_id")
+                .map_err(|e| e.to_string())?;
+            let name = stmt
+                .read::<String, _>("display_name")
+                .map_err(|e| e.to_string())?;
+            let existing_size = stmt
+                .read::<i64, _>("total_size")
+                .map_err(|e| e.to_string())? as u64;
+            let whole_sha256 = stmt
+                .read::<Option<String>, _>("whole_sha256")
+                .ok()
+                .flatten();
+
+            let candidate = UploadCandidateFile {
+                logical_file_id,
+                message_id,
+                name: name.clone(),
+                size: existing_size,
+            };
+
+            if existing_size == size && whole_sha256.as_deref() == Some(source_sha256.as_str()) {
+                if exact_duplicate.is_none() {
+                    exact_duplicate = Some(candidate);
+                }
+                continue;
+            }
+
+            // A version suggestion is deliberately weaker than duplicate
+            // detection, but still requires both files to have verified,
+            // different whole-file hashes. Filename similarity alone is never
+            // enough to classify content as a duplicate.
+            if whole_sha256.is_some()
+                && whole_sha256.as_deref() != Some(source_sha256.as_str())
+                && upload_media_kind(&name) == source_kind
+                && upload_similarity_key(&name) == source_key
+                && !source_key.is_empty()
+                && similar_files.len() < 8
+            {
+                similar_files.push(candidate);
+            }
+        }
+    }
+
+    Ok(UploadPreflightResult {
+        file_name,
+        size,
+        source_sha256,
+        source_identity,
+        exact_duplicate,
+        similar_files,
+    })
+}
+
 /// Report real acknowledged throughput over a short sliding window.
 /// No exponential smoothing or guessed carry-forward: the displayed MB/s is
 /// computed only from bytes Telegram has actually acknowledged.
@@ -1802,13 +1993,17 @@ pub async fn cmd_upload_file(
     mut path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
+    transfer_engine: Option<String>,
+    source_sha256: Option<String>,
+    source_identity: Option<String>,
+    upload_name: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
     db_pool: State<'_, DbConnection>,
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
-) -> Result<String, String> {
+) -> Result<UploadFileResult, String> {
     let mut temp_cache_path: Option<String> = None;
 
     #[cfg(target_os = "ios")]
@@ -1846,6 +2041,10 @@ pub async fn cmd_upload_file(
         path.clone(),
         folder_id,
         transfer_id,
+        transfer_engine,
+        source_sha256,
+        source_identity,
+        upload_name,
         app_handle,
         state,
         tdlib_state,
@@ -1867,13 +2066,30 @@ async fn cmd_upload_file_inner(
     path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
+    transfer_engine: Option<String>,
+    source_sha256: Option<String>,
+    source_identity: Option<String>,
+    upload_name: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
     db_pool: State<'_, DbConnection>,
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
-) -> Result<String, String> {
+) -> Result<UploadFileResult, String> {
+    let explicit_transfer_engine = transfer_engine.is_some();
+    let transfer_engine =
+        crate::commands::transfer_engine::TransferEngine::parse(transfer_engine.as_deref())?;
+    let tdlib_platform_supported = crate::commands::transfer_engine::tdlib_platform_supported();
+    if explicit_transfer_engine && transfer_engine.uses_tdlib() && !tdlib_platform_supported {
+        return Err(
+            "TDLib / C++ is not available on this platform. Choose TeraRelay Boost.".to_string(),
+        );
+    }
+    // Missing engine keeps legacy behavior: TDLib on supported Linux builds,
+    // the existing Grammers/MTProto path everywhere else.
+    let use_tdlib = transfer_engine.uses_tdlib() && tdlib_platform_supported;
+
     let logical_channel_id = if let Some(backing_channel_id) = folder_id {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, folder_id)?;
@@ -1894,6 +2110,25 @@ async fn cmd_upload_file_inner(
         .as_ref()
         .map(|_| crate::commands::logical_files::new_file_id());
 
+    let whole_sha256 = if logical_channel_id.is_some() {
+        match (source_sha256, source_identity) {
+            (Some(hash), Some(identity))
+                if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                crate::commands::transfers::verify_serialized_source_identity(&path, &identity)
+                    .await?;
+                Some(hash.to_ascii_lowercase())
+            }
+            _ => {
+                let (hash, _, _) =
+                    crate::commands::transfers::hash_file_with_identity(&path).await?;
+                Some(hash)
+            }
+        }
+    } else {
+        None
+    };
+
     let size = tokio::fs::metadata(&path)
         .await
         .map_err(|e| e.to_string())?
@@ -1906,8 +2141,31 @@ async fn cmd_upload_file_inner(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
+        if crate::commands::qa_feature_a::enabled() {
+            if let (Some(backing_channel_id), Some(file_id)) =
+                (folder_id, logical_file_id.as_deref())
+            {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                crate::commands::qa_feature_a::record_upload(
+                    &conn,
+                    backing_channel_id,
+                    file_id,
+                    &path,
+                    size,
+                    whole_sha256.as_deref(),
+                )?;
+                bw_state.release_up(size);
+                return Ok(UploadFileResult {
+                    message: "QA upload successful".to_string(),
+                    logical_file_id: Some(file_id.to_string()),
+                });
+            }
+        }
         bw_state.release_up(size);
-        return Ok("Mock upload successful".to_string());
+        return Ok(UploadFileResult {
+            message: "Mock upload successful".to_string(),
+            logical_file_id: None,
+        });
     }
     let client = client_opt.ok_or_else(|| {
         bw_state.release_up(size);
@@ -1928,10 +2186,27 @@ async fn cmd_upload_file_inner(
         );
     }
 
-    let file_name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+    let file_name = match upload_name {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty()
+                || trimmed == "."
+                || trimmed == ".."
+                || trimmed.contains('/')
+                || trimmed.contains('\\')
+                || trimmed.contains('\0')
+                || trimmed.len() > 255
+            {
+                bw_state.release_up(size);
+                return Err("Upload display name is invalid".to_string());
+            }
+            trimmed.to_string()
+        }
+        None => std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string()),
+    };
 
     let peer = match resolve_peer(&client, folder_id, &state.peer_cache).await {
         Ok(p) => p,
@@ -2037,7 +2312,7 @@ async fn cmd_upload_file_inner(
     // this advances from getNetworkStatistics; fallback transports continue to
     // derive speed from their authoritative file-byte counter.
     let network_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let use_tdlib_network_speed = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+    let use_tdlib_network_speed = use_tdlib;
 
     let cancelled = state.cancelled_transfers.clone();
     let progress_tid = tid.clone();
@@ -2126,14 +2401,9 @@ async fn cmd_upload_file_inner(
         return Err("Transfer cancelled".to_string());
     }
 
-    let tdlib_required = cfg!(all(target_os = "linux", target_arch = "x86_64"));
-
-    // On supported desktop Linux builds, local uploads use the native
-    // TDLib/C++ data plane. We deliberately do not
-    // silently fall back to the slower MTProto uploader here: if the one-time
-    // TDLib authorization has not been completed yet, the frontend opens the
-    // setup flow and retries this exact queued upload afterwards.
-    if tdlib_required && !crate::tdlib_fast::tdlib_is_ready(tdlib_state.inner()) {
+    // TDLib remains an explicit, isolated choice. TeraRelay Boost never enters
+    // this readiness/authorization path.
+    if use_tdlib && !crate::tdlib_fast::tdlib_is_ready(tdlib_state.inner()) {
         if let Some(task) = progress_task.as_ref() {
             task.abort();
         }
@@ -2144,8 +2414,8 @@ async fn cmd_upload_file_inner(
         return Err("TDLIB_SETUP_REQUIRED".to_string());
     }
 
-    let upload_result: Result<(), String> = if tdlib_required {
-        log::info!("Upload transport: TDLib/C++ native");
+    let upload_result: Result<(), String> = if use_tdlib {
+        log::info!("Upload transport: {}", transfer_engine.label());
 
         let destination = match folder_id {
             Some(id) => crate::tdlib_fast::FastDestination::Channel(id),
@@ -2342,9 +2612,9 @@ async fn cmd_upload_file_inner(
         }
         .await
     } else {
-        // Preserve the existing MTProto implementation for platforms where the
-        // isolated TDLib worker is not supported yet. Linux desktop never uses
-        // this path once TDLib support is available.
+        // TeraRelay Boost deliberately reuses the existing authorized Grammers
+        // session and adaptive multi-lane MTProto uploader. Legacy platforms
+        // without TDLib support also continue to use this same proven path.
         let lane_pool = match build_upload_lane_pool(&client, &state, &net_config).await {
             Ok(pool) => pool,
             Err(error) => {
@@ -2364,7 +2634,7 @@ async fn cmd_upload_file_inner(
             }
         };
         log::info!(
-            "Upload fallback transport: mode={}, active_lanes={}, available_lanes={}, worker_window={}",
+            "Upload transport: TeraRelay Boost, mode={}, active_lanes={}, available_lanes={}, worker_window={}",
             lane_pool.mode,
             lane_pool
                 .initial_active_lanes
@@ -2448,11 +2718,7 @@ async fn cmd_upload_file_inner(
             "Upload failed: path={}, folder_id={:?}, transport={}, error={}",
             path,
             folder_id,
-            if tdlib_required {
-                "TDLib/C++"
-            } else {
-                "MTProto"
-            },
+            transfer_engine.label(),
             err
         );
         if err == "Transfer cancelled" {
@@ -2495,7 +2761,7 @@ async fn cmd_upload_file_inner(
                 .first()
                 .map(|mime| mime.essence_str().to_string()),
             created_at: chrono::Utc::now().timestamp(),
-            whole_sha256: None,
+            whole_sha256: whole_sha256.clone(),
             chunks,
         };
 
@@ -2553,7 +2819,10 @@ async fn cmd_upload_file_inner(
             },
         );
     }
-    Ok("File uploaded successfully".to_string())
+    Ok(UploadFileResult {
+        message: "File uploaded successfully".to_string(),
+        logical_file_id,
+    })
 }
 
 fn message_id_from_update(update: &tl::enums::Update, random_id: i64) -> Option<i32> {
@@ -3025,18 +3294,23 @@ pub async fn initiate_upload(
     path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
+    transfer_engine: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
     db_pool: State<'_, DbConnection>,
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
-) -> Result<String, String> {
+) -> Result<UploadFileResult, String> {
     crate::upload_service::start_foreground_service();
     cmd_upload_file(
         path,
         folder_id,
         transfer_id,
+        transfer_engine,
+        None,
+        None,
+        None,
         app_handle,
         state,
         tdlib_state,
@@ -3082,6 +3356,17 @@ pub async fn cmd_rename_file(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         log::info!("[MOCK] Renamed message {} to {}", message_id, new_name);
+        if crate::commands::qa_feature_a::enabled() {
+            if let Some(backing_channel_id) = folder_id {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                crate::commands::qa_feature_a::rename_file(
+                    &conn,
+                    backing_channel_id,
+                    message_id,
+                    &new_name,
+                )?;
+            }
+        }
         return Ok(true);
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
@@ -3208,6 +3493,22 @@ pub async fn cmd_delete_file(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    if crate::commands::qa_feature_a::enabled() {
+        if let Some(backing_channel_id) = folder_id {
+            let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+            crate::commands::qa_feature_a::delete_file(&conn, backing_channel_id, message_id)?;
+            return Ok(true);
+        }
+    }
+    delete_file_inner(message_id, folder_id, state.inner(), db_pool.inner()).await
+}
+
+pub(crate) async fn delete_file_inner(
+    message_id: i32,
+    folder_id: Option<i64>,
+    state: &TelegramState,
+    db_pool: &DbConnection,
+) -> Result<bool, String> {
     let logical_manifest = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, folder_id)?;
@@ -3238,6 +3539,12 @@ pub async fn cmd_delete_file(
             message_id,
             folder_id
         );
+        if crate::commands::qa_feature_a::enabled() {
+            if let Some(backing_channel_id) = folder_id {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                crate::commands::qa_feature_a::delete_file(&conn, backing_channel_id, message_id)?;
+            }
+        }
         return Ok(true);
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
@@ -3521,12 +3828,818 @@ async fn download_parts_parallel(
     Ok(counter.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+const BOOST_DOWNLOAD_CHUNK_SIZE: i32 = 512 * 1024;
+const BOOST_DOWNLOAD_WORKERS: usize = 4;
+// Keep raw upload.getFile responses below the pinned Grammers MTProto inner-message
+// ceiling after rpc_result/upload.file framing. With precise=false Telegram also
+// requires the 1 MiB download window to be evenly divisible by limit, so 512 KiB
+// is the largest valid value below this Grammers decoder ceiling.
+const BOOST_RAW_DOWNLOAD_CHUNK_SIZE: i32 = 512 * 1024;
+const BOOST_DOWNLOAD_INITIAL_LANES: usize = 4;
+const BOOST_DOWNLOAD_MAX_LANES: usize = 8;
+const BOOST_DOWNLOAD_ADAPT_CHUNKS: u64 = 32;
+
+fn boost_download_workers() -> usize {
+    std::env::var("TERARELAY_BOOST_DOWNLOAD_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=8).contains(value))
+        .unwrap_or(BOOST_DOWNLOAD_WORKERS)
+}
+
+fn boost_download_connection_limit() -> usize {
+    std::env::var("TERARELAY_BOOST_DOWNLOAD_CONNECTIONS")
+        .or_else(|_| std::env::var("TERARELAY_BOOST_DOWNLOAD_LANES"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=BOOST_DOWNLOAD_MAX_LANES).contains(value))
+        .unwrap_or(BOOST_DOWNLOAD_MAX_LANES)
+}
+
+type SharedDownloadSender = SharedUploadSender;
+
+struct DownloadLanePool {
+    lanes: Vec<SharedDownloadSender>,
+    dc_id: i32,
+    endpoint: std::net::SocketAddr,
+}
+
+fn boost_document_location(media: &Media) -> Result<(i32, tl::enums::InputFileLocation), String> {
+    let Media::Document(document) = media else {
+        return Err("TeraRelay Boost raw lanes require a Telegram document".to_string());
+    };
+    let Some(tl::enums::Document::Document(raw)) = document.raw.document.as_ref() else {
+        return Err("Telegram document metadata is unavailable".to_string());
+    };
+    Ok((
+        raw.dc_id,
+        tl::types::InputDocumentFileLocation {
+            id: raw.id,
+            access_hash: raw.access_hash,
+            file_reference: raw.file_reference.clone(),
+            thumb_size: String::new(),
+        }
+        .into(),
+    ))
+}
+
+async fn ensure_transfer_dc_authorized(
+    main_client: &grammers_client::Client,
+    state: &TelegramState,
+    dc_id: i32,
+) -> Result<(), String> {
+    let source = state
+        .session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Telegram session is not available".to_string())?;
+    if source
+        .dc_option(dc_id)
+        .and_then(|option| option.auth_key)
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if dc_id == source.home_dc_id() {
+        return Err(format!("Telegram home DC {dc_id} has no authorization key"));
+    }
+
+    // This is Telegram's normal cross-DC authorization copy. It uses the
+    // already logged-in account and never starts a phone/code/QR/2FA flow.
+    let exported = main_client
+        .invoke(&tl::functions::auth::ExportAuthorization { dc_id })
+        .await
+        .map_err(map_error)?;
+    let tl::enums::auth::ExportedAuthorization::Authorization(exported) = exported;
+    main_client
+        .invoke_in_dc(
+            dc_id,
+            &tl::functions::auth::ImportAuthorization {
+                id: exported.id,
+                bytes: exported.bytes,
+            },
+        )
+        .await
+        .map_err(map_error)?;
+
+    let refreshed = state
+        .session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Telegram session disappeared while authorizing media DC".to_string())?;
+    if refreshed
+        .dc_option(dc_id)
+        .and_then(|option| option.auth_key)
+        .is_none()
+    {
+        return Err(format!(
+            "Telegram media DC {dc_id} was authorized but its transfer key was not persisted"
+        ));
+    }
+    Ok(())
+}
+
+async fn build_download_lane_pool(
+    main_client: &grammers_client::Client,
+    state: &TelegramState,
+    media: &Media,
+    net_config: &NetworkConfig,
+) -> Result<(DownloadLanePool, tl::enums::InputFileLocation), String> {
+    let (dc_id, location) = boost_document_location(media)?;
+    ensure_transfer_dc_authorized(main_client, state, dc_id).await?;
+
+    let source = state
+        .session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Telegram session is not available".to_string())?;
+    let api_id = state
+        .api_id
+        .lock()
+        .await
+        .ok_or_else(|| "Telegram API ID is not available".to_string())?;
+    let dc = source
+        .dc_option(dc_id)
+        .ok_or_else(|| format!("Telegram media DC {dc_id} is unavailable in the session"))?;
+    let auth_key = dc
+        .auth_key
+        .ok_or_else(|| format!("Telegram media DC {dc_id} has no authorization key"))?;
+
+    let config = main_client
+        .invoke(&tl::functions::help::GetConfig {})
+        .await
+        .map_err(map_error)?;
+    let tl::enums::Config::Config(config) = config;
+
+    let endpoint = config
+        .dc_options
+        .iter()
+        .find_map(|entry| {
+            let tl::enums::DcOption::Option(option) = entry;
+            if option.id != dc_id || !option.media_only || option.cdn || option.ipv6 {
+                return None;
+            }
+            let ip = option.ip_address.parse::<std::net::Ipv4Addr>().ok()?;
+            let port = u16::try_from(option.port).ok()?;
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                ip, port,
+            )))
+        })
+        .or_else(|| {
+            config.dc_options.iter().find_map(|entry| {
+                let tl::enums::DcOption::Option(option) = entry;
+                if option.id != dc_id || option.cdn || option.ipv6 {
+                    return None;
+                }
+                let ip = option.ip_address.parse::<std::net::Ipv4Addr>().ok()?;
+                let port = u16::try_from(option.port).ok()?;
+                Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    ip, port,
+                )))
+            })
+        })
+        .unwrap_or(std::net::SocketAddr::V4(dc.ipv4));
+
+    let desired = boost_download_connection_limit();
+    let params = ConnectionParams::default();
+    let mut lanes = Vec::with_capacity(desired);
+
+    for lane_index in 0..desired {
+        let server = if let Some(proxy) = net_config.effective_proxy_url() {
+            ServerAddr::Proxied {
+                address: endpoint,
+                proxy,
+            }
+        } else {
+            ServerAddr::Tcp { address: endpoint }
+        };
+
+        let connect_result = async {
+            let mut sender = connect_with_auth(transport::Full::new(), server, auth_key)
+                .await
+                .map_err(map_error)?;
+            let init = tl::functions::InvokeWithLayer {
+                layer: tl::LAYER,
+                query: tl::functions::InitConnection {
+                    api_id,
+                    device_model: params.device_model.clone(),
+                    system_version: params.system_version.clone(),
+                    app_version: params.app_version.clone(),
+                    system_lang_code: params.system_lang_code.clone(),
+                    lang_pack: "".into(),
+                    lang_code: params.lang_code.clone(),
+                    proxy: None,
+                    params: None,
+                    query: tl::functions::help::GetConfig {},
+                },
+            };
+            sender.invoke(&init).await.map_err(map_error)?;
+            Ok::<RawUploadSender, String>(sender)
+        }
+        .await;
+
+        match connect_result {
+            Ok(sender) => {
+                lanes.push(Arc::new(tokio::sync::Mutex::new(sender)));
+            }
+            Err(error) if !lanes.is_empty() => {
+                log::warn!(
+                    "TeraRelay Boost download lane {} could not connect; keeping {} working lane(s): {}",
+                    lane_index + 1,
+                    lanes.len(),
+                    error
+                );
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if lanes.is_empty() {
+        return Err("No TeraRelay Boost download lanes could be established".to_string());
+    }
+
+    log::info!(
+        "TeraRelay Boost download pool ready: dc={}, lanes={}, endpoint={}",
+        dc_id,
+        lanes.len(),
+        endpoint
+    );
+
+    Ok((
+        DownloadLanePool {
+            lanes,
+            dc_id,
+            endpoint,
+        },
+        location,
+    ))
+}
+
+fn adapt_download_lanes(
+    active_lanes: usize,
+    max_lanes: usize,
+    previous_speed: Option<f64>,
+    current_speed: f64,
+) -> usize {
+    if current_speed <= 0.0 {
+        return active_lanes;
+    }
+    let mut next = active_lanes.clamp(1, max_lanes.max(1));
+    match previous_speed {
+        None => next = (next + 1).min(max_lanes.max(1)),
+        Some(previous) if current_speed >= previous * 0.97 => {
+            next = (next + 1).min(max_lanes.max(1))
+        }
+        Some(previous) if current_speed < previous * 0.85 => next = next.saturating_sub(1).max(1),
+        _ => {}
+    }
+    next
+}
+
+async fn download_boost_chunk_raw(
+    sender: SharedDownloadSender,
+    location: tl::enums::InputFileLocation,
+    offset: u64,
+    expected_len: usize,
+    net_config: &NetworkConfig,
+) -> Result<Vec<u8>, String> {
+    let mut retries_left = net_config.retry_attempts();
+
+    loop {
+        let request = tl::functions::upload::GetFile {
+            precise: false,
+            cdn_supported: false,
+            location: location.clone(),
+            offset: i64::try_from(offset)
+                .map_err(|_| "Boost download offset is out of range".to_string())?,
+            limit: BOOST_RAW_DOWNLOAD_CHUNK_SIZE,
+        };
+
+        let result = {
+            let mut locked = sender.lock().await;
+            locked.invoke(&request).await
+        };
+
+        match result {
+            Ok(tl::enums::upload::File::File(file)) => {
+                if file.bytes.len() != expected_len {
+                    return Err(format!(
+                        "Incomplete TeraRelay Boost raw chunk at {}: expected {} bytes, received {}",
+                        offset,
+                        expected_len,
+                        file.bytes.len()
+                    ));
+                }
+                return Ok(file.bytes);
+            }
+            Ok(tl::enums::upload::File::CdnRedirect(_)) => {
+                return Err("Telegram unexpectedly redirected a non-CDN Boost request".to_string());
+            }
+            Err(error) => {
+                let mapped = map_error(error);
+                if net_config.should_respect_flood_wait()
+                    && (mapped.starts_with("FLOOD_WAIT_")
+                        || mapped.starts_with("FLOOD_PREMIUM_WAIT_"))
+                {
+                    let seconds = mapped
+                        .rsplit('_')
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if seconds > 0 && retries_left > 0 {
+                        retries_left -= 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds.min(300))).await;
+                        continue;
+                    }
+                }
+                if retries_left == 0 {
+                    return Err(mapped);
+                }
+                retries_left -= 1;
+                let attempt = net_config.retry_attempts().saturating_sub(retries_left);
+                let delay = backoff_ms(
+                    attempt,
+                    net_config.retry_base_backoff_ms(),
+                    net_config.retry_max_backoff_ms(),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
+    }
+}
+
+/// Existing high-level Grammers parallel downloader retained as a reliability
+/// fallback when dedicated Boost lanes cannot be established.
+async fn download_single_document_boost_shared_client(
+    client: &grammers_client::Client,
+    media: &Media,
+    save_path: &str,
+    expected_len: u64,
+    expected_hash: Option<&str>,
+    cancelled: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    net_config: &NetworkConfig,
+    app_handle: &tauri::AppHandle,
+    tid: &str,
+) -> Result<u64, String> {
+    if expected_len == 0 {
+        return Err("TeraRelay Boost requires a known document size".to_string());
+    }
+
+    let file = tokio::fs::File::create(save_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.set_len(expected_len)
+        .await
+        .map_err(|e| e.to_string())?;
+    drop(file);
+
+    let chunk_size = BOOST_DOWNLOAD_CHUNK_SIZE as u64;
+    let chunk_count = expected_len.div_ceil(chunk_size);
+    let workers = boost_download_workers()
+        .min(chunk_count.max(1) as usize)
+        .max(1);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let started = std::time::Instant::now();
+
+    log::info!(
+        "Download transport: TeraRelay Boost, single-document parallel, workers={}, chunks={}, bytes={}",
+        workers,
+        chunk_count,
+        expected_len
+    );
+
+    let emitter = if !tid.is_empty() {
+        let emit_counter = counter.clone();
+        let emit_tid = tid.to_string();
+        let emit_handle = app_handle.clone();
+        Some(tokio::spawn(async move {
+            let mut last_bytes = 0u64;
+            let mut last_time = std::time::Instant::now();
+            let mut speed_smoother = SpeedWindow::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_time).as_secs_f64();
+                let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
+                let percent = ((current as f64 / expected_len as f64) * 100.0).min(99.0) as u8;
+                let _ = emit_handle.emit(
+                    "download-progress",
+                    ProgressPayload {
+                        id: emit_tid.clone(),
+                        percent,
+                        uploaded_bytes: current,
+                        total_bytes: expected_len,
+                        speed_bytes_per_sec: speed,
+                    },
+                );
+                last_bytes = current;
+                last_time = now;
+                if current >= expected_len {
+                    break;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    use futures::TryStreamExt;
+    let result: Result<(), String> = futures::stream::iter((0..chunk_count).map(Ok::<u64, String>))
+        .try_for_each_concurrent(workers, |chunk_index| {
+            let counter = counter.clone();
+            async move {
+                if cancelled.read().await.contains(tid) {
+                    return Err("Transfer cancelled".to_string());
+                }
+
+                let offset = chunk_index * chunk_size;
+                let expected_chunk_len = (expected_len - offset).min(chunk_size) as usize;
+                let skip = i32::try_from(chunk_index)
+                    .map_err(|_| "Boost download chunk index overflow".to_string())?;
+                let mut retries_left = net_config.retry_attempts();
+
+                let bytes = loop {
+                    if cancelled.read().await.contains(tid) {
+                        return Err("Transfer cancelled".to_string());
+                    }
+
+                    let mut download = client
+                        .iter_download(media)
+                        .chunk_size(BOOST_DOWNLOAD_CHUNK_SIZE)
+                        .skip_chunks(skip);
+
+                    match download.next().await {
+                        Ok(Some(bytes)) => break bytes,
+                        Ok(None) => {
+                            return Err(format!(
+                                "TeraRelay Boost returned no data for chunk {}",
+                                chunk_index + 1
+                            ));
+                        }
+                        Err(error) => {
+                            let mapped = map_error(error);
+                            if retries_left == 0 {
+                                return Err(format!(
+                                    "TeraRelay Boost chunk {} failed: {}",
+                                    chunk_index + 1,
+                                    mapped
+                                ));
+                            }
+                            retries_left -= 1;
+                            let delay = backoff_ms(
+                                net_config.retry_attempts().saturating_sub(retries_left),
+                                net_config.retry_base_backoff_ms(),
+                                net_config.retry_max_backoff_ms(),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                    }
+                };
+
+                if bytes.len() != expected_chunk_len {
+                    return Err(format!(
+                        "Incomplete TeraRelay Boost chunk {}: expected {} bytes, received {}",
+                        chunk_index + 1,
+                        expected_chunk_len,
+                        bytes.len()
+                    ));
+                }
+
+                let mut output = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(save_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::io::AsyncSeekExt::seek(&mut output, std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::io::AsyncWriteExt::write_all(&mut output, &bytes)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let total_so_far = counter
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    + bytes.len() as u64;
+                let dl_limit = net_config.download_limit_bytes_per_sec();
+                if dl_limit > 0 {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    let rate = total_so_far as f64 / elapsed;
+                    if rate > dl_limit as f64 {
+                        let ideal_elapsed = total_so_far as f64 / dl_limit as f64;
+                        let sleep_ms = ((ideal_elapsed - elapsed) * 1000.0) as u64;
+                        if sleep_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                sleep_ms.min(5000),
+                            ))
+                            .await;
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+        })
+        .await;
+
+    if let Some(task) = emitter {
+        task.abort();
+    }
+    result?;
+
+    let downloaded = counter.load(std::sync::atomic::Ordering::Relaxed);
+    if downloaded != expected_len {
+        return Err(format!(
+            "TeraRelay Boost reconstructed {} bytes but expected {} bytes",
+            downloaded, expected_len
+        ));
+    }
+
+    if let Some(expected) = expected_hash {
+        let actual =
+            crate::commands::transfers::hash_file_range(save_path, 0, expected_len).await?;
+        if actual != expected {
+            return Err(
+                "TeraRelay Boost checksum verification failed for the downloaded document"
+                    .to_string(),
+            );
+        }
+    }
+
+    let output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(save_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    output.sync_all().await.map_err(|e| e.to_string())?;
+
+    Ok(downloaded)
+}
+
+/// TeraRelay Boost V2: dedicated file-transfer sessions on the document's
+/// Telegram media DC. The already-authorized account session is reused; no
+/// interactive login or TDLib state is involved.
+async fn download_single_document_boost(
+    client: &grammers_client::Client,
+    state: &TelegramState,
+    media: &Media,
+    save_path: &str,
+    expected_len: u64,
+    expected_hash: Option<&str>,
+    cancelled: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    net_config: &NetworkConfig,
+    app_handle: &tauri::AppHandle,
+    tid: &str,
+) -> Result<u64, String> {
+    if expected_len == 0 {
+        return Err("TeraRelay Boost requires a known document size".to_string());
+    }
+
+    let (pool, location) = match build_download_lane_pool(client, state, media, net_config).await {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "Dedicated TeraRelay Boost download lanes unavailable; falling back to the shared Grammers client: {}",
+                error
+            );
+            return download_single_document_boost_shared_client(
+                client,
+                media,
+                save_path,
+                expected_len,
+                expected_hash,
+                cancelled,
+                net_config,
+                app_handle,
+                tid,
+            )
+            .await;
+        }
+    };
+
+    let file = tokio::fs::File::create(save_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.set_len(expected_len)
+        .await
+        .map_err(|e| e.to_string())?;
+    drop(file);
+
+    let chunk_size = BOOST_RAW_DOWNLOAD_CHUNK_SIZE as u64;
+    let chunk_count = expected_len.div_ceil(chunk_size);
+    let max_lanes = pool.lanes.len().max(1);
+    let mut active_lanes = BOOST_DOWNLOAD_INITIAL_LANES
+        .min(max_lanes)
+        .min(chunk_count.max(1) as usize)
+        .max(1);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let started = std::time::Instant::now();
+    let mut previous_stage_speed: Option<f64> = None;
+    let mut next_chunk = 0u64;
+
+    log::info!(
+        "Download transport: TeraRelay Boost V2, dc={}, endpoint={}, lanes={}/{}, chunk={} KiB, bytes={}",
+        pool.dc_id,
+        pool.endpoint,
+        active_lanes,
+        max_lanes,
+        BOOST_RAW_DOWNLOAD_CHUNK_SIZE / 1024,
+        expected_len
+    );
+
+    let emitter = if !tid.is_empty() {
+        let emit_counter = counter.clone();
+        let emit_tid = tid.to_string();
+        let emit_handle = app_handle.clone();
+        Some(tokio::spawn(async move {
+            let mut last_bytes = 0u64;
+            let mut last_time = std::time::Instant::now();
+            let mut speed_smoother = SpeedWindow::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_time).as_secs_f64();
+                let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
+                let percent = ((current as f64 / expected_len as f64) * 100.0).min(99.0) as u8;
+                let _ = emit_handle.emit(
+                    "download-progress",
+                    ProgressPayload {
+                        id: emit_tid.clone(),
+                        percent,
+                        uploaded_bytes: current,
+                        total_bytes: expected_len,
+                        speed_bytes_per_sec: speed,
+                    },
+                );
+                last_bytes = current;
+                last_time = now;
+                if current >= expected_len {
+                    break;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    use futures::TryStreamExt;
+    let result: Result<(), String> = async {
+        while next_chunk < chunk_count {
+            if cancelled.read().await.contains(tid) {
+                return Err("Transfer cancelled".to_string());
+            }
+
+            let stage_end = (next_chunk + BOOST_DOWNLOAD_ADAPT_CHUNKS).min(chunk_count);
+            let stage_started = std::time::Instant::now();
+            let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+            let lanes_for_stage = active_lanes;
+
+            futures::stream::iter((next_chunk..stage_end).map(Ok::<u64, String>))
+                .try_for_each_concurrent(lanes_for_stage, |chunk_index| {
+                    let sender =
+                        pool.lanes[(chunk_index as usize) % lanes_for_stage].clone();
+                    let location = location.clone();
+                    let counter = counter.clone();
+                    async move {
+                        if cancelled.read().await.contains(tid) {
+                            return Err("Transfer cancelled".to_string());
+                        }
+
+                        let offset = chunk_index * chunk_size;
+                        let expected_chunk_len =
+                            (expected_len - offset).min(chunk_size) as usize;
+                        let bytes = download_boost_chunk_raw(
+                            sender,
+                            location,
+                            offset,
+                            expected_chunk_len,
+                            net_config,
+                        )
+                        .await?;
+
+                        let mut output = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(save_path)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        tokio::io::AsyncSeekExt::seek(
+                            &mut output,
+                            std::io::SeekFrom::Start(offset),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        tokio::io::AsyncWriteExt::write_all(&mut output, &bytes)
+                            .await
+                            .map_err(|e| e.to_string())?;
+
+                        let total_so_far = counter
+                            .fetch_add(
+                                bytes.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            + bytes.len() as u64;
+
+                        let dl_limit = net_config.download_limit_bytes_per_sec();
+                        if dl_limit > 0 {
+                            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                            let rate = total_so_far as f64 / elapsed;
+                            if rate > dl_limit as f64 {
+                                let ideal_elapsed = total_so_far as f64 / dl_limit as f64;
+                                let sleep_ms = ((ideal_elapsed - elapsed) * 1000.0) as u64;
+                                if sleep_ms > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        sleep_ms.min(5000),
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    }
+                })
+                .await?;
+
+            let after = counter.load(std::sync::atomic::Ordering::Relaxed);
+            let stage_bytes = after.saturating_sub(before);
+            let stage_seconds = stage_started.elapsed().as_secs_f64().max(0.001);
+            let stage_speed = stage_bytes as f64 / stage_seconds;
+            let old_lanes = active_lanes;
+            active_lanes = adapt_download_lanes(
+                old_lanes,
+                max_lanes.min(chunk_count as usize).max(1),
+                previous_stage_speed,
+                stage_speed,
+            );
+            log::info!(
+                "TeraRelay Boost download tuning: stage={:.2} MiB/s, lanes={}->{}, downloaded={}/{} MiB",
+                stage_speed / (1024.0 * 1024.0),
+                old_lanes,
+                active_lanes,
+                after / (1024 * 1024),
+                expected_len.div_ceil(1024 * 1024)
+            );
+            previous_stage_speed = Some(stage_speed);
+            next_chunk = stage_end;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Some(task) = emitter {
+        task.abort();
+    }
+    result?;
+
+    let downloaded = counter.load(std::sync::atomic::Ordering::Relaxed);
+    if downloaded != expected_len {
+        return Err(format!(
+            "TeraRelay Boost reconstructed {} bytes but expected {} bytes",
+            downloaded, expected_len
+        ));
+    }
+
+    if let Some(expected) = expected_hash {
+        let actual =
+            crate::commands::transfers::hash_file_range(save_path, 0, expected_len).await?;
+        if actual != expected {
+            return Err(
+                "TeraRelay Boost checksum verification failed for the downloaded document"
+                    .to_string(),
+            );
+        }
+    }
+
+    let output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(save_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    output.sync_all().await.map_err(|e| e.to_string())?;
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    log::info!(
+        "TeraRelay Boost V2 measured download: {:.2} MiB/s average over {:.2}s",
+        downloaded as f64 / elapsed / (1024.0 * 1024.0),
+        elapsed
+    );
+
+    Ok(downloaded)
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct DownloadFileRequest {
     message_id: i32,
     save_path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
+    transfer_engine: Option<String>,
 }
 
 #[tauri::command]
@@ -3539,6 +4652,17 @@ pub async fn cmd_download_file(
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
 ) -> Result<String, String> {
+    let explicit_transfer_engine = req.transfer_engine.is_some();
+    let transfer_engine =
+        crate::commands::transfer_engine::TransferEngine::parse(req.transfer_engine.as_deref())?;
+    let tdlib_platform_supported = crate::commands::transfer_engine::tdlib_platform_supported();
+    if explicit_transfer_engine && transfer_engine.uses_tdlib() && !tdlib_platform_supported {
+        return Err(
+            "TDLib / C++ is not available on this platform. Choose TeraRelay Boost.".to_string(),
+        );
+    }
+    let use_tdlib = transfer_engine.uses_tdlib() && tdlib_platform_supported;
+
     let tid = req.transfer_id.unwrap_or_default();
     let save_path = req.save_path;
     let folder_id = req.folder_id;
@@ -3748,10 +4872,16 @@ pub async fn cmd_download_file(
         );
     }
 
-    let tdlib_download = cfg!(all(target_os = "linux", target_arch = "x86_64"))
-        && parts.iter().all(|(media, expected, _)| {
-            matches!(media, Media::Document(_)) && expected.unwrap_or(0) > 0
-        });
+    let tdlib_capable = parts.iter().all(|(media, expected, _)| {
+        matches!(media, Media::Document(_)) && expected.unwrap_or(0) > 0
+    });
+    if explicit_transfer_engine && use_tdlib && !tdlib_capable {
+        bw_state.release_down(total_size);
+        return Err(
+            "TDLib / C++ cannot handle this media shape. Choose TeraRelay Boost.".to_string(),
+        );
+    }
+    let tdlib_download = use_tdlib && tdlib_capable;
     let mut tdlib_average_bytes_per_sec: Option<u64> = None;
     let mut tdlib_network_seconds: Option<f64> = None;
 
@@ -3884,7 +5014,48 @@ pub async fn cmd_download_file(
 
     let downloaded: u64 = if let Some(downloaded) = tdlib_downloaded {
         downloaded
+    } else if matches!(
+        transfer_engine,
+        crate::commands::transfer_engine::TransferEngine::Boost
+    ) && parts.len() == 1
+        && matches!(parts[0].0, Media::Document(_))
+        && parts[0].1.unwrap_or(0) > 0
+    {
+        let (media, expected, hash) = &parts[0];
+        match download_single_document_boost(
+            &client,
+            state.inner(),
+            media,
+            &staged_save_path,
+            expected.unwrap_or(0),
+            hash.as_deref(),
+            &state.cancelled_transfers,
+            &net_config,
+            &app_handle,
+            &tid,
+        )
+        .await
+        {
+            Ok(downloaded) => downloaded,
+            Err(error) => {
+                if error == "Transfer cancelled" {
+                    state.cancelled_transfers.write().await.remove(&tid);
+                }
+                bw_state.release_down(total_size);
+                return Err(error);
+            }
+        }
     } else if parts.len() > 1 {
+        if matches!(
+            transfer_engine,
+            crate::commands::transfer_engine::TransferEngine::Boost
+        ) {
+            log::info!(
+                "Download transport: TeraRelay Boost, logical multipart parallel, parts={}, bytes={}",
+                parts.len(),
+                total_size
+            );
+        }
         // Split file fallback: download parts concurrently into a preallocated file.
         match download_parts_parallel(
             &client,
@@ -4124,6 +5295,25 @@ pub async fn cmd_move_files(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    move_files_inner(
+        message_ids,
+        source_folder_id,
+        target_folder_id,
+        app_handle,
+        state.inner(),
+        db_pool.inner(),
+    )
+    .await
+}
+
+pub(crate) async fn move_files_inner(
+    message_ids: Vec<i32>,
+    source_folder_id: Option<i64>,
+    target_folder_id: Option<i64>,
+    app_handle: tauri::AppHandle,
+    state: &TelegramState,
+    db_pool: &DbConnection,
+) -> Result<bool, String> {
     let (source_logical_channel_id, target_logical_channel_id) = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, source_folder_id)?;
@@ -4162,6 +5352,17 @@ pub async fn cmd_move_files(
             source_folder_id,
             target_folder_id
         );
+        if crate::commands::qa_feature_a::enabled() {
+            if let (Some(source_id), Some(target_id)) = (source_folder_id, target_folder_id) {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                crate::commands::qa_feature_a::move_files(
+                    &conn,
+                    source_id,
+                    target_id,
+                    &message_ids,
+                )?;
+            }
+        }
         return Ok(true);
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
@@ -4397,6 +5598,12 @@ pub async fn cmd_get_files(
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
         log::info!("[MOCK] Returning mock files for folder {:?}", folder_id);
+        if crate::commands::qa_feature_a::enabled() {
+            if let Some(backing_channel_id) = folder_id {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                return crate::commands::qa_feature_a::list_files(&conn, backing_channel_id);
+            }
+        }
         return Ok(Vec::new()); // No mock files for now
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
@@ -4412,6 +5619,8 @@ pub async fn cmd_get_files(
         None
     };
     let mut active_remote_manifest_ids = std::collections::HashSet::new();
+    let mut active_stack_ids = std::collections::HashSet::new();
+    let mut stack_manifests = Vec::new();
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
@@ -4423,6 +5632,19 @@ pub async fn cmd_get_files(
     let mut msgs = client.iter_messages(&peer);
     while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
         if let Some(media) = msg.media() {
+            // TeraRelay Drive keeps its global virtual-directory index in a
+            // hidden Saved Messages control document. Hide it everywhere,
+            // including root listings where there is no logical channel ID.
+            if let Media::Document(document) = &media {
+                if crate::commands::drive_metadata::is_drive_manifest_document(
+                    document.name(),
+                    msg.text(),
+                ) || crate::drive_stream::is_drive_data_document(document.name(), msg.text())
+                {
+                    continue;
+                }
+            }
+
             // Manifest documents are storage metadata, never user files. A
             // receiver with an empty local DB downloads them here and rebuilds
             // the exact same logical index from Telegram.
@@ -4430,6 +5652,40 @@ pub async fn cmd_get_files(
                 (logical_channel_id.as_deref(), &media)
             {
                 let document_name = document.name().to_string();
+
+                // Version-stack metadata is a hidden control document, just like
+                // logical-file manifests. The newest valid copy for each stack is
+                // authoritative; stale copies are ignored and never shown as files.
+                if let Some(stack_id) =
+                    crate::commands::file_stacks::stack_manifest_id(&document_name, msg.text())
+                {
+                    if active_stack_ids.contains(&stack_id) {
+                        continue;
+                    }
+                    match crate::commands::file_stacks::download_stack_manifest(
+                        &client,
+                        &media,
+                        Some(&stack_id),
+                        Some(logical_channel_id),
+                    )
+                    .await
+                    {
+                        Ok(manifest) => {
+                            active_stack_ids.insert(stack_id);
+                            stack_manifests.push(manifest);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Ignoring invalid TeraRelay stack metadata {} in channel {:?}: {}",
+                                stack_id,
+                                folder_id,
+                                error
+                            );
+                        }
+                    }
+                    continue;
+                }
+
                 if let Some(file_id) =
                     crate::commands::logical_files::manifest_file_id(&document_name, msg.text())
                 {
@@ -4526,6 +5782,11 @@ pub async fn cmd_get_files(
                 created_at: msg.date().to_string(),
                 icon_type: "file".into(),
                 is_split: false,
+                logical_file_id: None,
+                stack_id: None,
+                stack_name: None,
+                stack_version_count: 0,
+                stack_label: None,
             });
         }
     }
@@ -4550,6 +5811,11 @@ pub async fn cmd_get_files(
             created_at: first.4.clone(),
             icon_type: "file".into(),
             is_split: true,
+            logical_file_id: None,
+            stack_id: None,
+            stack_name: None,
+            stack_version_count: 0,
+            stack_label: None,
         });
     }
 
@@ -4577,12 +5843,23 @@ pub async fn cmd_get_files(
         };
 
         files.retain(|file| !manifest_chunk_ids.contains(&file.id));
-        files.extend(manifest_files);
+        files.extend(
+            manifest_files
+                .into_iter()
+                .filter(|file| !crate::drive_stream::is_drive_backing_logical_name(&file.name)),
+        );
     }
 
     // iter_messages yields newest first (descending message id); keep that
     // order with collapsed entries positioned by their first part.
     files.sort_by(|a, b| b.id.cmp(&a.id));
+
+    // Collapse version stacks only after logical-file manifests have rebuilt
+    // stable file identities. The stack anchor preserves chronological position
+    // even when the user changes which version is primary.
+    if logical_channel_id.is_some() && !stack_manifests.is_empty() {
+        files = crate::commands::file_stacks::collapse_files(files, &stack_manifests);
+    }
 
     Ok(files)
 }
@@ -4607,6 +5884,12 @@ fn extract_search_files(msgs: &[tl::enums::Message]) -> Vec<FileMetadata> {
                     // never user-visible global-search results.
                     if crate::commands::logical_files::manifest_file_id(&doc_name, &m.message)
                         .is_some()
+                        || crate::commands::file_stacks::stack_manifest_id(&doc_name, &m.message)
+                            .is_some()
+                        || crate::commands::drive_metadata::is_drive_manifest_document(
+                            &doc_name, &m.message,
+                        )
+                        || crate::drive_stream::is_drive_data_document(&doc_name, &m.message)
                     {
                         continue;
                     }
@@ -4645,6 +5928,11 @@ fn extract_search_files(msgs: &[tl::enums::Message]) -> Vec<FileMetadata> {
                         created_at: m.date.to_string(),
                         icon_type: "file".into(),
                         is_split,
+                        logical_file_id: None,
+                        stack_id: None,
+                        stack_name: None,
+                        stack_version_count: 0,
+                        stack_label: None,
                     });
                 }
             }
@@ -6045,9 +7333,11 @@ pub async fn cmd_upload_from_url(
 #[cfg(test)]
 mod split_tests {
     use super::{
-        adapt_upload_parallelism, checked_upload_part_count, clean_file_uri, ordered_part_ids,
-        parse_part_name, split_part_caption, split_part_name, telegram_upload_chunk_size,
-        upload_pool_plan, SPLIT_PART_SIZE, UPLOAD_MAIN_SINGLE_WORKERS, UPLOAD_PART_WORKERS,
+        adapt_download_lanes, adapt_upload_parallelism, checked_upload_part_count, clean_file_uri,
+        ordered_part_ids, parse_part_name, split_part_caption, split_part_name,
+        telegram_upload_chunk_size, upload_media_kind, upload_pool_plan, upload_similarity_key,
+        BOOST_RAW_DOWNLOAD_CHUNK_SIZE, SPLIT_PART_SIZE, UPLOAD_MAIN_SINGLE_WORKERS,
+        UPLOAD_PART_WORKERS,
     };
     use std::collections::HashMap;
 
@@ -6061,6 +7351,24 @@ mod split_tests {
             clean_file_uri("/var/mobile/Containers/Data/plain.txt"),
             "/var/mobile/Containers/Data/plain.txt"
         );
+    }
+
+    #[test]
+    fn version_similarity_ignores_technical_media_suffixes_without_using_content_identity() {
+        assert_eq!(
+            upload_similarity_key("Interstellar.1080p.BluRay.mkv"),
+            "interstellar"
+        );
+        assert_eq!(
+            upload_similarity_key("Interstellar.2160p.HDR.HEVC.mkv"),
+            "interstellar"
+        );
+        assert_ne!(
+            upload_similarity_key("Interstellar.2160p.HDR.mkv"),
+            upload_similarity_key("Arrival.2160p.HDR.mkv")
+        );
+        assert_eq!(upload_media_kind("movie.mkv"), "video");
+        assert_eq!(upload_media_kind("movie.pdf"), "document");
     }
 
     #[test]
@@ -6101,6 +7409,30 @@ mod split_tests {
             adapt_upload_parallelism("main-single", 1, 6, 1, Some(10.0), 8.0),
             (1, 5)
         );
+    }
+
+    #[test]
+    fn boost_download_parallelism_scales_conservatively() {
+        assert_eq!(adapt_download_lanes(4, 8, None, 10.0), 5);
+        assert_eq!(adapt_download_lanes(5, 8, Some(10.0), 10.1), 6);
+        assert_eq!(adapt_download_lanes(6, 8, Some(10.0), 8.0), 5);
+        assert_eq!(adapt_download_lanes(8, 8, Some(10.0), 11.0), 8);
+        assert_eq!(adapt_download_lanes(1, 1, Some(10.0), 5.0), 1);
+    }
+
+    #[test]
+    fn boost_raw_download_chunk_satisfies_telegram_and_grammers_limits() {
+        // This pinned Grammers revision rejects any decoded inner MTProto
+        // message at or above 1,044,448 bytes. upload.getFile wraps the file
+        // bytes in rpc_result/upload.file TL framing, so a full 1 MiB payload
+        // can panic the receiver before TeraRelay gets an ordinary RPC error.
+        // With precise=false Telegram additionally requires 1 MiB to be
+        // evenly divisible by limit, otherwise upload.getFile returns LIMIT_INVALID.
+        const GRAMMERS_MAX_INNER_MESSAGE_SIZE: i32 = 1_044_448;
+        const TELEGRAM_DOWNLOAD_WINDOW: i32 = 1024 * 1024;
+        assert!(BOOST_RAW_DOWNLOAD_CHUNK_SIZE < GRAMMERS_MAX_INNER_MESSAGE_SIZE);
+        assert_eq!(BOOST_RAW_DOWNLOAD_CHUNK_SIZE % (4 * 1024), 0);
+        assert_eq!(TELEGRAM_DOWNLOAD_WINDOW % BOOST_RAW_DOWNLOAD_CHUNK_SIZE, 0);
     }
 
     #[test]

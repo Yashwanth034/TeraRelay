@@ -24,12 +24,12 @@ export function TeraRelayBrand({
             <img
                 src="/logo.svg"
                 alt="TeraRelay"
-                className={`${style.mark} shrink-0 block`}
+                className={`tr-brand-mark ${style.mark} shrink-0 block`}
                 draggable={false}
             />
             {showName && (
                 <div className="min-w-0">
-                    <div className={`${style.name} font-semibold tracking-tight text-telegram-text leading-tight`}>
+                    <div className={`tr-brand-name ${style.name} font-semibold tracking-tight text-telegram-text leading-tight`}>
                         TeraRelay
                     </div>
                     {subtitle && (

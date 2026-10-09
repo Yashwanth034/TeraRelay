@@ -41,6 +41,11 @@ export function useFileOperations(
     const handleBulkDelete = useCallback(async () => {
         const ids = selectedIdsRef.current;
         if (ids.length === 0) return;
+        const stacked = displayedFilesRef.current.filter(file => ids.includes(file.id) && !!file.stack_id);
+        if (stacked.length > 0) {
+            toast.info('Version stacks must be deleted from Manage versions so you can choose whether to unstack or delete every version.');
+            return;
+        }
         if (!await confirm({ title: "Delete Files", message: `Are you sure you want to delete ${ids.length} files?`, confirmText: "Delete All", variant: 'danger' })) return;
 
         let success = 0;
@@ -113,6 +118,11 @@ export function useFileOperations(
     const handleBulkMove = useCallback(async (targetFolderId: number | null, onSuccess?: () => void) => {
         const ids = selectedIdsRef.current;
         if (ids.length === 0) return;
+        const stacked = displayedFilesRef.current.filter(file => ids.includes(file.id) && !!file.stack_id);
+        if (stacked.length > 0) {
+            toast.info('Move version stacks individually so all versions move together safely.');
+            return;
+        }
         try {
             await invoke('cmd_move_files', {
                 messageIds: ids,

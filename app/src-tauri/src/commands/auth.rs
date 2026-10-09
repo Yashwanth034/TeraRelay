@@ -289,6 +289,7 @@ pub async fn cmd_logout(
     *state.login_token.lock().await = None;
     *state.password_token.lock().await = None;
     *state.api_id.lock().await = None;
+    *state.ephemeral_api_hash.lock().await = None;
     crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
     state.cancelled_transfers.write().await.clear();
 
@@ -368,6 +369,33 @@ pub async fn cmd_auth_request_code(
     state: State<'_, TelegramState>,
 ) -> Result<String, String> {
     request_login_code_inner(&app_handle, &phone, api_id, &api_hash, &state, true).await
+}
+
+pub(crate) fn real_e2e_qa_ephemeral_login_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TERARELAY_REAL_E2E_QA")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+}
+
+#[tauri::command]
+pub async fn cmd_auth_request_code_ephemeral(
+    app_handle: tauri::AppHandle,
+    phone: String,
+    api_id: i32,
+    api_hash: String,
+    state: State<'_, TelegramState>,
+) -> Result<String, String> {
+    if !real_e2e_qa_ephemeral_login_enabled() {
+        return Err(
+            "Ephemeral Telegram login is available only in explicitly enabled debug QA mode."
+                .to_string(),
+        );
+    }
+    let result =
+        request_login_code_inner(&app_handle, &phone, api_id, &api_hash, &state, false).await?;
+    *state.ephemeral_api_hash.lock().await = Some(api_hash.trim().to_string());
+    Ok(result)
 }
 
 #[tauri::command]

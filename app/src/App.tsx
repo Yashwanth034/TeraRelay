@@ -20,6 +20,8 @@ import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
 import { useSettings } from "./context/SettingsContext";
 import { FastTransferAuthProvider } from "./context/FastTransferAuthContext";
+import { TransferMethodProvider } from "./context/TransferMethodContext";
+import { UploadSuggestionProvider } from "./context/UploadSuggestionContext";
 import { useTranslation } from "react-i18next";
 
 const queryClient = new QueryClient();
@@ -72,6 +74,17 @@ function AppContent() {
   useEffect(() => {
     const checkSession = async () => {
       try {
+        // Explicit isolated QA mode used only by automated/manual AI Workspace
+        // testing. Production/release builds cannot enable this path.
+        const qaFeatureAEnabled =
+          import.meta.env.DEV && import.meta.env.VITE_TERA_QA_FEATURE_A === '1';
+        (globalThis as typeof globalThis & { __TERARELAY_QA_FEATURE_A__?: boolean })
+          .__TERARELAY_QA_FEATURE_A__ = qaFeatureAEnabled;
+        if (qaFeatureAEnabled) {
+          await invoke('cmd_qa_feature_a_seed');
+          setAuthStatus("authenticated");
+          return;
+        }
         try {
           await invoke("cmd_migrate_legacy_api_credentials");
         } catch (migrationError) {
@@ -116,6 +129,60 @@ function AppContent() {
     checkSession();
   }, []);
 
+  // On Linux desktop, expose the same TeraRelay data as a normal user-space
+  // filesystem. Mounting is independent from remote metadata sync so cached
+  // files/folders remain browsable during a temporary Telegram outage.
+  useEffect(() => {
+    if (authStatus !== "authenticated" || isMobile) return;
+
+    let disposed = false;
+    let syncTimer: number | undefined;
+
+    const syncDrive = async () => {
+      try {
+        // A release marks a pending Drive file closed before its final remote
+        // manifest is published. If the app crashed in that narrow window,
+        // resume the bounded chunk finalization once Telegram is authenticated.
+        await invoke("cmd_drive_recover_pending");
+      } catch (error) {
+        if (!disposed) {
+          console.warn("[Drive] Pending write recovery deferred:", error);
+        }
+      }
+      try {
+        await invoke("cmd_drive_sync_metadata");
+      } catch (error) {
+        if (!disposed) {
+          console.warn("[Drive] Metadata sync deferred:", error);
+        }
+      }
+    };
+
+    const startDrive = async () => {
+      try {
+        await invoke("cmd_drive_mount");
+      } catch (error) {
+        if (!disposed) {
+          console.warn("[Drive] Linux mount unavailable:", error);
+        }
+      }
+      await syncDrive();
+      if (!disposed) {
+        syncTimer = window.setInterval(() => {
+          void syncDrive();
+        }, 15_000);
+      }
+    };
+
+    void startDrive();
+
+    return () => {
+      disposed = true;
+      if (syncTimer !== undefined) window.clearInterval(syncTimer);
+      void invoke("cmd_drive_unmount").catch(() => {});
+    };
+  }, [authStatus, isMobile]);
+
   // Clean up PDF preview cache files on close/beforeunload
   useEffect(() => {
     const handleClose = () => {
@@ -144,7 +211,7 @@ function AppContent() {
 
   return (
     <main className="absolute inset-0 text-telegram-text overflow-hidden selection:bg-telegram-primary/30">
-      <Toaster theme={theme} position="bottom-center" />
+      <Toaster theme={theme} position="bottom-center" closeButton />
       {authStatus === "authenticated" && (
         <Suspense fallback={
           <div className="h-screen w-screen flex flex-col items-center justify-center bg-telegram-bg">
@@ -178,7 +245,11 @@ function App() {
           <ConfirmProvider>
             <SettingsProvider>
               <FastTransferAuthProvider>
-                <AppContent />
+                <TransferMethodProvider>
+                  <UploadSuggestionProvider>
+                    <AppContent />
+                  </UploadSuggestionProvider>
+                </TransferMethodProvider>
               </FastTransferAuthProvider>
             </SettingsProvider>
           </ConfirmProvider>

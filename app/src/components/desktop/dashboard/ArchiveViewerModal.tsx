@@ -289,7 +289,7 @@ export function ArchiveViewerModal({
 
     return (
         <div
-            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+            className="tr-modal-backdrop fixed inset-0 z-[200] flex items-center justify-center p-4"
             onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
         >
             {/* Arrow navigation buttons */}
@@ -313,11 +313,11 @@ export function ArchiveViewerModal({
             )}
 
             <div
-                className="bg-telegram-surface border border-telegram-border rounded-xl w-[520px] max-h-[70vh] shadow-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                className="tr-modal w-full max-w-[560px] max-h-[74vh] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
                 onClick={e => e.stopPropagation()}
             >
                 {/* Header */}
-                <div className="p-4 border-b border-telegram-border flex items-center justify-between shrink-0">
+                <div className="tr-modal-header p-4 flex items-center justify-between shrink-0">
                     <div className="flex items-center gap-3 min-w-0">
                         <FileArchive className="w-6 h-6 text-telegram-primary shrink-0" />
                         <div className="min-w-0">
@@ -333,7 +333,7 @@ export function ArchiveViewerModal({
                         )}
                         <button
                             onClick={onClose}
-                            className="p-1.5 rounded-lg hover:bg-telegram-hover text-telegram-subtext hover:text-telegram-text transition-colors"
+                            className="tr-modal-close"
                         >
                             <X className="w-5 h-5" />
                         </button>
@@ -342,7 +342,7 @@ export function ArchiveViewerModal({
 
                 {/* Stats bar */}
                 {entries && !loading && !error && (
-                    <div className="px-4 py-2 border-b border-telegram-border/50 bg-telegram-hover/20 shrink-0">
+                    <div className="px-4 py-2.5 border-b border-[var(--tr-border-soft)] bg-[color-mix(in_srgb,var(--tr-panel-soft)_62%,transparent)] shrink-0">
                         <div className="flex items-center justify-between gap-2">
                             <div className="flex items-center gap-4 text-xs text-telegram-subtext">
                                 <span className="flex items-center gap-1">
@@ -402,7 +402,7 @@ export function ArchiveViewerModal({
                                     {/* Bulk folder dropdown */}
                                     {extractAllFolderMenuOpen && (
                                         <div
-                                            className="absolute right-0 top-full mt-1 z-[220] w-48 bg-telegram-surface border border-telegram-border rounded-lg shadow-xl overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100"
+                                            className="tr-context-menu absolute right-0 top-full mt-1 z-[220] w-48 overflow-hidden animate-in fade-in slide-in-from-top-1 duration-100"
                                             onClick={e => e.stopPropagation()}
                                         >
                                             <div className="px-3 py-2 border-b border-telegram-border/50">
@@ -478,7 +478,7 @@ export function ArchiveViewerModal({
                             {entries.map((entry, i) => (
                                 <div
                                     key={`${entry.filename}-${i}`}
-                                    className="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-telegram-hover/50 transition-colors group"
+                                    className="tr-archive-row flex items-center gap-3 px-3 py-2.5 group"
                                 >
                                     {/* Icon */}
                                     <div className="shrink-0">
@@ -567,10 +567,10 @@ export function ArchiveViewerModal({
                 </div>
 
                 {/* Footer */}
-                <div className="p-3 border-t border-telegram-border bg-telegram-hover/10 shrink-0">
+                <div className="tr-modal-footer shrink-0">
                     <button
                         onClick={onClose}
-                        className="w-full px-4 py-2 rounded-lg bg-telegram-hover hover:bg-telegram-hover/70 text-telegram-text text-sm font-medium transition-colors"
+                        className="tr-button tr-button--secondary tr-button--md w-full"
                     >
                         {t('common.close')}
                     </button>

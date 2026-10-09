@@ -57,6 +57,8 @@ function normalizeError(error: unknown) {
 
 export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     const isBrowser = typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window);
+    const qaEphemeralCredentialsAllowed =
+        import.meta.env.DEV && import.meta.env.VITE_TERA_REAL_E2E_QA === '1';
     const { isMobile } = usePlatform();
     const [step, setStep] = useState<Step>('setup');
     const [checkingCredentials, setCheckingCredentials] = useState(true);
@@ -137,7 +139,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         // Desktop keeps the API hash in the operating-system credential store.
         // Mobile deliberately keeps the API hash memory-only: Telegram only needs it
         // for the login-code request, while later session restores need only api_id.
-        if (!isMobile && !secureStoreAvailable) {
+        if (!isMobile && !secureStoreAvailable && !qaEphemeralCredentialsAllowed) {
             setError('Secure credential storage is unavailable on this device. Unlock or enable your operating system credential store and try again.');
             return;
         }
@@ -166,36 +168,51 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     throw new Error('Enter your Telegram API credentials first.');
                 }
 
+                let useEphemeralQaCredentials = false;
                 if (!isMobile) {
                     const status = await invoke<SecureCredentialStatus>('cmd_secure_credential_status');
                     if (!status.available) {
-                        throw new Error('Secure credential storage is unavailable on this device. Unlock or enable your operating system credential store and try again.');
+                        if (!qaEphemeralCredentialsAllowed) {
+                            throw new Error('Secure credential storage is unavailable on this device. Unlock or enable your operating system credential store and try again.');
+                        }
+                        useEphemeralQaCredentials = true;
                     }
                 }
 
-                await invoke('cmd_auth_request_code', {
-                    phone: trimmedPhone,
-                    apiId: id,
-                    apiHash,
-                });
+                await invoke(
+                    useEphemeralQaCredentials
+                        ? 'cmd_auth_request_code_ephemeral'
+                        : 'cmd_auth_request_code',
+                    {
+                        phone: trimmedPhone,
+                        apiId: id,
+                        apiHash,
+                    },
+                );
 
                 const store = await load('config.json');
                 await store.set('api_id', String(id));
                 await store.delete('api_hash');
                 await store.save();
 
-                setHasSavedCredentials(true);
-                setApiHash('');
+                setHasSavedCredentials(!useEphemeralQaCredentials);
+                if (!useEphemeralQaCredentials) setApiHash('');
             }
 
             setStep('code');
         } catch (requestError) {
             const message = normalizeError(requestError);
-            const match = message.match(/FLOOD_WAIT_(\d+)/);
-            if (match) {
-                setFloodWait(Number.parseInt(match[1], 10));
+            if (message.includes('API_ID_INVALID')) {
+                setStep('setup');
+                setHasSavedCredentials(false);
+                setError('Telegram rejected this API ID / API Hash pair. Check both values at my.telegram.org and try again.');
             } else {
-                setError(message);
+                const match = message.match(/FLOOD_WAIT_(\d+)/);
+                if (match) {
+                    setFloodWait(Number.parseInt(match[1], 10));
+                } else {
+                    setError(message);
+                }
             }
         } finally {
             setLoading(false);

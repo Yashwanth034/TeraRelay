@@ -45,18 +45,18 @@ export function RemoteUploadModal({ isOpen, onClose, folders, defaultFolderId, o
     };
 
     return (
-        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+        <div className="tr-modal-backdrop fixed inset-0 z-[200] flex items-center justify-center p-4" onClick={onClose}>
             <form
                 onSubmit={handleSubmit}
-                className="bg-telegram-surface border border-telegram-border rounded-xl w-[420px] shadow-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                className="tr-modal w-full max-w-[440px] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
                 onClick={e => e.stopPropagation()}
             >
-                <div className="p-4 border-b border-telegram-border flex items-center justify-between">
+                <div className="tr-modal-header p-4 flex items-center justify-between">
                     <h3 className="text-telegram-text font-medium flex items-center gap-2">
                         <Globe className="w-5 h-5 text-telegram-primary" />
                         {t('files.remote_upload')}
                     </h3>
-                    <button type="button" onClick={onClose} className="text-telegram-subtext hover:text-telegram-text transition-colors">
+                    <button type="button" onClick={onClose} className="tr-modal-close">
                         <X className="w-5 h-5" />
                     </button>
                 </div>
@@ -69,7 +69,7 @@ export function RemoteUploadModal({ isOpen, onClose, folders, defaultFolderId, o
                             placeholder="https://example.com/file.zip"
                             value={url}
                             onChange={e => setUrl(e.target.value)}
-                            className="w-full bg-telegram-bg border border-telegram-border rounded-lg px-3 py-2 text-sm text-telegram-text placeholder:text-telegram-subtext/60 focus:outline-none focus:border-telegram-primary/50 transition-colors"
+                            className="tr-modal-input w-full px-3 py-2 text-sm placeholder:text-telegram-subtext/60"
                             autoFocus
                         />
                     </div>
@@ -80,7 +80,7 @@ export function RemoteUploadModal({ isOpen, onClose, folders, defaultFolderId, o
                             <select
                                 value={folderId === null ? '' : folderId}
                                 onChange={e => setFolderId(e.target.value === '' ? null : Number(e.target.value))}
-                                className="appearance-none w-full bg-telegram-bg border border-telegram-border rounded-md pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
+                                className="tr-modal-input appearance-none w-full pl-3 pr-8 py-2 text-sm cursor-pointer"
                             >
                                 <option value="">{t('common.personal_vault')}</option>
                                 {folders.map(folder => (
@@ -94,17 +94,17 @@ export function RemoteUploadModal({ isOpen, onClose, folders, defaultFolderId, o
                     </div>
                 </div>
 
-                <div className="p-4 border-t border-telegram-border bg-telegram-hover/20 flex gap-3 justify-end">
+                <div className="tr-modal-footer">
                     <button
                         type="button"
                         onClick={onClose}
-                        className="px-4 py-2 rounded-lg border border-telegram-border hover:bg-telegram-hover text-telegram-text text-sm font-medium transition-all"
+                        className="tr-button tr-button--secondary tr-button--sm"
                     >
                         {t('common.cancel')}
                     </button>
                     <button
                         type="submit"
-                        className="px-4 py-2 rounded-lg bg-telegram-primary hover:bg-telegram-primary/95 text-white text-sm font-medium transition-all shadow-md"
+                        className="tr-button tr-button--primary tr-button--sm"
                     >
                         {t('files.start_upload')}
                     </button>

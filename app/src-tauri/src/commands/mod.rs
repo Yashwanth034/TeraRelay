@@ -20,6 +20,10 @@ pub struct TelegramState {
     pub login_token: Arc<Mutex<Option<LoginToken>>>,
     pub password_token: Arc<Mutex<Option<PasswordToken>>>,
     pub api_id: Arc<Mutex<Option<i32>>>,
+    /// Process-memory-only API hash used by the explicitly enabled real-E2E QA
+    /// login path when the isolated desktop has no OS credential store.
+    /// Never persisted; cleared on logout.
+    pub ephemeral_api_hash: Arc<Mutex<Option<String>>>,
     /// Send to this channel to request runner shutdown.
     /// Uses std::sync::Mutex (not tokio) so it can be locked from synchronous
     /// contexts like the RunEvent::Exit handler.
@@ -38,16 +42,20 @@ pub struct TelegramState {
 pub mod api_settings;
 pub mod archive;
 pub mod auth;
+pub mod drive_metadata;
+pub mod file_stacks;
 pub mod folder_groups;
 pub mod fs;
 pub mod logical_channels;
 pub mod logical_files;
 pub mod network;
 pub mod preview;
+pub mod qa_feature_a;
 pub mod secure_credentials;
 pub mod settings;
 pub mod sharing;
 pub mod streaming;
+pub mod transfer_engine;
 pub mod transfers;
 pub mod utils;
 pub mod video_metadata;
@@ -55,15 +63,19 @@ pub mod video_metadata;
 pub use api_settings::*;
 pub use archive::*;
 pub use auth::*;
+pub use drive_metadata::*;
+pub use file_stacks::*;
 pub use folder_groups::*;
 pub use fs::*;
 pub use logical_channels::*;
 pub use logical_files::*;
 pub use network::*;
 pub use preview::*;
+pub use qa_feature_a::*;
 pub use secure_credentials::*;
 pub use settings::*;
 pub use sharing::*;
 pub use streaming::*;
+pub use transfer_engine::*;
 pub use utils::*;
 pub use video_metadata::*;

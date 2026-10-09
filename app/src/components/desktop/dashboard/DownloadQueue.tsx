@@ -9,6 +9,7 @@ interface DownloadQueueProps {
     onPauseItem: (id: string) => void;
     onResumeItem: (id: string) => void;
     onRetryItem: (id: string) => void;
+    onDismissItem: (id: string) => void;
 }
 
 export function DownloadQueue({
@@ -18,6 +19,7 @@ export function DownloadQueue({
     onPauseItem,
     onResumeItem,
     onRetryItem,
+    onDismissItem,
 }: DownloadQueueProps) {
     if (items.length === 0) return null;
 
@@ -25,8 +27,8 @@ export function DownloadQueue({
     const pausedCount = items.filter(i => i.status === 'paused').length;
 
     return (
-        <div className="tr-transfer-dock w-full bg-telegram-surface border border-telegram-border rounded-2xl shadow-2xl overflow-hidden">
-            <div className="p-3 border-b border-telegram-border bg-telegram-hover flex justify-between items-center">
+        <div className="tr-transfer-dock w-full overflow-hidden">
+            <div className="tr-transfer-header flex justify-between items-center">
                 <div className="flex items-center gap-2">
                     <Download className="w-4 h-4 text-telegram-secondary" />
                     <h4 className="text-sm font-medium text-telegram-text">Downloads</h4>
@@ -42,18 +44,18 @@ export function DownloadQueue({
                     )}
                 </div>
                 {(activeCount > 0 || pausedCount > 0) && (
-                    <button onClick={onCancelAll} className="text-xs text-red-400 hover:text-red-300 transition-colors">
+                    <button onClick={onCancelAll} className="tr-transfer-cancel-all">
                         Cancel All
                     </button>
                 )}
             </div>
 
-            <div className="max-h-64 overflow-y-auto p-2 space-y-2">
+            <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2">
                 {items.map(item => {
                     const showProgress = item.status === 'downloading' || item.status === 'pausing' || item.status === 'paused';
                     const active = item.status === 'downloading';
                     return (
-                        <div key={item.id} className="flex flex-col gap-1.5 p-2.5 bg-telegram-hover rounded-lg">
+                        <div key={item.id} className="tr-transfer-item flex flex-col gap-1.5 p-2.5">
                             <div className="flex items-center gap-2.5 text-sm">
                                 <div className="flex-shrink-0">
                                     {item.status === 'pending' && <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center"><div className="w-2 h-2 bg-yellow-500 rounded-full" /></div>}
@@ -108,11 +110,17 @@ export function DownloadQueue({
                                         <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
                                 )}
+
+                                {(item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (
+                                    <button onClick={() => onDismissItem(item.id)} className="p-1 text-gray-400 hover:text-telegram-text transition-colors" title="Dismiss" aria-label={`Dismiss ${item.filename ?? 'transfer'}`}>
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
                             </div>
 
                             {showProgress && (
                                 <>
-                                    <div className="relative w-full bg-telegram-border h-1 rounded-full overflow-hidden">
+                                    <div className="tr-transfer-progress relative w-full h-1 overflow-hidden">
                                         {(active && (item.downloadedBytes ?? 0) === 0) ? (
                                             <div className="bg-telegram-secondary h-full w-1/2 animate-progress-indeterminate" />
                                         ) : (

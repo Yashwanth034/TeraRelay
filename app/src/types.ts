@@ -8,6 +8,16 @@ export interface TelegramFile {
     folder_id?: number | null;
     /** Logical file stored across multiple Telegram documents; shown as one file in TeraRelay. */
     is_split?: boolean;
+    /** Stable manifest-backed file identity. Present for modern TeraRelay channel files. */
+    logical_file_id?: string;
+    /** Version stack represented by this row/card. */
+    stack_id?: string;
+    /** User-facing stack name; `name` remains the physical primary filename. */
+    stack_name?: string;
+    /** Number of available versions in this stack. */
+    stack_version_count?: number;
+    /** Optional label for the current primary version. */
+    stack_label?: string;
     // Add other fields if backend sends them
 }
 
@@ -63,6 +73,8 @@ export interface LogicalChannelRecord {
     joined_at: number;
 }
 
+export type TransferEngine = 'boost' | 'tdlib';
+
 export interface QueueItem {
     id: string;
     path: string;
@@ -76,6 +88,40 @@ export interface QueueItem {
     speedBytesPerSec?: number;
     uploadPhase?: 'preparing' | 'uploading';
     tempZipPath?: string; // Set when the upload originated from a zipped folder
+    /** Optional post-upload action: attach this upload to an existing stack. */
+    versionStackId?: string;
+    /** Optional post-upload action: create a stack with this existing logical file. */
+    versionBaseFileId?: string;
+    /** Whether the newly uploaded version should become primary. Defaults to false. */
+    versionMakePrimary?: boolean;
+    /** Transfer backend selected explicitly by the user. */
+    transferEngine?: TransferEngine;
+    /** Full-file SHA-256 computed before upload for exact duplicate detection. */
+    sourceSha256?: string;
+    /** Serialized source identity proving the SHA-256 still describes this file. */
+    sourceIdentity?: string;
+    /** Pending virtual-drive write that must be finalized after upload. */
+    drivePendingId?: string;
+    /** Filename shown by the mounted drive; staging paths are intentionally opaque. */
+    driveFileName?: string;
+}
+
+export interface FileStackMemberView {
+    file: TelegramFile;
+    label?: string | null;
+    is_primary: boolean;
+    is_anchor: boolean;
+    added_at: number;
+}
+
+export interface FileStackView {
+    stack_id: string;
+    display_name: string;
+    primary_file_id: string;
+    anchor_file_id: string;
+    created_at: number;
+    updated_at: number;
+    members: FileStackMemberView[];
 }
 
 export interface BandwidthStats {
@@ -95,6 +141,8 @@ export interface DownloadItem {
     totalBytes?: number;
     speedBytesPerSec?: number;
     savePath?: string;
+    /** Transfer backend selected explicitly by the user. */
+    transferEngine?: TransferEngine;
 }
 export interface ShareInfo {
     id: string;
@@ -237,6 +285,7 @@ export interface MediaTrackInfo {
     language: string | null;
     title: string | null;
     channels: number | null;
+    channel_layout?: string | null;
 }
 
 export interface MediaTrackProbe {
@@ -244,4 +293,17 @@ export interface MediaTrackProbe {
     subtitle_tracks: MediaTrackInfo[];
     duration_secs?: number | null;
     start_time_secs?: number | null;
+}
+
+export interface RichMediaMetadata {
+    duration_secs: number | null;
+    width: number | null;
+    height: number | null;
+    video_codec: string | null;
+    video_profile: string | null;
+    pixel_format: string | null;
+    dynamic_range: string | null;
+    container: string | null;
+    audio_tracks: MediaTrackInfo[];
+    subtitle_tracks: MediaTrackInfo[];
 }

@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use tauri::Manager;
 
 const SERVICE_NAME: &str = "io.terarelay.desktop.telegram";
+#[cfg(target_os = "linux")]
+const QA_KERNEL_SERVICE_NAME: &str = "io.terarelay.desktop.telegram.qa-kernel";
 const LEGACY_CONFIG_NAME: &str = "config.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -106,6 +108,91 @@ fn profile_key(app: &tauri::AppHandle) -> Result<String, String> {
 fn keyring_entry(app: &tauri::AppHandle) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE_NAME, &profile_key(app)?)
         .map_err(|e| format!("OS credential storage is unavailable: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn qa_kernel_keyring_entry(app: &tauri::AppHandle) -> Result<keyring::Entry, String> {
+    let user = format!("{}-qa-kernel", profile_key(app)?);
+    let credential =
+        keyring::keyutils::KeyutilsCredential::new_with_target(None, QA_KERNEL_SERVICE_NAME, &user)
+            .map_err(|e| format!("Linux kernel credential storage is unavailable: {e}"))?;
+    Ok(keyring::Entry::new_with_credential(Box::new(credential)))
+}
+
+#[cfg(target_os = "linux")]
+pub fn save_qa_kernel_api_credentials(
+    app: &tauri::AppHandle,
+    api_id: i32,
+    api_hash: &str,
+) -> Result<(), String> {
+    if api_id <= 0 || api_hash.trim().is_empty() {
+        return Err("Telegram API credentials are incomplete.".to_string());
+    }
+    let credentials = StoredTelegramApiCredentials {
+        api_id,
+        api_hash: api_hash.trim().to_string(),
+    };
+    let encoded = serde_json::to_string(&credentials)
+        .map_err(|e| format!("Failed to encode Telegram API credentials: {e}"))?;
+    let entry = qa_kernel_keyring_entry(app)?;
+    entry
+        .set_password(&encoded)
+        .map_err(|e| format!("Could not save QA credentials in the Linux kernel keyring: {e}"))?;
+    let verified = entry
+        .get_password()
+        .map_err(|e| format!("Could not verify QA credentials in the Linux kernel keyring: {e}"))?;
+    let verified: StoredTelegramApiCredentials = serde_json::from_str(&verified)
+        .map_err(|e| format!("Saved QA Telegram API credentials are invalid: {e}"))?;
+    if verified != credentials {
+        return Err("QA kernel credential verification failed after save.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn save_qa_kernel_api_credentials(
+    _app: &tauri::AppHandle,
+    _api_id: i32,
+    _api_hash: &str,
+) -> Result<(), String> {
+    Err("QA kernel credential storage is available only on Linux.".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub fn load_qa_kernel_api_credentials(
+    app: &tauri::AppHandle,
+) -> Result<Option<StoredTelegramApiCredentials>, String> {
+    let entry = qa_kernel_keyring_entry(app)?;
+    match entry.get_password() {
+        Ok(raw) => serde_json::from_str::<StoredTelegramApiCredentials>(&raw)
+            .map(Some)
+            .map_err(|e| format!("Saved QA Telegram API credentials are invalid: {e}")),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read QA credentials from the Linux kernel keyring: {error}"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn load_qa_kernel_api_credentials(
+    _app: &tauri::AppHandle,
+) -> Result<Option<StoredTelegramApiCredentials>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+pub fn delete_qa_kernel_api_credentials(app: &tauri::AppHandle) -> Result<(), String> {
+    let entry = qa_kernel_keyring_entry(app)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not clear QA kernel credentials: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn delete_qa_kernel_api_credentials(_app: &tauri::AppHandle) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

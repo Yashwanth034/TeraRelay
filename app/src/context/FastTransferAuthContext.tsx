@@ -12,8 +12,8 @@ interface FastTransferStatus {
     detail: string;
 }
 
-type AuthStep = 'phone' | 'code' | 'password';
-type AuthFlow = 'auto-2fa' | 'manual';
+type AuthStep = 'api_hash' | 'phone' | 'code' | 'password';
+type AuthFlow = 'auto-2fa' | 'manual' | 'qa-credentials';
 
 interface FastTransferAuthContextValue {
     ensureFastTransferReady: () => Promise<boolean>;
@@ -34,6 +34,7 @@ function stepFromStatus(status: FastTransferStatus): AuthStep | null {
 }
 
 export function FastTransferAuthProvider({ children }: { children: ReactNode }) {
+    const qaRealE2E = import.meta.env.DEV && import.meta.env.VITE_TERA_REAL_E2E_QA === '1';
     const [open, setOpen] = useState(false);
     const [step, setStep] = useState<AuthStep>('phone');
     const [flow, setFlow] = useState<AuthFlow>('manual');
@@ -93,12 +94,25 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
                 });
             } catch (error) {
                 automaticError = error;
+                const message = cleanError(error);
+                if (qaRealE2E && message.includes('Saved Telegram API credentials are unavailable')) {
+                    setStep('api_hash');
+                    setFlow('qa-credentials');
+                    setValue('');
+                    setError(null);
+                    setBusy(false);
+                    setOpen(true);
+                    return await new Promise<boolean>((resolve) => {
+                        resolveRef.current = resolve;
+                    });
+                }
                 console.warn('Automatic TDLib authorization did not finish yet.', error);
             }
 
             const settleSavedSession = async (initial: FastTransferStatus | null) => {
                 let settled = initial;
-                for (let attempt = 0; attempt < 8; attempt += 1) {
+                const restoreDeadline = Date.now() + 60_000;
+                while (Date.now() < restoreDeadline) {
                     if (
                         settled?.ready
                         || settled?.auth_state === 'password'
@@ -108,7 +122,7 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
                         break;
                     }
 
-                    await new Promise(resolve => window.setTimeout(resolve, 400));
+                    await new Promise(resolve => window.setTimeout(resolve, 1_000));
                     try {
                         settled = await invoke<FastTransferStatus>('cmd_fast_transfer_status');
                     } catch {
@@ -184,11 +198,17 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
         setError(null);
 
         try {
-            let status = step === 'phone'
-                ? await invoke<FastTransferStatus>('cmd_fast_transfer_phone', { phone: submitted })
-                : step === 'code'
-                    ? await invoke<FastTransferStatus>('cmd_fast_transfer_code', { code: submitted })
-                    : await invoke<FastTransferStatus>('cmd_fast_transfer_password', { password: submitted });
+            let status = step === 'api_hash'
+                ? await invoke<FastTransferStatus>('cmd_fast_transfer_prepare_qa_credentials', { apiHash: submitted })
+                : step === 'phone'
+                    ? await invoke<FastTransferStatus>('cmd_fast_transfer_phone', { phone: submitted })
+                    : step === 'code'
+                        ? await invoke<FastTransferStatus>('cmd_fast_transfer_code', { code: submitted })
+                        : await invoke<FastTransferStatus>('cmd_fast_transfer_password', { password: submitted });
+
+            if (step === 'api_hash') {
+                setFlow(status.auth_state === 'password' ? 'auto-2fa' : 'manual');
+            }
 
             if (status.ready) {
                 // Confirm the newly authorized TDLib session once before
@@ -217,33 +237,41 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
         }
     };
 
-    const title = flow === 'auto-2fa'
-        ? 'Confirm Telegram 2FA'
+    const title = step === 'api_hash'
+        ? 'Enable real TDLib QA'
+        : flow === 'auto-2fa'
+            ? 'Confirm Telegram 2FA'
+            : step === 'phone'
+                ? 'Connect fast transfers'
+                : step === 'code'
+                    ? 'Enter Telegram code'
+                    : 'Enter Telegram 2FA';
+
+    const description = step === 'api_hash'
+        ? 'Your main Telegram session is already connected. Enter the API Hash once so this isolated QA profile can reopen TDLib after app restarts without logging you out.'
+        : flow === 'auto-2fa'
+            ? 'Your main TeraRelay login was reused successfully. Telegram only needs your 2-step verification password to finish TDLib authorization.'
+            : step === 'phone'
+                ? 'Automatic TDLib authorization was unavailable. Sign in once to the fast-transfer engine; this TDLib session will then be saved for future app launches.'
+                : step === 'code'
+                    ? 'Enter the Telegram login code sent for the TDLib fast-transfer session.'
+                    : 'Telegram requires your 2-step verification password to finish the TDLib login.';
+
+    const label = step === 'api_hash'
+        ? 'Telegram API Hash'
         : step === 'phone'
-            ? 'Connect fast transfers'
+            ? 'Phone number'
             : step === 'code'
-                ? 'Enter Telegram code'
-                : 'Enter Telegram 2FA';
+                ? 'Telegram code'
+                : '2FA password';
 
-    const description = flow === 'auto-2fa'
-        ? 'Your main TeraRelay login was reused successfully. Telegram only needs your 2-step verification password to finish TDLib authorization.'
+    const placeholder = step === 'api_hash'
+        ? 'API Hash'
         : step === 'phone'
-            ? 'Automatic TDLib authorization was unavailable. Sign in once to the fast-transfer engine; this TDLib session will then be saved for future app launches.'
+            ? '+91 98765 43210'
             : step === 'code'
-                ? 'Enter the Telegram login code sent for the TDLib fast-transfer session.'
-                : 'Telegram requires your 2-step verification password to finish the TDLib login.';
-
-    const label = step === 'phone'
-        ? 'Phone number'
-        : step === 'code'
-            ? 'Telegram code'
-            : '2FA password';
-
-    const placeholder = step === 'phone'
-        ? '+91 98765 43210'
-        : step === 'code'
-            ? '12345'
-            : 'Your Telegram 2FA password';
+                ? '12345'
+                : 'Your Telegram 2FA password';
 
     const Icon = step === 'phone' ? Phone : step === 'code' ? KeyRound : LockKeyhole;
 
@@ -278,8 +306,8 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
                                     <Icon className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-telegram-subtext" />
                                     <input
                                         autoFocus
-                                        type={step === 'password' ? 'password' : step === 'phone' ? 'tel' : 'text'}
-                                        autoComplete={step === 'password' ? 'current-password' : step === 'phone' ? 'tel' : 'one-time-code'}
+                                        type={step === 'password' || step === 'api_hash' ? 'password' : step === 'phone' ? 'tel' : 'text'}
+                                        autoComplete={step === 'api_hash' ? 'off' : step === 'password' ? 'current-password' : step === 'phone' ? 'tel' : 'one-time-code'}
                                         value={value}
                                         onChange={(event) => {
                                             setValue(event.target.value);
@@ -322,7 +350,7 @@ export function FastTransferAuthProvider({ children }: { children: ReactNode }) 
                                 >
                                     <span className="flex items-center justify-center gap-2">
                                         {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-                                        {busy ? 'Checking…' : step === 'phone' ? 'Send code' : 'Continue'}
+                                        {busy ? 'Checking…' : step === 'api_hash' ? 'Save & continue' : step === 'phone' ? 'Send code' : 'Continue'}
                                     </span>
                                 </button>
                             </div>

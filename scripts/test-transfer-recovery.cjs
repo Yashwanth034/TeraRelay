@@ -40,18 +40,37 @@ function makeBackend(saved = {}) {
   for (const [kind, items] of Object.entries(saved)) database(db, 'save', kind, items);
   const backend = {
     db, saves: [], jobs: [], deleted: [], listeners: new Map(), saveHolds: [], failures: 0, authReady: true,
+    authCalls: 0, transferChoice: 'tdlib',
+    driveSnapshot: { pending: [] }, driveFinalized: [], driveSyncs: 0, preflightResult: null,
     saveInFlight: 0, maxSaveInFlight: 0, dialogs: [], filename: path.join(fixtures, 'folder-' + serial + '.zip'),
     read: kind => database(db, 'load', kind),
     holdSave(predicate = () => true) { const gate = deferred(); backend.saveHolds.push({ predicate, gate }); return gate; },
-    complete(id, error) {
+    complete(id, error, result = null) {
       const job = backend.jobs.find(j => j.id === id && !j.finished);
       assert.ok(job, 'Fixture transfer was not started: ' + id);
       job.finished = true;
-      if (error) job.gate.reject(new Error(error)); else job.gate.resolve(null);
+      if (error) job.gate.reject(new Error(error)); else job.gate.resolve(result);
     },
     emit(name, payload) { for (const callback of backend.listeners.get(name) || []) callback({ payload }); },
     async invoke(command, args) {
       if (command === 'cmd_load_transfer_queue') return backend.read(args.kind);
+      if (command === 'cmd_drive_get_snapshot') return structuredClone(backend.driveSnapshot);
+      if (command === 'cmd_drive_sync_metadata') { backend.driveSyncs++; return { revision: 1, dirty: false, source: 'fixture' }; }
+      if (command === 'cmd_drive_finalize_upload') {
+        backend.driveFinalized.push(structuredClone(args));
+        backend.driveSnapshot.pending = backend.driveSnapshot.pending.filter(item => item.id !== args.pendingId);
+        return null;
+      }
+      if (command === 'cmd_preflight_upload_candidate') {
+        return backend.preflightResult || {
+          file_name: path.basename(args.path),
+          size: fs.existsSync(args.path) ? fs.statSync(args.path).size : 1,
+          source_sha256: 'a'.repeat(64),
+          source_identity: 'fixture-source-identity',
+          exact_duplicate: null,
+          similar_files: [],
+        };
+      }
       if (command === 'cmd_save_transfer_queue') {
         assert.ok(args.kind === 'upload' || args.kind === 'download');
         assert.ok(Array.isArray(args.items), 'Queue writes must contain a complete snapshot');
@@ -157,7 +176,15 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
       pickWithFallback: async fn => fn(), showFileDialogFallback: async () => [],
     },
     '../context/SettingsContext': { useSettings: () => ({ settings: { maxConcurrentUploads: concurrency, maxConcurrentDownloads: concurrency } }) },
-    '../context/FastTransferAuthContext': { useFastTransferAuth: () => ({ ensureFastTransferReady: async () => backend.authReady }) },
+    '../context/FastTransferAuthContext': {
+      useFastTransferAuth: () => ({
+        ensureFastTransferReady: async () => { backend.authCalls++; return backend.authReady; },
+      }),
+    },
+    '../context/TransferMethodContext': { useTransferMethod: () => ({ chooseTransferMethod: async () => backend.transferChoice }) },
+    '../context/UploadSuggestionContext': {
+      useUploadSuggestion: () => ({ reviewUploadSuggestion: async () => 'keep_separate' }),
+    },
   };
   const modules = new Map();
   function load(file) {
@@ -238,6 +265,10 @@ const corruptedQueues = [
   ['download', 'invalid destination', [down('bad', 'pending', { savePath: { path: '/bad' } })]],
   ['upload', 'invalid folder identity', [up('bad', 'pending', { folderId: false })]],
   ['download', 'missing filename', [down('bad', 'pending', { filename: '' })]],
+  ['upload', 'invalid transfer engine', [up('bad', 'pending', { transferEngine: 'automatic' })]],
+  ['download', 'invalid transfer engine', [down('bad', 'pending', { transferEngine: 'automatic' })]],
+  ['upload', 'incomplete mounted-drive identity', [up('bad', 'pending', { drivePendingId: '0'.repeat(32) })]],
+  ['upload', 'invalid mounted-drive identity', [up('bad', 'pending', { drivePendingId: 'not-an-id', driveFileName: 'file.txt' })]],
 ];
 for (const [kind, reason, items] of corruptedQueues) test(kind + ' preserves corrupted saved records: ' + reason, () => withHarness(kind, { [kind]: items }, async (h, backend) => {
   const helper = h.load(path.join(root, 'app/src/transferQueue.ts'));
@@ -272,6 +303,133 @@ test('legacy URL identity can recover without a separate local source path', () 
   assert.ok(backend.read('upload')[0].path);
   assert.equal(backend.jobs[0].command, 'cmd_upload_from_url');
 }, 1, { uploadQueue: [{ id: 'url-only', url: 'https://fixture.invalid/large.mkv', folderId: null, status: 'pending' }] }));
+
+test('mounted-drive close enters the durable Boost upload queue and finalizes the virtual entry', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-staged.txt');
+    fs.writeFileSync(source, 'mounted drive payload');
+    const pendingId = '0'.repeat(32);
+    backend.emit('drive-upload-staged', {
+      pending_id: pendingId,
+      path: source,
+      folder_id: 9100001,
+      file_name: 'Drive staged.txt',
+    });
+    await h.flush();
+
+    const saved = backend.read('upload');
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].drivePendingId, pendingId);
+    assert.equal(saved[0].driveFileName, 'Drive staged.txt');
+    assert.equal(saved[0].transferEngine, 'boost');
+    assert.equal(backend.authCalls, 0, 'Mounted-drive upload unexpectedly required TDLib setup');
+    assert.equal(backend.jobs.length, 1);
+    assert.equal(backend.jobs[0].args.folderId, 9100001);
+
+    const logicalId = 'b'.repeat(32);
+    backend.complete(backend.jobs[0].id, null, {
+      message: 'fixture upload complete',
+      logical_file_id: logicalId,
+    });
+    await h.flush();
+
+    assert.deepEqual(backend.driveFinalized, [{
+      pendingId,
+      logicalFileId: logicalId,
+    }]);
+    assert.ok(backend.driveSyncs >= 1, 'Drive metadata publication was not requested after finalization');
+  })
+);
+
+test('mounted-drive byte-identical copy reuses existing logical content without another upload', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-dedup.txt');
+    fs.writeFileSync(source, 'same bytes');
+    const pendingId = '1'.repeat(32);
+    const logicalId = 'c'.repeat(32);
+    backend.preflightResult = {
+      file_name: 'Duplicate alias.txt',
+      size: fs.statSync(source).size,
+      source_sha256: 'd'.repeat(64),
+      source_identity: 'fixture-dedup-identity',
+      exact_duplicate: {
+        logical_file_id: logicalId,
+        message_id: 77,
+        name: 'Original.txt',
+        size: fs.statSync(source).size,
+      },
+      similar_files: [],
+    };
+
+    backend.emit('drive-upload-staged', {
+      pending_id: pendingId,
+      path: source,
+      folder_id: 9100001,
+      file_name: 'Duplicate alias.txt',
+    });
+    await h.flush();
+
+    assert.equal(backend.jobs.length, 0, 'Identical bytes were uploaded again');
+    assert.deepEqual(backend.driveFinalized, [{
+      pendingId,
+      logicalFileId: logicalId,
+    }]);
+    assert.equal(backend.read('upload').length, 0, 'De-duplicated Drive work remained stuck in the queue');
+  })
+);
+
+for (const kind of ['upload', 'download']) test('TeraRelay Boost ' + kind + ' persists its engine and bypasses TDLib setup', () =>
+  withHarness(kind, { [kind]: [] }, async (h, backend) => {
+    backend.authReady = false;
+    backend.transferChoice = 'boost';
+    if (kind === 'upload') {
+      h.state.handleDropUpload(['/fixture/boost.bin']);
+    } else {
+      await h.state.queueDownload(7, 'boost.bin', null);
+    }
+    await h.flush();
+    const saved = backend.read(kind);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].transferEngine, 'boost');
+    assert.equal(backend.jobs.length, 1, 'Boost was blocked by TDLib setup');
+    if (kind === 'upload') {
+      assert.equal(backend.jobs[0].args.transferEngine, 'boost');
+    } else {
+      assert.equal(backend.jobs[0].args.req.transfer_engine, 'boost');
+    }
+  })
+);
+
+for (const kind of ['upload', 'download']) test('reopened TeraRelay Boost ' + kind + ' keeps the chosen engine', () => {
+  const item = kind === 'upload'
+    ? up('boost-reopen', 'pending', { transferEngine: 'boost' })
+    : down('boost-reopen', 'pending', { transferEngine: 'boost', savePath: '/fixture/boost-reopen.bin' });
+  return withHarness(kind, { [kind]: [item] }, async (h, backend) => {
+    backend.authReady = false;
+    await h.flush();
+    assert.equal(backend.jobs.length, 1);
+    if (kind === 'upload') {
+      assert.equal(backend.jobs[0].args.transferEngine, 'boost');
+    } else {
+      assert.equal(backend.jobs[0].args.req.transfer_engine, 'boost');
+    }
+  });
+});
+
+for (const kind of ['upload', 'download']) test('legacy ' + kind + ' queue keeps historical implicit engine selection', () => {
+  const item = kind === 'upload'
+    ? up('legacy-engine', 'pending')
+    : down('legacy-engine', 'pending', { savePath: '/fixture/legacy-engine.bin' });
+  return withHarness(kind, { [kind]: [item] }, async (h, backend) => {
+    await h.flush();
+    assert.equal(backend.jobs.length, 1);
+    if (kind === 'upload') {
+      assert.equal(backend.jobs[0].args.transferEngine, undefined);
+    } else {
+      assert.equal(backend.jobs[0].args.req.transfer_engine, undefined);
+    }
+  });
+});
 
 for (const kind of ['upload', 'download']) test(kind + ' preserves setup-cancelled work and its source/destination on reopening', () => withHarness(kind, { [kind]: [] }, async (h, backend) => {
   backend.authReady = false;
@@ -397,6 +555,35 @@ test('newly selected download destination commits before download invoke', () =>
   assert.equal(backend.read('download')[0].savePath, destination);
   assert.equal(backend.jobs[0].args.req.save_path, destination);
   assert.equal(backend.jobs[0].args.req.folder_id, 4);
+}));
+
+test('Boost choice is durable and bypasses TDLib readiness', () => withHarness('upload', { upload: [] }, async (h, backend) => {
+  backend.transferChoice = 'boost';
+  backend.authReady = false;
+  h.state.handleDropUpload(['/fixture/boost.bin']);
+  await h.flush();
+  assert.equal(backend.authCalls, 0, 'Boost unexpectedly entered TDLib readiness');
+  assert.equal(backend.jobs.length, 1, 'Boost upload did not start');
+  assert.equal(backend.jobs[0].args.transferEngine, 'boost');
+  assert.equal(backend.read('upload')[0].transferEngine, 'boost', 'Boost engine was not durable');
+
+  h.close();
+  const reopened = makeHarness('upload', backend);
+  try {
+    await reopened.flush();
+    assert.equal(reopened.queue[0].transferEngine, 'boost', 'Recovered upload lost Boost selection');
+  } finally { reopened.close(); }
+}));
+
+test('TDLib choice still uses the existing readiness flow and reaches backend unchanged', () => withHarness('download', { download: [] }, async (h, backend) => {
+  backend.transferChoice = 'tdlib';
+  backend.authReady = true;
+  await h.state.queueDownload(77, 'tdlib.bin', 9);
+  await h.flush();
+  assert.equal(backend.authCalls, 1, 'TDLib choice did not use the existing readiness flow');
+  assert.equal(backend.jobs.length, 1, 'TDLib download did not start after readiness');
+  assert.equal(backend.jobs[0].args.req.transfer_engine, 'tdlib');
+  assert.equal(backend.read('download')[0].transferEngine, 'tdlib', 'TDLib engine was not durable');
 }));
 
 test('save-dialog cancellation releases exactly one slot', () => withHarness('download', { download: [] }, async (h, backend) => {

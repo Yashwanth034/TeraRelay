@@ -30,11 +30,52 @@ function validateSavedQueue(kind: TransferQueueKind, value: unknown): void {
         if (typeof item.status !== 'string' || !statuses.has(item.status)) invalid(`item ${index + 1} has an unknown status`);
         if (item.folderId !== null && !Number.isSafeInteger(item.folderId)) invalid(`item ${index + 1} has an invalid folder ID`);
         if (item.error !== undefined && typeof item.error !== 'string') invalid(`item ${index + 1} has an invalid error`);
+        if (item.transferEngine !== undefined && item.transferEngine !== 'boost' && item.transferEngine !== 'tdlib') {
+            invalid(`item ${index + 1} has an invalid transfer engine`);
+        }
         if (kind === 'upload') {
             if (!optionalPath('path') || !optionalPath('url') || !optionalPath('tempZipPath')) {
                 invalid(`item ${index + 1} has an invalid source path`);
             }
             if (!nonempty('path') && !nonempty('url')) invalid(`item ${index + 1} has no upload source`);
+            const versionId = (field: string) => item[field] === undefined ||
+                (typeof item[field] === 'string' && /^[0-9a-f]{32}$/.test(item[field] as string));
+            if (!versionId('versionStackId') || !versionId('versionBaseFileId')) {
+                invalid(`item ${index + 1} has invalid version metadata`);
+            }
+            if (item.versionStackId !== undefined && item.versionBaseFileId !== undefined) {
+                invalid(`item ${index + 1} has conflicting version targets`);
+            }
+            if (item.versionMakePrimary !== undefined && typeof item.versionMakePrimary !== 'boolean') {
+                invalid(`item ${index + 1} has an invalid primary-version flag`);
+            }
+            const hasSourceHash = item.sourceSha256 !== undefined;
+            const hasSourceIdentity = item.sourceIdentity !== undefined;
+            if (hasSourceHash !== hasSourceIdentity) {
+                invalid(`item ${index + 1} has incomplete source fingerprint metadata`);
+            }
+            if (hasSourceHash && (
+                typeof item.sourceSha256 !== 'string'
+                || !/^[0-9a-f]{64}$/.test(item.sourceSha256)
+                || typeof item.sourceIdentity !== 'string'
+                || item.sourceIdentity.length === 0
+            )) {
+                invalid(`item ${index + 1} has invalid source fingerprint metadata`);
+            }
+            const hasDrivePending = item.drivePendingId !== undefined;
+            const hasDriveName = item.driveFileName !== undefined;
+            if (hasDrivePending !== hasDriveName) {
+                invalid(`item ${index + 1} has incomplete TeraRelay Drive metadata`);
+            }
+            if (hasDrivePending && (
+                typeof item.drivePendingId !== 'string'
+                || !/^[0-9a-f]{32}$/.test(item.drivePendingId)
+                || typeof item.driveFileName !== 'string'
+                || item.driveFileName.trim().length === 0
+                || item.driveFileName.includes('/')
+            )) {
+                invalid(`item ${index + 1} has invalid TeraRelay Drive metadata`);
+            }
         } else {
             // DownloadFileRequest accepts signed i32 message IDs; keep that existing contract.
             if (!Number.isSafeInteger(item.messageId) || (item.messageId as number) < -2147483648 ||
@@ -62,6 +103,14 @@ export const normalizeUploadQueue: Normalize<QueueItem> = items => items.filter(
     url: item.url,
     folderId: item.folderId,
     tempZipPath: item.tempZipPath,
+    versionStackId: item.versionStackId,
+    versionBaseFileId: item.versionBaseFileId,
+    versionMakePrimary: item.versionMakePrimary,
+    transferEngine: item.transferEngine,
+    sourceSha256: item.sourceSha256,
+    sourceIdentity: item.sourceIdentity,
+    drivePendingId: item.drivePendingId,
+    driveFileName: item.driveFileName,
     status: savedStatus(item),
     ...(['error', 'paused', 'pausing'].includes(item.status) && item.error !== undefined ? { error: item.error } : {}),
 }));
@@ -72,6 +121,7 @@ export const normalizeDownloadQueue: Normalize<DownloadItem> = items => items.fi
     filename: item.filename,
     folderId: item.folderId,
     savePath: item.savePath,
+    transferEngine: item.transferEngine,
     status: savedStatus(item),
     ...(['error', 'paused', 'pausing'].includes(item.status) && item.error !== undefined ? { error: item.error } : {}),
 }));

@@ -17,7 +17,7 @@ pub struct VideoMetadata {
     pub height: Option<u32>,
 }
 
-#[derive(serde::Serialize, Clone)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct MediaTrackInfo {
     pub index: i32,
     pub kind: String,
@@ -25,6 +25,7 @@ pub struct MediaTrackInfo {
     pub language: Option<String>,
     pub title: Option<String>,
     pub channels: Option<u32>,
+    pub channel_layout: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -33,6 +34,20 @@ pub struct MediaTrackProbe {
     pub subtitle_tracks: Vec<MediaTrackInfo>,
     pub duration_secs: Option<f64>,
     pub start_time_secs: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct RichMediaMetadata {
+    pub duration_secs: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub video_codec: Option<String>,
+    pub video_profile: Option<String>,
+    pub pixel_format: Option<String>,
+    pub dynamic_range: Option<String>,
+    pub container: Option<String>,
+    pub audio_tracks: Vec<MediaTrackInfo>,
+    pub subtitle_tracks: Vec<MediaTrackInfo>,
 }
 
 #[derive(serde::Deserialize)]
@@ -95,7 +110,7 @@ pub async fn cmd_probe_media_tracks(
             .arg("-v")
             .arg("error")
             .arg("-show_entries")
-            .arg("format=duration,start_time:stream=index,codec_type,codec_name,channels:stream_tags=language,title")
+            .arg("format=duration,start_time:stream=index,codec_type,codec_name,channels,channel_layout:stream_tags=language,title")
             .arg("-of")
             .arg("json")
             .arg(&stream_url)
@@ -115,6 +130,188 @@ pub async fn cmd_probe_media_tracks(
         serde_json::from_slice(&output.stdout).map_err(|e| format!("Invalid FFprobe JSON: {e}"))?;
 
     Ok(parse_media_track_probe(parsed))
+}
+
+fn qa_rich_media_metadata(file_name: &str) -> RichMediaMetadata {
+    let lower = file_name.to_ascii_lowercase();
+    let is_dune = lower.contains("dune");
+    let is_4k = lower.contains("2160p") || lower.contains("4k");
+    let is_hdr = lower.contains("hdr");
+    let duration_secs = if is_dune { 9_960.0 } else { 10_140.0 };
+
+    RichMediaMetadata {
+        duration_secs: Some(duration_secs),
+        width: Some(if is_4k { 3840 } else { 1920 }),
+        height: Some(if is_4k { 2160 } else { 1080 }),
+        video_codec: Some(if is_4k {
+            "hevc".to_string()
+        } else {
+            "h264".to_string()
+        }),
+        video_profile: None,
+        pixel_format: Some(if is_4k {
+            "yuv420p10le".to_string()
+        } else {
+            "yuv420p".to_string()
+        }),
+        dynamic_range: is_hdr.then(|| "HDR10".to_string()),
+        container: Some("MKV".to_string()),
+        audio_tracks: vec![MediaTrackInfo {
+            index: 1,
+            kind: "audio".to_string(),
+            codec: "aac".to_string(),
+            language: Some("eng".to_string()),
+            title: None,
+            channels: Some(if is_4k { 6 } else { 2 }),
+            channel_layout: Some(if is_4k {
+                "5.1".to_string()
+            } else {
+                "stereo".to_string()
+            }),
+        }],
+        subtitle_tracks: if is_4k {
+            (0..3)
+                .map(|offset| MediaTrackInfo {
+                    index: 2 + offset,
+                    kind: "subtitle".to_string(),
+                    codec: "subrip".to_string(),
+                    language: Some("eng".to_string()),
+                    title: None,
+                    channels: None,
+                    channel_layout: None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn container_from_file_name(file_name: &str) -> Option<String> {
+    let extension = std::path::Path::new(file_name)
+        .extension()?
+        .to_str()?
+        .to_ascii_uppercase();
+    (!extension.is_empty()).then_some(extension)
+}
+
+fn parse_rich_media_metadata(parsed: serde_json::Value, file_name: &str) -> RichMediaMetadata {
+    let tracks = parse_media_track_probe(parsed.clone());
+    let video = parsed
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| {
+            streams.iter().find(|stream| {
+                stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+            })
+        });
+
+    let width = video
+        .and_then(|stream| stream.get("width"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as u32);
+    let height = video
+        .and_then(|stream| stream.get("height"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as u32);
+    let video_codec = video
+        .and_then(|stream| stream.get("codec_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let video_profile = video
+        .and_then(|stream| stream.get("profile"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let pixel_format = video
+        .and_then(|stream| stream.get("pix_fmt"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let transfer = video
+        .and_then(|stream| stream.get("color_transfer"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let primaries = video
+        .and_then(|stream| stream.get("color_primaries"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let dynamic_range = match transfer {
+        "smpte2084" if primaries == "bt2020" => Some("HDR10".to_string()),
+        "smpte2084" => Some("HDR (PQ)".to_string()),
+        "arib-std-b67" => Some("HLG".to_string()),
+        _ => None,
+    };
+
+    let container = container_from_file_name(file_name).or_else(|| {
+        parsed
+            .get("format")
+            .and_then(|format| format.get("format_name"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.split(',').next())
+            .map(|value| value.to_ascii_uppercase())
+    });
+
+    RichMediaMetadata {
+        duration_secs: tracks.duration_secs,
+        width,
+        height,
+        video_codec,
+        video_profile,
+        pixel_format,
+        dynamic_range,
+        container,
+        audio_tracks: tracks.audio_tracks,
+        subtitle_tracks: tracks.subtitle_tracks,
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_get_rich_media_metadata(
+    message_id: i32,
+    folder_id: Option<i64>,
+    file_name: String,
+    config: State<'_, StreamConfig>,
+) -> Result<RichMediaMetadata, String> {
+    if crate::commands::qa_feature_a::enabled() {
+        return Ok(qa_rich_media_metadata(&file_name));
+    }
+
+    let folder_segment = folder_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "home".to_string());
+    let stream_url = format!(
+        "http://localhost:{}/stream/{}/{}?token={}",
+        config.port,
+        folder_segment,
+        message_id,
+        urlencoding::encode(&config.token)
+    );
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-show_entries")
+            .arg("format=format_name,duration,start_time:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,color_transfer,color_primaries,color_space,channels,channel_layout:stream_tags=language,title")
+            .arg("-of")
+            .arg("json")
+            .arg(&stream_url)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "FFprobe timed out while reading media details".to_string())?
+    .map_err(|e| format!("FFprobe is unavailable: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFprobe failed: {}", stderr.trim()));
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("Invalid FFprobe JSON: {e}"))?;
+
+    Ok(parse_rich_media_metadata(parsed, &file_name))
 }
 
 fn finite_probe_number(value: &serde_json::Value) -> Option<f64> {
@@ -167,6 +364,10 @@ fn parse_media_track_probe(parsed: serde_json::Value) -> MediaTrackProbe {
                 .get("channels")
                 .and_then(serde_json::Value::as_u64)
                 .map(|value| value as u32),
+            channel_layout: stream
+                .get("channel_layout")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         };
 
         if kind == "audio" {
@@ -445,5 +646,55 @@ mod track_probe_tests {
                 parse_media_track_probe(serde_json::json!({"format":{"duration":duration}}));
             assert_eq!(probe.duration_secs, None);
         }
+    }
+
+    #[test]
+    fn rich_probe_extracts_video_hdr_audio_and_subtitle_details() {
+        let metadata = parse_rich_media_metadata(
+            serde_json::json!({
+                "format":{"duration":"10140.0","format_name":"matroska,webm"},
+                "streams":[
+                    {
+                        "index":0,
+                        "codec_type":"video",
+                        "codec_name":"hevc",
+                        "profile":"Main 10",
+                        "width":3840,
+                        "height":2160,
+                        "pix_fmt":"yuv420p10le",
+                        "color_transfer":"smpte2084",
+                        "color_primaries":"bt2020"
+                    },
+                    {
+                        "index":1,
+                        "codec_type":"audio",
+                        "codec_name":"aac",
+                        "channels":6,
+                        "channel_layout":"5.1",
+                        "tags":{"language":"eng"}
+                    },
+                    {
+                        "index":2,
+                        "codec_type":"subtitle",
+                        "codec_name":"subrip",
+                        "tags":{"language":"eng"}
+                    }
+                ]
+            }),
+            "Interstellar.2160p.HDR.mkv",
+        );
+
+        assert_eq!(metadata.duration_secs, Some(10_140.0));
+        assert_eq!(metadata.width, Some(3840));
+        assert_eq!(metadata.height, Some(2160));
+        assert_eq!(metadata.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(metadata.dynamic_range.as_deref(), Some("HDR10"));
+        assert_eq!(metadata.container.as_deref(), Some("MKV"));
+        assert_eq!(metadata.audio_tracks.len(), 1);
+        assert_eq!(
+            metadata.audio_tracks[0].channel_layout.as_deref(),
+            Some("5.1")
+        );
+        assert_eq!(metadata.subtitle_tracks.len(), 1);
     }
 }

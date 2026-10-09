@@ -54,6 +54,32 @@ function test(name, fn) {
 const queueProps = {
   onCancelAll() {}, onCancelItem() {}, onPauseItem() {}, onResumeItem() {}, onRetryItem() {},
 };
+
+test('isolated real Telegram QA keeps API hash ephemeral when secure storage is unavailable', () => {
+  const authUi = fs.readFileSync(path.join(root, 'app/src/components/shared/AuthWizard.tsx'), 'utf8');
+  const authRust = fs.readFileSync(path.join(root, 'app/src-tauri/src/commands/auth.rs'), 'utf8');
+  assert.ok(authUi.includes("VITE_TERA_REAL_E2E_QA"), 'QA-only real Telegram login gate is missing');
+  assert.ok(authUi.includes("cmd_auth_request_code_ephemeral"), 'QA login does not use the ephemeral backend command');
+  assert.ok(authUi.includes("!secureStoreAvailable && !qaEphemeralCredentialsAllowed"), 'Production keyring requirement was weakened instead of adding a QA-only exception');
+  assert.ok(authRust.includes("cmd_auth_request_code_ephemeral"), 'Ephemeral backend command is missing');
+  assert.match(authRust, /request_login_code_inner\([\s\S]*?false\)\.await/, 'Ephemeral login must not persist the API hash');
+});
+
+test('isolated real Telegram QA can prime TDLib credentials without logging out', () => {
+  const fastUi = fs.readFileSync(path.join(root, 'app/src/context/FastTransferAuthContext.tsx'), 'utf8');
+  const tdlib = fs.readFileSync(path.join(root, 'app/src-tauri/src/tdlib_fast.rs'), 'utf8');
+  assert.ok(fastUi.includes("VITE_TERA_REAL_E2E_QA"), 'TDLib QA credential recovery is not gated to real-E2E dev mode');
+  assert.ok(fastUi.includes("cmd_fast_transfer_prepare_qa_credentials"), 'TDLib cannot accept a one-time QA API hash from the active session');
+  assert.ok(fastUi.includes("api_hash"), 'TDLib QA modal has no API-hash-only step');
+  assert.ok(tdlib.includes("save_qa_kernel_api_credentials"), 'TDLib QA credentials are not persisted in the kernel keyring');
+});
+
+test('Telegram API_ID_INVALID returns the auth wizard to API credentials', () => {
+  const authUi = fs.readFileSync(path.join(root, 'app/src/components/shared/AuthWizard.tsx'), 'utf8');
+  assert.ok(authUi.includes("message.includes('API_ID_INVALID')"), 'API_ID_INVALID is not handled explicitly');
+  assert.ok(authUi.includes("setStep('setup')"), 'Invalid API credentials do not return to setup');
+  assert.ok(authUi.includes('Telegram rejected this API ID / API Hash pair.'), 'Invalid API credentials lack a clear user-facing message');
+});
 for (const [name, bytesKey, status] of [['UploadQueue', 'uploadedBytes', 'uploading'], ['DownloadQueue', 'downloadedBytes', 'downloading']]) {
   test(name + ' does not present missing throughput updates as stopped transfer', () => {
     const component = load(path.join(root, 'app/src/components/desktop/dashboard/' + name + '.tsx'))[name];
@@ -401,6 +427,256 @@ test('compatibility conversion releases the original network source before start
   start();
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(state.error?.includes('fixture backend conversion failure'));
+});
+
+test('version files expose explicit Add version and Manage versions actions', () => {
+  const menuLoad = loader({
+    'react-i18next': { useTranslation: () => ({ t: key => key }) },
+  });
+  const { ContextMenu } = menuLoad(path.join(root, 'app/src/components/desktop/dashboard/ContextMenu.tsx'));
+  const noop = () => {};
+  const base = {
+    x: 10, y: 10, onClose: noop, onDownload: noop, onDelete: noop,
+    onPreview: noop, onRename: noop, onMove: noop, onAddVersion: noop,
+    onManageVersions: noop, folders: [], activeFolderId: 7,
+  };
+  const plain = renderToStaticMarkup(React.createElement(ContextMenu, {
+    ...base,
+    file: {
+      id: 1, name: 'movie-1080p.mkv', size: 100, sizeStr: '100 B',
+      type: 'file', folder_id: 7, logical_file_id: '1'.repeat(32),
+    },
+  }));
+  assert.ok(plain.includes('Add version'), 'Unstacked logical file is missing Add version');
+  assert.ok(!plain.includes('Manage versions'), 'Unstacked file unexpectedly shows Manage versions');
+
+  const stacked = renderToStaticMarkup(React.createElement(ContextMenu, {
+    ...base,
+    file: {
+      id: 2, name: 'movie-4k.mkv', size: 200, sizeStr: '200 B',
+      type: 'file', folder_id: 7, logical_file_id: '2'.repeat(32),
+      stack_id: 'a'.repeat(32), stack_name: 'Movie', stack_version_count: 2,
+    },
+  }));
+  for (const label of ['Add version', 'Manage versions', 'Move stack', 'Rename stack', 'Delete / unstack']) {
+    assert.ok(stacked.includes(label), 'Stack context menu is missing: ' + label);
+  }
+});
+
+test('Add version UI offers upload-new and existing-file flows without drag stacking', () => {
+  const modalLoad = loader({
+    '../../../context/ConfirmContext': { useConfirm: () => ({ confirm: async () => true }) },
+    '../../../hooks/useEscapeToClose': { useEscapeToClose() {} },
+  });
+  const { VersionStackModal } = modalLoad(path.join(root, 'app/src/components/desktop/dashboard/VersionStackModal.tsx'));
+  const noop = () => {};
+  const html = renderToStaticMarkup(React.createElement(VersionStackModal, {
+    file: {
+      id: 1, name: 'movie-1080p.mkv', size: 100, sizeStr: '100 B',
+      type: 'file', folder_id: 7, logical_file_id: '1'.repeat(32),
+    },
+    allFiles: [{
+      id: 1, name: 'movie-1080p.mkv', size: 100, sizeStr: '100 B',
+      type: 'file', folder_id: 7, logical_file_id: '1'.repeat(32),
+    }],
+    folderId: 7, initialMode: 'add', readOnly: false,
+    onClose: noop, onChanged: noop, onUploadNew: noop, onPreview: noop,
+    onDownload: noop, onDownloadAll: noop,
+  }));
+  assert.ok(html.includes('Upload new version'), 'Upload-new version action missing');
+  assert.ok(html.includes('Use existing TeraRelay file'), 'Existing-file version action missing');
+  assert.ok(html.includes('Make added file primary'), 'Explicit primary choice missing');
+  assert.ok(!html.includes('Drag one file'), 'Version creation regressed to drag-first UX');
+});
+
+test('expanded version stacks are not collapsed by automatic feed rerenders', () => {
+  const feed = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'), 'utf8');
+  const grouped = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/StackedFileRow.tsx'), 'utf8');
+
+  assert.ok(feed.includes('expandedStackIds'), 'Channel feed does not own stack expansion state across row remounts');
+  assert.ok(feed.includes('expanded={expandedStackIds.has(file.stack_id)}'), 'Stack row is not restored from the feed-level expansion state');
+  assert.ok(feed.includes('onExpandedChange='), 'Stack row cannot report an explicit user expand/collapse choice');
+  assert.ok(!grouped.includes('const [expanded, setExpanded] = useState(false)'), 'Stack row still resets itself to collapsed whenever it remounts');
+});
+
+test('stacked files use one expandable group without decorative version badges', () => {
+  const feed = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'), 'utf8');
+  const grouped = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/StackedFileRow.tsx'), 'utf8');
+  const grid = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/FileCard.tsx'), 'utf8');
+  const list = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/FileListItem.tsx'), 'utf8');
+  const mobile = fs.readFileSync(path.join(root, 'app/src/components/mobile/TouchFileList.tsx'), 'utf8');
+  const modal = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/VersionStackModal.tsx'), 'utf8');
+
+  assert.ok(feed.includes('<StackedFileRow'), 'Channel feed does not route stacked files into the grouped card');
+  assert.ok(feed.includes('file.stack_id && (file.stack_version_count ?? 0) > 1'), 'Grouped-card routing lost the stable stack guard');
+  assert.ok(grouped.includes("invoke<FileStackView>('cmd_get_file_stack'"), 'Grouped card does not load the existing stack manifest');
+  assert.ok(grouped.includes('tr-version-group__body'), 'Grouped card has no contained expanded body');
+  assert.ok(grouped.includes('ChevronDown') && grouped.includes('ChevronRight'), 'Grouped card lost its quiet expand/collapse control');
+  const parentMarkup = grouped.split('{expanded && (')[0];
+  assert.ok(!parentMarkup.includes('<PremiumFileThumbnail'), 'Group parent must not duplicate a member thumbnail');
+  assert.ok(!parentMarkup.includes('formatBytes(file.size)'), 'Group parent must not duplicate member size metadata');
+  assert.ok(!parentMarkup.includes('getPremiumFileMeta(file)'), 'Group parent must not duplicate member quality metadata');
+  assert.ok(parentMarkup.includes('onDownloadAll(current.members.map(member => member.file))'), 'Group download must reuse the existing bulk-download path');
+  assert.ok(parentMarkup.includes('Download all files in'), 'Group download action should be explicit without adding visible labels');
+
+  for (const [name, source] of [['grid', grid], ['list', list], ['mobile', mobile]]) {
+    assert.ok(!source.includes('stack_version_count'), name + ' view reintroduced a rendered stack-count badge');
+  }
+  assert.ok(!modal.includes('<Crown'), 'Stack manager reintroduced the crown decoration');
+  assert.ok(!/>\s*Primary\s*</.test(modal), 'Stack manager reintroduced a visible PRIMARY badge');
+  assert.ok(!modal.includes('Timeline anchor'), 'Stack manager exposed the internal timeline-anchor label');
+});
+
+test('auto-created technical stack names are presented as clean content titles', () => {
+  const { getPremiumFileTitle } = load(path.join(root, 'app/src/filePresentation.ts'));
+  assert.equal(
+    getPremiumFileTitle({
+      id: 1,
+      name: 'Interstellar.1080p.BluRay.mkv',
+      stack_name: 'Interstellar.1080p.BluRay.mkv',
+      size: 1,
+      sizeStr: '1 B',
+      type: 'file',
+    }),
+    'Interstellar',
+  );
+  assert.equal(
+    getPremiumFileTitle({
+      id: 2,
+      name: 'Interstellar.1080p.BluRay.mkv',
+      stack_name: 'Director Cut',
+      size: 1,
+      sizeStr: '1 B',
+      type: 'file',
+    }),
+    'Director Cut',
+    'Deliberate custom stack names must stay untouched',
+  );
+});
+
+test('rich media metadata stays on-demand and enriches cached file rows', () => {
+  const details = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/MediaDetailsPanel.tsx'), 'utf8');
+  const hook = fs.readFileSync(path.join(root, 'app/src/hooks/useRichMediaMetadata.ts'), 'utf8');
+  const cachedRow = fs.readFileSync(path.join(root, 'app/src/components/shared/RichFileMetaText.tsx'), 'utf8');
+  const feed = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'), 'utf8');
+  const grouped = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/StackedFileRow.tsx'), 'utf8');
+  const menu = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ContextMenu.tsx'), 'utf8');
+
+  assert.ok(details.includes("useRichMediaMetadata("), 'File-details panel does not load rich media metadata');
+  for (const label of ['Resolution', 'Dynamic range', 'Codec', 'Container', 'Duration', 'Audio', 'Subtitles', 'Channel']) {
+    assert.ok(details.includes(label), 'File-details panel is missing ' + label);
+  }
+  assert.ok(hook.includes("enabled: eligible && enabled"), 'Metadata hook no longer has an explicit on-demand gate');
+  assert.ok(cachedRow.includes("useRichMediaMetadata(file.id, folderId, file.name, false)"), 'File rows can trigger media probing instead of reading cache only');
+  assert.ok(feed.includes('<RichFileMetaText'), 'Channel rows do not consume cached rich metadata');
+  assert.ok(grouped.includes('<RichFileMetaText'), 'Stack member rows do not consume cached rich metadata');
+  assert.ok(menu.includes('File details'), 'Context menu is missing File details');
+  assert.ok(menu.includes("!file.stack_id && onDetails"), 'Group parent incorrectly exposes member-level file details');
+});
+
+test('rich media presentation keeps the main list compact', () => {
+  const { getRichFileMeta, formatCompactMediaDuration, formatVideoCodec } = load(path.join(root, 'app/src/filePresentation.ts'));
+  const file = {
+    id: 1,
+    name: 'Interstellar.2160p.HDR.mkv',
+    size: 4300000000,
+    sizeStr: '4.3 GB',
+    type: 'file',
+  };
+  const metadata = {
+    duration_secs: 10140,
+    width: 3840,
+    height: 2160,
+    video_codec: 'hevc',
+    video_profile: 'Main 10',
+    pixel_format: 'yuv420p10le',
+    dynamic_range: 'HDR10',
+    container: 'MKV',
+    audio_tracks: [],
+    subtitle_tracks: [],
+  };
+  assert.equal(formatCompactMediaDuration(metadata.duration_secs), '2h 49m');
+  assert.equal(formatVideoCodec(metadata.video_codec), 'HEVC');
+  assert.equal(getRichFileMeta(file, metadata), '4K · HDR · HEVC · 2h 49m');
+  assert.ok(getRichFileMeta(file, metadata).split(' · ').length <= 4, 'Main-list metadata became cluttered');
+});
+
+test('duplicate detection is byte-verified and filename-only matches cannot become duplicates', () => {
+  const backend = fs.readFileSync(path.join(root, 'app/src-tauri/src/commands/fs.rs'), 'utf8');
+  const transfers = fs.readFileSync(path.join(root, 'app/src-tauri/src/commands/transfers.rs'), 'utf8');
+  const upload = fs.readFileSync(path.join(root, 'app/src/hooks/useFileUpload.ts'), 'utf8');
+  const dialog = fs.readFileSync(path.join(root, 'app/src/context/UploadSuggestionContext.tsx'), 'utf8');
+
+  assert.ok(transfers.includes('hash_file_range(path, 0, before.size)'), 'Preflight does not hash the complete source file');
+  assert.ok(transfers.includes('if before != after'), 'Preflight does not reject a source that changed while hashing');
+  assert.ok(backend.includes('existing_size == size') && backend.includes('whole_sha256.as_deref() == Some(source_sha256.as_str())'), 'Exact duplicate classification is not guarded by size + whole-file SHA-256');
+  assert.ok(backend.includes('whole_sha256.as_deref() != Some(source_sha256.as_str())'), 'Version suggestions do not require different verified content hashes');
+  assert.ok(backend.includes('whole_sha256: whole_sha256.clone()'), 'Uploaded logical manifests do not persist the whole-file hash');
+  assert.ok(upload.includes("cmd_preflight_upload_candidate"), 'Normal upload path does not run duplicate/version preflight');
+  assert.ok(upload.includes("sourceSha256: preflight.source_sha256"), 'Verified preflight hash is not persisted with the recoverable upload');
+  assert.ok(dialog.includes('Skip duplicate') && dialog.includes('Upload anyway'), 'Exact-duplicate decision UI is incomplete');
+  assert.ok(dialog.includes('Add as version') && dialog.includes('Keep separate') && dialog.includes('Cancel'), 'Possible-version decision UI is incomplete');
+  assert.ok(dialog.includes('calculated from every byte'), 'UI does not explain the byte-verified duplicate check');
+});
+
+test('TDLib saved-session restore waits up to one minute before giving up', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/context/FastTransferAuthContext.tsx'), 'utf8');
+  assert.ok(source.includes('60_000'), 'TDLib restore window is shorter than the real saved-session settle time');
+  assert.ok(source.includes('1_000'), 'TDLib restore polling is not paced at about one second');
+  assert.ok(source.includes('Date.now() < restoreDeadline'), 'TDLib restore is not bounded by a real deadline');
+});
+
+test('global error toasts expose a manual dismiss button', () => {
+  const app = fs.readFileSync(path.join(root, 'app/src/App.tsx'), 'utf8');
+  assert.ok(/<Toaster[^>]*closeButton/.test(app), 'Sonner toasts do not expose the global close button');
+});
+
+test('failed and completed transfer cards can be dismissed manually', () => {
+  const upload = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'), 'utf8');
+  const download = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/DownloadQueue.tsx'), 'utf8');
+  const dashboard = fs.readFileSync(path.join(root, 'app/src/components/desktop/DesktopDashboard.tsx'), 'utf8');
+  const uploadHook = fs.readFileSync(path.join(root, 'app/src/hooks/useFileUpload.ts'), 'utf8');
+  const downloadHook = fs.readFileSync(path.join(root, 'app/src/hooks/useFileDownload.ts'), 'utf8');
+  for (const [name, source] of [['upload queue', upload], ['download queue', download]]) {
+    assert.ok(source.includes('onDismissItem'), name + ' has no dismiss callback');
+    assert.ok(source.includes('title="Dismiss"'), name + ' has no visible dismiss button');
+    assert.ok(source.includes("item.status === 'success'"), name + ' cannot dismiss completed items');
+  }
+  assert.ok(dashboard.includes('onDismissItem={dismissUploadItem}'), 'Upload dismiss is not wired to the dashboard');
+  assert.ok(dashboard.includes('onDismissItem={dismissDownloadItem}'), 'Download dismiss is not wired to the dashboard');
+  assert.ok(uploadHook.includes('const dismissItem ='), 'Upload queue cannot remove terminal items durably');
+  assert.ok(downloadHook.includes('const dismissItem ='), 'Download queue cannot remove terminal items durably');
+});
+
+test('channel feed keeps compact rows while grouping uploads by day', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'), 'utf8');
+  assert.ok(source.includes('formatChannelDay'), 'Channel feed has no upload-day formatter');
+  assert.ok(source.includes('tr-channel-day-divider'), 'Channel feed has no visible day grouping divider');
+  assert.ok(source.includes("return 'Today'") && source.includes("return 'Yesterday'"), 'Recent upload dates are not human-friendly');
+  assert.ok(!source.includes('flex justify-center py-2'), 'Bulky centered date chips were reintroduced');
+});
+
+test('transfer chooser exposes only TeraRelay Boost and TDLib C++', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/context/TransferMethodContext.tsx'), 'utf8');
+  assert.ok(source.includes('TeraRelay Boost'), 'Boost choice missing');
+  assert.ok(source.includes('TDLib / C++'), 'TDLib choice missing');
+  assert.ok(!source.includes('Automatic — Recommended') && !source.includes("finish('automatic')"), 'Automatic engine must not exist in V1');
+});
+
+test('Feature A version upload remains independent from Feature B chooser', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useFileUpload.ts'), 'utf8');
+  const ast = ts.createSourceFile('useFileUpload.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let body = '';
+  function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'handleVersionUpload') {
+      body = node.initializer?.getText(ast) || '';
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.ok(body, 'handleVersionUpload was not found');
+  assert.ok(!body.includes('chooseTransferMethod'), 'Feature B chooser leaked into Feature A version upload');
+  assert.ok(!body.includes('transferEngine'), 'Feature A version upload changed its transfer contract');
 });
 
 if (process.argv.includes('--fixture')) {

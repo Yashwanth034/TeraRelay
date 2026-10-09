@@ -7,6 +7,7 @@ import { DownloadItem, TelegramFile } from '../types';
 import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback, sanitizeFilename } from '../utils';
 import { useSettings } from '../context/SettingsContext';
 import { useFastTransferAuth } from '../context/FastTransferAuthContext';
+import { useTransferMethod } from '../context/TransferMethodContext';
 import type { Store } from '@tauri-apps/plugin-store';
 import { normalizeDownloadQueue, useRecoverableTransferQueue } from '../transferQueue';
 
@@ -19,6 +20,11 @@ interface ProgressPayload {
 }
 
 export function useFileDownload(store: Store | null) {
+    // App.tsx sets this runtime flag only after Vite confirms an explicit
+    // dev-only Feature A QA build. Undefined is always treated as production.
+    const qaFeatureATest =
+        (globalThis as typeof globalThis & { __TERARELAY_QA_FEATURE_A__?: boolean })
+            .__TERARELAY_QA_FEATURE_A__ === true;
     const { queue: downloadQueue, setQueue: setDownloadQueue, queueRef, initialized, durable, persist } =
         useRecoverableTransferQueue('download', store, normalizeDownloadQueue);
     const cancelledRef = useRef<Set<string>>(new Set());
@@ -26,6 +32,7 @@ export function useFileDownload(store: Store | null) {
     const activeIdsRef = useRef<Set<string>>(new Set());
     const { settings } = useSettings();
     const { ensureFastTransferReady } = useFastTransferAuth();
+    const { chooseTransferMethod } = useTransferMethod();
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -91,8 +98,13 @@ export function useFileDownload(store: Store | null) {
                 // Destination must survive reopening before TDLib receives any work.
                 await persist();
             }
-            const ready = await ensureFastTransferReady();
-            if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
+            const transferEngine = item.transferEngine;
+            // Legacy queue items carry no explicit engine and retain the old
+            // readiness + backend platform-selection behavior.
+            if (transferEngine !== 'boost' && !qaFeatureATest) {
+                const ready = await ensureFastTransferReady();
+                if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
+            }
             if (cancelledRef.current.has(item.id) || pausedRef.current.has(item.id)) {
                 throw new Error('Transfer cancelled');
             }
@@ -102,7 +114,8 @@ export function useFileDownload(store: Store | null) {
                     message_id: item.messageId,
                     save_path: savePath,
                     folder_id: item.folderId,
-                    transfer_id: item.id
+                    transfer_id: item.id,
+                    transfer_engine: transferEngine
                 }
             });
             completed = true;
@@ -155,18 +168,24 @@ export function useFileDownload(store: Store | null) {
         }
     };
 
-    const queueDownload = (messageId: number, filename: string, folderId: number | null) => {
+    const queueDownload = async (messageId: number, filename: string, folderId: number | null) => {
+        const transferEngine = await chooseTransferMethod('download');
+        if (!transferEngine) return;
         const newItem: DownloadItem = {
             id: Math.random().toString(36).substr(2, 9),
             messageId,
             filename: sanitizeFilename(filename),
             folderId,
+            transferEngine,
             status: 'pending'
         };
         setDownloadQueue(prev => [...prev, newItem]);
     };
 
     const queueBulkDownload = async (files: TelegramFile[], folderId: number | null) => {
+        const transferEngine = await chooseTransferMethod('download');
+        if (!transferEngine) return;
+
         // Mobile platforms do not support a directory picker here.
         // Resolve each destination up front, sequentially, so queue workers never
         // open overlapping native save dialogs.
@@ -182,6 +201,7 @@ export function useFileDownload(store: Store | null) {
                     filename,
                     folderId,
                     savePath,
+                    transferEngine,
                     status: 'pending' as const,
                 });
             }
@@ -201,6 +221,7 @@ export function useFileDownload(store: Store | null) {
                     messageId: file.id,
                     filename: sanitizedName,
                     folderId,
+                    transferEngine,
                     status: 'pending' as const,
                     savePath: dir.endsWith(separator) ? `${dir}${sanitizedName}` : `${dir}${separator}${sanitizedName}`
                 };
@@ -312,6 +333,17 @@ export function useFileDownload(store: Store | null) {
         ));
     };
 
+    const dismissItem = (id: string) => {
+        const item = queueRef.current.find(i => i.id === id);
+        if (!item || !['success', 'error', 'cancelled'].includes(item.status)) return;
+        const next = queueRef.current.filter(i => i.id !== id);
+        setDownloadQueue(next);
+        void persist(next).catch(error => {
+            setDownloadQueue(current => current.some(i => i.id === id) ? current : [...current, item]);
+            toast.error(`Could not dismiss download: ${error}`);
+        });
+    };
+
     return {
         downloadQueue,
         queueDownload,
@@ -322,5 +354,6 @@ export function useFileDownload(store: Store | null) {
         pauseItem,
         resumeItem,
         retryItem,
+        dismissItem,
     };
 }

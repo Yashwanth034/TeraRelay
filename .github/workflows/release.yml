@@ -81,42 +81,42 @@ jobs:
           import json
           import os
 
-          include = [{
-              "name": "Linux x64",
-              "platform": "ubuntu-22.04",
-              "helper_target": "linux-x64",
-              "rust_target": "x86_64-unknown-linux-gnu",
-              "args": "",
-          }]
-          if os.environ["WINDOWS_READY"] == "true":
-              include.append({
+          windows_ready = os.environ["WINDOWS_READY"] == "true"
+          macos_ready = os.environ["MACOS_READY"] == "true"
+          include = [
+              {
+                  "name": "Linux x64",
+                  "platform": "ubuntu-22.04",
+                  "helper_target": "linux-x64",
+                  "rust_target": "x86_64-unknown-linux-gnu",
+                  "args": "",
+              },
+              {
                   "name": "Windows x64",
                   "platform": "windows-latest",
                   "helper_target": "windows-x64",
                   "rust_target": "x86_64-pc-windows-msvc",
-                  "args": "--config src-tauri/tauri.windows-signing.conf.json",
-              })
-          if os.environ["MACOS_READY"] == "true":
-              include.extend([
-                  {
-                      "name": "macOS Apple Silicon",
-                      "platform": "macos-latest",
-                      "helper_target": "macos-arm64",
-                      "rust_target": "aarch64-apple-darwin",
-                      "swift_triple": "arm64-apple-macosx12.0",
-                      "macos_arch": "arm64",
-                      "args": "--config src-tauri/tauri.macos-signing.conf.json --target aarch64-apple-darwin",
-                  },
-                  {
-                      "name": "macOS Intel",
-                      "platform": "macos-latest",
-                      "helper_target": "macos-x64",
-                      "rust_target": "x86_64-apple-darwin",
-                      "swift_triple": "x86_64-apple-macosx12.0",
-                      "macos_arch": "x86_64",
-                      "args": "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin",
-                  },
-              ])
+                  "args": "--config src-tauri/tauri.windows-signing.conf.json" if windows_ready else "",
+              },
+              {
+                  "name": "macOS Apple Silicon",
+                  "platform": "macos-latest",
+                  "helper_target": "macos-arm64",
+                  "rust_target": "aarch64-apple-darwin",
+                  "swift_triple": "arm64-apple-macosx12.0",
+                  "macos_arch": "arm64",
+                  "args": "--config src-tauri/tauri.macos-signing.conf.json --target aarch64-apple-darwin" if macos_ready else "--target aarch64-apple-darwin",
+              },
+              {
+                  "name": "macOS Intel",
+                  "platform": "macos-latest",
+                  "helper_target": "macos-x64",
+                  "rust_target": "x86_64-apple-darwin",
+                  "swift_triple": "x86_64-apple-macosx12.0",
+                  "macos_arch": "x86_64",
+                  "args": "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin" if macos_ready else "--target x86_64-apple-darwin",
+              },
+          ]
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
           )"
@@ -191,7 +191,7 @@ jobs:
         run: node scripts/test-native-drive-platforms.cjs
 
       - name: Configure Windows code signing
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && needs.release-capabilities.outputs.windows_ready == 'true'
         shell: pwsh
         working-directory: app
         env:
@@ -217,7 +217,7 @@ jobs:
           Set-Content -Path 'src-tauri/tauri.windows-signing.conf.json' -Value $config -Encoding utf8
 
       - name: Require macOS Developer ID and notarization credentials
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -240,7 +240,7 @@ jobs:
           test -n "$MACOS_FILE_PROVIDER_PROVISION_PROFILE"
 
       - name: Import macOS Developer ID certificate
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -262,7 +262,7 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
 
       - name: Prepare and validate macOS File Provider provisioning
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -317,8 +317,13 @@ jobs:
         shell: bash
         run: cargo check --manifest-path app/src-tauri/Cargo.toml --target "${{ matrix.rust_target }}"
 
+      - name: Configure unsigned macOS fallback
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready != 'true'
+        shell: bash
+        run: echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+
       - name: Compile and sign macOS native Drive provider
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
@@ -358,7 +363,7 @@ jobs:
           args: ${{ matrix.args }}
 
       - name: Verify bundled macOS File Provider and signatures
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -393,7 +398,7 @@ jobs:
           PY
 
       - name: Verify Windows Authenticode signatures
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && needs.release-capabilities.outputs.windows_ready == 'true'
         shell: pwsh
         working-directory: app
         run: |
@@ -629,6 +634,64 @@ jobs:
             ${{ env.ANDROID_RELEASE_DIR }}/*.aab
             ${{ env.ANDROID_RELEASE_DIR }}/mobile-latest.json
             ${{ env.ANDROID_RELEASE_DIR }}/mobile-latest.json.sig
+
+  ios-simulator:
+    name: iOS simulator release validation
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate release tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: ios-simulator-release
+
+      - name: Ensure CocoaPods is available
+        run: command -v pod >/dev/null || brew install cocoapods
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Initialize iOS native project
+        run: npm run tauri -- ios init --ci
+
+      - name: Work around Xcode 26 MetalToolchain linker regression
+        shell: bash
+        run: |
+          xcodebuild -showComponent MetalToolchain || true
+          xcodebuild -deleteComponent MetalToolchain || true
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+
+      - name: Build iOS simulator application
+        run: npm run tauri -- ios build --target aarch64-sim --ci
+
+      - name: Upload iOS simulator output
+        uses: actions/upload-artifact@v7
+        with:
+          name: terarelay-ios-simulator
+          if-no-files-found: error
+          path: app/src-tauri/gen/apple/build/**/*
 
   ios-release:
     name: iOS App Store Connect release

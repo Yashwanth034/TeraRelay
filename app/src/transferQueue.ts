@@ -111,6 +111,12 @@ export const normalizeUploadQueue: Normalize<QueueItem> = items => items.filter(
     sourceIdentity: item.sourceIdentity,
     drivePendingId: item.drivePendingId,
     driveFileName: item.driveFileName,
+    uploadName: item.uploadName,
+    remoteImportJobId: item.remoteImportJobId,
+    remoteImportSelectionId: item.remoteImportSelectionId,
+    remoteImportLabel: item.remoteImportLabel,
+    remoteImportHeight: item.remoteImportHeight,
+    remoteImportLogicalFileId: item.remoteImportLogicalFileId,
     status: savedStatus(item),
     ...(['error', 'paused', 'pausing'].includes(item.status) && item.error !== undefined ? { error: item.error } : {}),
 }));

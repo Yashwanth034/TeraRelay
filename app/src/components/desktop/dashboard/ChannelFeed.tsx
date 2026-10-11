@@ -103,7 +103,7 @@ export function ChannelFeed({
     readOnly = false,
 }: ChannelFeedProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
-    const [expandedStackIds, setExpandedStackIds] = useState<Set<string>>(() => new Set());
+    const [collapsedStackIds, setCollapsedStackIds] = useState<Set<string>>(() => new Set());
 
     const orderedFiles = useMemo(
         () => [...files].sort((a, b) => {
@@ -196,12 +196,12 @@ export function ChannelFeed({
                                         <StackedFileRow
                                             file={file}
                                             folderId={activeFolderId}
-                                            expanded={expandedStackIds.has(file.stack_id)}
+                                            expanded={!collapsedStackIds.has(file.stack_id)}
                                             onExpandedChange={(nextExpanded) => {
-                                                setExpandedStackIds(current => {
+                                                setCollapsedStackIds(current => {
                                                     const next = new Set(current);
-                                                    if (nextExpanded) next.add(file.stack_id!);
-                                                    else next.delete(file.stack_id!);
+                                                    if (nextExpanded) next.delete(file.stack_id!);
+                                                    else next.add(file.stack_id!);
                                                     return next;
                                                 });
                                             }}

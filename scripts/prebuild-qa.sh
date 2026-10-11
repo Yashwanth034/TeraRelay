@@ -8,6 +8,10 @@ echo "== TeraRelay prebuild QA =="
 
 ./scripts/test-transfer-ui.sh
 node scripts/test-focused-ui.cjs
+node scripts/test-app-updater.cjs
+node scripts/test-android-updater-config.cjs
+node scripts/test-release-updater.cjs
+node scripts/test-native-drive-platforms.cjs
 node scripts/test-playback-seeking.cjs
 node scripts/test-transfer-recovery.cjs
 python3 scripts/test-upload-progress.py

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>TeraRelay</string>
+  <key>CFBundleExecutable</key>
+  <string>TeraRelayFileProvider</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.terarelay.desktop.FileProvider</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>TeraRelayFileProvider</string>
+  <key>CFBundlePackageType</key>
+  <string>XPC!</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.1</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleIcons</key>
+  <dict>
+    <key>CFBundlePrimaryIcon</key>
+    <dict>
+      <key>CFBundleSymbolName</key>
+      <string>externaldrive.fill.badge.icloud</string>
+    </dict>
+  </dict>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionFileProviderDocumentGroup</key>
+    <string>group.io.terarelay.drive</string>
+    <key>NSExtensionFileProviderSupportsEnumeration</key>
+    <true/>
+    <key>NSExtensionPointIdentifier</key>
+    <string>com.apple.fileprovider-nonui</string>
+    <key>NSExtensionPrincipalClass</key>
+    <string>TeraRelayFileProvider.TeraRelayFileProviderExtension</string>
+  </dict>
+</dict>
+</plist>

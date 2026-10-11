@@ -1,10 +1,13 @@
-import React, { useState, useEffect, Suspense } from "react";
+import React, { useState, useEffect, useRef, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AuthWizard } from "./components/shared/AuthWizard";
+import { DriveContinuityUnlock } from "./components/shared/DriveContinuityUnlock";
+import { AppUpdatePrompt } from "./components/shared/AppUpdatePrompt";
 import { ErrorBoundary } from "./components/shared/ErrorBoundary";
 import { TeraRelayBrand } from "./components/shared/TeraRelayBrand";
+import { useDeviceContinuity } from "./hooks/useDeviceContinuity";
 import { usePlatform } from "./hooks/usePlatform";
 import "./App.css";
 
@@ -14,10 +17,11 @@ const DesktopDashboard = React.lazy(() => import("./components/desktop/DesktopDa
 // variables prevent Vite from resolving the module at build time.
 const MobileDashboard = React.lazy(() => import("./components/mobile/MobileDashboard.tsx"));
 
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 import { ConfirmProvider } from "./context/ConfirmContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
+import { AppUpdateProvider } from "./context/AppUpdateContext";
 import { useSettings } from "./context/SettingsContext";
 import { FastTransferAuthProvider } from "./context/FastTransferAuthContext";
 import { TransferMethodProvider } from "./context/TransferMethodContext";
@@ -34,6 +38,15 @@ function AppContent() {
   const { isMobile } = usePlatform();
   const { settings, updateSetting, isLoaded } = useSettings();
   const { i18n } = useTranslation();
+  const { state: continuity, markDriveUnlocked } = useDeviceContinuity({
+    authenticated: authStatus === "authenticated",
+    authResolved: authStatus !== "loading",
+    isMobile,
+  });
+  const [continuityUnlockDismissed, setContinuityUnlockDismissed] = useState(false);
+  const continuityRestoreNotifiedRef = useRef(false);
+  const continuityWarningNotifiedRef = useRef(false);
+  const continuitySecurityNotifiedRef = useRef(false);
 
   // Handle active language and RTL direction changes
   useEffect(() => {
@@ -129,59 +142,48 @@ function AppContent() {
     checkSession();
   }, []);
 
-  // On Linux desktop, expose the same TeraRelay data as a normal user-space
-  // filesystem. Mounting is independent from remote metadata sync so cached
-  // files/folders remain browsable during a temporary Telegram outage.
   useEffect(() => {
-    if (authStatus !== "authenticated" || isMobile) return;
+    if (authStatus !== "authenticated") {
+      setContinuityUnlockDismissed(false);
+      continuityRestoreNotifiedRef.current = false;
+      continuityWarningNotifiedRef.current = false;
+      continuitySecurityNotifiedRef.current = false;
+      return;
+    }
 
-    let disposed = false;
-    let syncTimer: number | undefined;
+    if (continuity.restoredFromRemote && !continuityRestoreNotifiedRef.current) {
+      continuityRestoreNotifiedRef.current = true;
+      const restoredItems = continuity.directoryCount + continuity.fileCount;
+      const detail = restoredItems > 0
+        ? `${continuity.directoryCount} folder${continuity.directoryCount === 1 ? '' : 's'} and ${continuity.fileCount} file${continuity.fileCount === 1 ? '' : 's'}`
+        : 'your existing TeraRelay cloud state';
+      toast.success(`TeraRelay restored ${detail} from Telegram`);
+    }
 
-    const syncDrive = async () => {
-      try {
-        // A release marks a pending Drive file closed before its final remote
-        // manifest is published. If the app crashed in that narrow window,
-        // resume the bounded chunk finalization once Telegram is authenticated.
-        await invoke("cmd_drive_recover_pending");
-      } catch (error) {
-        if (!disposed) {
-          console.warn("[Drive] Pending write recovery deferred:", error);
-        }
-      }
-      try {
-        await invoke("cmd_drive_sync_metadata");
-      } catch (error) {
-        if (!disposed) {
-          console.warn("[Drive] Metadata sync deferred:", error);
-        }
-      }
-    };
+    if (continuity.securityError && !continuitySecurityNotifiedRef.current) {
+      continuitySecurityNotifiedRef.current = true;
+      toast.warning('TeraRelay cloud metadata is available, but secure Drive key storage could not be checked on this device. Encrypted Drive contents stay locked until secure storage is available.');
+    }
 
-    const startDrive = async () => {
-      try {
-        await invoke("cmd_drive_mount");
-      } catch (error) {
-        if (!disposed) {
-          console.warn("[Drive] Linux mount unavailable:", error);
-        }
-      }
-      await syncDrive();
-      if (!disposed) {
-        syncTimer = window.setInterval(() => {
-          void syncDrive();
-        }, 15_000);
-      }
-    };
-
-    void startDrive();
-
-    return () => {
-      disposed = true;
-      if (syncTimer !== undefined) window.clearInterval(syncTimer);
-      void invoke("cmd_drive_unmount").catch(() => {});
-    };
-  }, [authStatus, isMobile]);
+    if (
+      continuity.phase === 'degraded'
+      && continuity.error
+      && continuity.directoryCount === 0
+      && continuity.fileCount === 0
+      && !continuityWarningNotifiedRef.current
+    ) {
+      continuityWarningNotifiedRef.current = true;
+      toast.warning('Could not restore TeraRelay cloud data yet. Nothing was changed; TeraRelay will retry automatically.');
+    }
+  }, [
+    authStatus,
+    continuity.phase,
+    continuity.error,
+    continuity.securityError,
+    continuity.restoredFromRemote,
+    continuity.directoryCount,
+    continuity.fileCount,
+  ]);
 
   // Clean up PDF preview cache files on close/beforeunload
   useEffect(() => {
@@ -212,6 +214,7 @@ function AppContent() {
   return (
     <main className="absolute inset-0 text-telegram-text overflow-hidden selection:bg-telegram-primary/30">
       <Toaster theme={theme} position="bottom-center" closeButton />
+      <AppUpdatePrompt />
       {authStatus === "authenticated" && (
         <Suspense fallback={
           <div className="h-screen w-screen flex flex-col items-center justify-center bg-telegram-bg">
@@ -229,6 +232,19 @@ function AppContent() {
           )}
         </Suspense>
       )}
+      {authStatus === "authenticated" && (
+        <DriveContinuityUnlock
+          open={continuity.needsDriveUnlock && !continuityUnlockDismissed}
+          restoredFromRemote={continuity.restoredFromRemote}
+          directoryCount={continuity.directoryCount}
+          fileCount={continuity.fileCount}
+          onUnlocked={() => {
+            markDriveUnlocked();
+            setContinuityUnlockDismissed(true);
+          }}
+          onDismiss={() => setContinuityUnlockDismissed(true)}
+        />
+      )}
       {authStatus === "unauthenticated" && (
         <AuthWizard onLogin={() => setAuthStatus("authenticated")} />
       )}
@@ -244,13 +260,15 @@ function App() {
         <QueryClientProvider client={queryClient}>
           <ConfirmProvider>
             <SettingsProvider>
-              <FastTransferAuthProvider>
-                <TransferMethodProvider>
-                  <UploadSuggestionProvider>
-                    <AppContent />
-                  </UploadSuggestionProvider>
-                </TransferMethodProvider>
-              </FastTransferAuthProvider>
+              <AppUpdateProvider>
+                <FastTransferAuthProvider>
+                  <TransferMethodProvider>
+                    <UploadSuggestionProvider>
+                      <AppContent />
+                    </UploadSuggestionProvider>
+                  </TransferMethodProvider>
+                </FastTransferAuthProvider>
+              </AppUpdateProvider>
             </SettingsProvider>
           </ConfirmProvider>
         </QueryClientProvider>

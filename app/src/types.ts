@@ -104,6 +104,15 @@ export interface QueueItem {
     drivePendingId?: string;
     /** Filename shown by the mounted drive; staging paths are intentionally opaque. */
     driveFileName?: string;
+    /** Optional filename override for staged/generated uploads whose local path is opaque. */
+    uploadName?: string;
+    /** Durable ownership metadata for a prepared Remote Import output. */
+    remoteImportJobId?: string;
+    remoteImportSelectionId?: string;
+    remoteImportLabel?: string | null;
+    remoteImportHeight?: number | null;
+    /** Stable logical file ID returned after a successful prepared import upload. */
+    remoteImportLogicalFileId?: string | null;
 }
 
 export interface FileStackMemberView {

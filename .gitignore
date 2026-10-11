@@ -14,6 +14,17 @@ app/src-tauri/tdlib-one-login-restart-proof-1MiB.bin
 app/src-tauri/tdlib-premium-check-1MiB.bin
 app/src-tauri/tdlib-native-actual-4GiB.bin
 
+# Local development continuity / scratch state
+.superpowers/
+app/src-tauri/.superpowers/
+NEXT_VERSION_PLAN.md
+
+# Remote Import helper payloads are generated from pinned hashes by
+# scripts/prepare-remote-import-engines.py (including in release CI).
+# Keep only the resource directory itself in source control.
+app/src-tauri/resources/remote-import/*
+!app/src-tauri/resources/remote-import/.gitkeep
+
 # Runtime/private data
 *.log
 *.session

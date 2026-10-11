@@ -40,6 +40,7 @@ pub struct TelegramState {
 }
 
 pub mod api_settings;
+pub mod app_update;
 pub mod archive;
 pub mod auth;
 pub mod drive_metadata;
@@ -51,6 +52,7 @@ pub mod logical_files;
 pub mod network;
 pub mod preview;
 pub mod qa_feature_a;
+pub mod remote_import;
 pub mod secure_credentials;
 pub mod settings;
 pub mod sharing;
@@ -61,6 +63,7 @@ pub mod utils;
 pub mod video_metadata;
 
 pub use api_settings::*;
+pub use app_update::*;
 pub use archive::*;
 pub use auth::*;
 pub use drive_metadata::*;
@@ -72,6 +75,7 @@ pub use logical_files::*;
 pub use network::*;
 pub use preview::*;
 pub use qa_feature_a::*;
+pub use remote_import::*;
 pub use secure_credentials::*;
 pub use settings::*;
 pub use sharing::*;

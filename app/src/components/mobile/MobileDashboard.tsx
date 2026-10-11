@@ -23,6 +23,7 @@ import { formatBytes, getFileCategory, isImageFile, copyToClipboard, type FileCa
 import { PreviewModal } from '../desktop/dashboard/PreviewModal';
 import { TelegramFile, TelegramFolder, BandwidthStats } from '../../types';
 import { useSettings } from '../../context/SettingsContext';
+import { useAppUpdate } from '../../context/AppUpdateContext';
 import { version as appVersion } from '../../../package.json';
 import { LANGUAGES } from '../../i18n/languages';
 import { useTranslation } from 'react-i18next';
@@ -34,6 +35,7 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const { isAndroid } = usePlatform();
   const { settings, updateSetting } = useSettings();
+  const { status: updateStatus, release: updateRelease, error: updateError, checkForUpdates } = useAppUpdate();
 
   // Sync proxy settings to backend whenever they change
   useEffect(() => {
@@ -637,6 +639,26 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
               <div className="flex flex-col items-center py-3 space-y-4">
                 <TeraRelayBrand size="lg" className="flex-col gap-2 text-center" />
                 <p className="text-[11px] text-telegram-subtext">v{appVersion}</p>
+
+                <div className="flex flex-col items-center gap-2">
+                  <button
+                    onClick={() => void checkForUpdates(true)}
+                    disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold bg-telegram-primary/10 text-telegram-primary border border-telegram-primary/20 active:scale-95 transition disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${updateStatus === 'checking' ? 'animate-spin' : ''}`} />
+                    {updateStatus === 'checking' ? t('settings.checking_for_updates') : t('settings.check_for_updates')}
+                  </button>
+                  {updateStatus === 'up-to-date' && (
+                    <p className="text-[10px] text-emerald-400">{t('settings.up_to_date')}</p>
+                  )}
+                  {updateRelease && (
+                    <p className="text-[10px] text-telegram-primary">{t('settings.update_available_version', { version: updateRelease.version })}</p>
+                  )}
+                  {updateStatus === 'error' && updateError && (
+                    <p className="text-[10px] text-red-400 text-center px-4">{updateError}</p>
+                  )}
+                </div>
 
                 <div className="w-10 h-px bg-telegram-border" />
 

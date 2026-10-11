@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { useSettings } from '../../../context/SettingsContext';
+import { useAppUpdate } from '../../../context/AppUpdateContext';
 import { useConfirm } from '../../../context/ConfirmContext';
 import { useTranslation } from 'react-i18next';
 import { LANGUAGES } from '../../../i18n/languages';
@@ -51,6 +52,7 @@ const SHOW_ADVANCED_SETTINGS = false;
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     useEscapeToClose(isOpen, onClose);
     const { settings, updateSetting, resetSettings } = useSettings();
+    const { status: updateStatus, release: updateRelease, error: updateError, checkForUpdates } = useAppUpdate();
     const { confirm } = useConfirm();
     const { t } = useTranslation();
     const [clearing, setClearing] = useState(false);
@@ -1912,6 +1914,26 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             <div className="text-center">
                                                 <h3 className="text-base font-bold text-telegram-text">TeraRelay</h3>
                                                 <p className="text-xs text-telegram-subtext mt-0.5">v{appVersion}</p>
+                                            </div>
+
+                                            <div className="flex flex-col items-center gap-2">
+                                                <button
+                                                    onClick={() => void checkForUpdates(true)}
+                                                    disabled={updateStatus === 'checking' || updateStatus === 'downloading' || updateStatus === 'installing'}
+                                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary/10 border border-telegram-primary/20 text-telegram-primary hover:bg-telegram-primary/15 transition disabled:opacity-50"
+                                                >
+                                                    <RefreshCw className={`w-3.5 h-3.5 ${updateStatus === 'checking' ? 'animate-spin' : ''}`} />
+                                                    {updateStatus === 'checking' ? t('settings.checking_for_updates') : t('settings.check_for_updates')}
+                                                </button>
+                                                {updateStatus === 'up-to-date' && (
+                                                    <p className="text-[10px] text-emerald-400">{t('settings.up_to_date')}</p>
+                                                )}
+                                                {updateRelease && (
+                                                    <p className="text-[10px] text-telegram-primary">{t('settings.update_available_version', { version: updateRelease.version })}</p>
+                                                )}
+                                                {updateStatus === 'error' && updateError && (
+                                                    <p className="max-w-[300px] text-center text-[10px] text-red-400">{updateError}</p>
+                                                )}
                                             </div>
 
                                             {/* Divider */}

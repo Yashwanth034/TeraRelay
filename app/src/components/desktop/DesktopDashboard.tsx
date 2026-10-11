@@ -36,6 +36,8 @@ import { Link, Copy, Check, X, Loader2, Share2 } from 'lucide-react';
 import { useTelegramConnection } from '../../hooks/useTelegramConnection';
 import { useFileOperations } from '../../hooks/useFileOperations';
 import { useFileUpload } from '../../hooks/useFileUpload';
+import { useRemoteImport } from '../../hooks/useRemoteImport';
+import { useRemoteImportBatch } from '../../hooks/useRemoteImportBatch';
 import { useFileDownload } from '../../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts';
 import { useSettings } from '../../context/SettingsContext';
@@ -146,7 +148,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         handleFolderUpload,
         handleVersionUpload,
         handleDropUpload,
-        handleUrlUpload,
+        enqueuePreparedImports,
         cancelAll: cancelUploads,
         cancelItem: cancelUploadItem,
         pauseItem: pauseUploadItem,
@@ -154,6 +156,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         retryItem: retryUploadItem,
         dismissItem: dismissUploadItem,
     } = useFileUpload(activeFolderId, store, allFiles);
+    const remoteImport = useRemoteImport(activeFolderId, store, enqueuePreparedImports);
+    const {
+        jobs: remoteImportJobs,
+        analyzeSource: analyzeRemoteImport,
+        startImport: startRemoteImport,
+    } = remoteImport;
+    const remoteImportBatch = useRemoteImportBatch(
+        activeFolderId,
+        store,
+        remoteImport,
+        cancelUploadItem,
+        retryUploadItem,
+    );
     const {
         downloadQueue,
         queueDownload,
@@ -727,13 +742,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         key="pdf-viewer"
                     />
                 )}
-                {showRemoteUpload && (
+                {showRemoteUpload && activeFolderId !== null && !activeChannelReadOnly && (
                     <RemoteUploadModal
                         isOpen={showRemoteUpload}
                         onClose={() => setShowRemoteUpload(false)}
-                        folders={folders}
-                        defaultFolderId={activeFolderId}
-                        onUpload={handleUrlUpload}
+                        activeFolderId={activeFolderId}
+                        currentChannelName={currentFolderName}
+                        jobs={remoteImportJobs}
+                        onAnalyze={analyzeRemoteImport}
+                        onImport={startRemoteImport}
+                        onBatchSettled={() => queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] })}
+                        remoteImportBatch={remoteImportBatch}
                         key="remote-upload-modal"
                     />
                 )}

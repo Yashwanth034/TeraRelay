@@ -1,0 +1,13 @@
+{
+  "identifier": "ios-updater",
+  "description": "iOS-only permission to open the App Store or TestFlight update page",
+  "platforms": [
+    "iOS"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "opener:default"
+  ]
+}

@@ -489,13 +489,16 @@ test('Add version UI offers upload-new and existing-file flows without drag stac
   assert.ok(!html.includes('Drag one file'), 'Version creation regressed to drag-first UX');
 });
 
-test('expanded version stacks are not collapsed by automatic feed rerenders', () => {
+test('version stacks stay expanded unless the user explicitly collapses them', () => {
   const feed = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'), 'utf8');
   const grouped = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/StackedFileRow.tsx'), 'utf8');
 
-  assert.ok(feed.includes('expandedStackIds'), 'Channel feed does not own stack expansion state across row remounts');
-  assert.ok(feed.includes('expanded={expandedStackIds.has(file.stack_id)}'), 'Stack row is not restored from the feed-level expansion state');
+  assert.ok(feed.includes('collapsedStackIds'), 'Channel feed does not remember only explicit user collapses');
+  assert.ok(feed.includes('expanded={!collapsedStackIds.has(file.stack_id)}'), 'Stack rows do not default to expanded');
+  assert.ok(feed.includes('if (nextExpanded) next.delete(file.stack_id!)'), 'Explicit expand does not clear the user-collapse marker');
+  assert.ok(feed.includes('else next.add(file.stack_id!)'), 'Explicit collapse does not persist the user-collapse marker');
   assert.ok(feed.includes('onExpandedChange='), 'Stack row cannot report an explicit user expand/collapse choice');
+  assert.ok(grouped.includes('if (expanded && !stack && !loading)'), 'Initially expanded stacks do not load their members automatically');
   assert.ok(!grouped.includes('const [expanded, setExpanded] = useState(false)'), 'Stack row still resets itself to collapsed whenever it remounts');
 });
 
@@ -702,4 +705,136 @@ if (process.argv.includes('--fixture')) {
   assert.ok(process.env.TERA_QA_UI_OUTPUT, '--fixture requires TERA_QA_UI_OUTPUT');
   fs.writeFileSync(process.env.TERA_QA_UI_OUTPUT, html);
 }
+test('device continuity reuses existing Drive sync before desktop mount', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  const snapshot = source.indexOf("invoke<DriveSnapshotLike>('cmd_drive_get_snapshot')");
+  const sync = source.indexOf("invoke<DriveSyncResultLike>('cmd_drive_sync_metadata')");
+  const crypto = source.indexOf("invoke<DriveCryptoStatusLike>('cmd_drive_crypto_status')");
+  const mount = source.indexOf("invoke('cmd_drive_mount')");
+  assert.ok(snapshot >= 0 && sync > snapshot, 'Continuity must snapshot local Drive before remote reconciliation');
+  assert.ok(crypto > sync, 'Continuity must inspect encryption after remote metadata is reconciled');
+  assert.ok(mount > crypto, 'Desktop Drive mount must start only after the initial reconciliation/classification');
+  assert.ok(source.includes("invoke('cmd_drive_recover_pending')"), 'Existing pending-write recovery was dropped');
+  assert.ok(source.includes('15_000'), 'Existing 15-second metadata retry interval was dropped');
+  assert.ok(source.includes('if (!isMobile)'), 'Linux mount/recovery is not kept desktop-only');
+  assert.ok(!source.includes('cmd_drive_crypto_setup'), 'Continuity must never create a new Drive key');
+});
+
+test('device continuity only classifies pristine remote state as a new-device restore', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/deviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('isPristineDriveSnapshot'), 'Pristine local Drive detection is missing');
+  assert.ok(source.includes("source === 'remote'"), 'Remote sync source is not recognized');
+  assert.ok(source.includes("source === 'remote-merged'"), 'Merged remote sync source is not recognized');
+  assert.ok(source.includes('restoredFromRemote'), 'Continuity result does not expose remote restore state');
+  assert.ok(source.includes('directoryCount'), 'Restored folder count is missing');
+  assert.ok(source.includes('fileCount'), 'Restored file count is missing');
+});
+
+test('device continuity classifier executes the new-device and encryption rules', () => {
+  const { classifyDeviceContinuity } = load(path.join(root, 'app/src/deviceContinuity.ts'));
+  const pristine = { revision: 0, dirty: false, directories: [], files: [], pending: [] };
+  const restored = { revision: 42, dirty: false, directories: [{ id: 'docs' }], files: [{ id: 'file' }], pending: [] };
+  const remote = { revision: 42, dirty: false, source: 'remote' };
+  const current = { revision: 42, dirty: false, source: 'current' };
+
+  const newDevice = classifyDeviceContinuity(pristine, remote, restored, { configured: true, unlocked: false });
+  assert.equal(newDevice.restoredFromRemote, true, 'Pristine remote state was not classified as a restore');
+  assert.equal(newDevice.directoryCount, 1);
+  assert.equal(newDevice.fileCount, 1);
+  assert.equal(newDevice.needsDriveUnlock, true, 'Encrypted restored Drive did not request the existing passphrase');
+
+  const existingDevice = classifyDeviceContinuity(restored, remote, restored, { configured: true, unlocked: true });
+  assert.equal(existingDevice.restoredFromRemote, false, 'Existing local state was falsely announced as a new-device restore');
+
+  const localOnly = classifyDeviceContinuity(pristine, current, restored, { configured: false, unlocked: false });
+  assert.equal(localOnly.restoredFromRemote, false, 'Current/local metadata was falsely classified as a remote restore');
+});
+
+test('device continuity metadata sync runs on mobile without mounting Drive', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.match(source, /cmd_drive_sync_metadata[\s\S]*15_000/, 'Authenticated clients do not retain periodic metadata sync');
+  assert.match(source, /if \(!isMobile\)[\s\S]*cmd_drive_mount/, 'Mount is not gated to desktop');
+  assert.ok(!source.includes('authenticated || isMobile'), 'Mobile clients are still excluded from metadata continuity');
+});
+
+test('App delegates Drive startup to device continuity instead of duplicating sync logic', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/App.tsx'), 'utf8');
+  assert.ok(source.includes('useDeviceContinuity'), 'App does not use the continuity hook');
+  assert.ok(source.includes('DriveContinuityUnlock'), 'App does not render the continuity unlock experience');
+  assert.ok(!source.includes('const syncDrive = async () =>'), 'Old inline Drive sync orchestration still duplicates the continuity hook');
+  assert.ok(source.includes('authenticated: authStatus === "authenticated"'), 'Continuity is not bound to authenticated state');
+});
+
+test('continuity unlock uses only the existing Drive passphrase path', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/components/shared/DriveContinuityUnlock.tsx'), 'utf8');
+  assert.ok(source.includes("invoke<DriveCryptoStatusLike>('cmd_drive_crypto_unlock'"), 'Unlock dialog does not use the existing unlock command');
+  assert.ok(!source.includes('cmd_drive_crypto_setup'), 'New-device restore must never create a replacement encryption key');
+  assert.ok(source.includes('Later'), 'Unlock dialog cannot be safely dismissed');
+  assert.ok(source.includes('type="password"'), 'Drive passphrase field is not protected as a password input');
+  assert.ok(source.includes("setPassphrase('')"), 'Passphrase is not cleared after use/dismissal');
+});
+
+test('continuity failures cannot masquerade as a pristine or unencrypted new device', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('revision: -1, dirty: true'), 'Failed local snapshot still looks pristine and can create a false restore classification');
+  assert.ok(source.includes('securityError'), 'Drive crypto-status failure is silently treated as an unencrypted Drive');
+  assert.ok(source.includes('Could not read Drive encryption status'), 'Secure-storage failure does not remain visible in continuity state');
+});
+
+test('App surfaces secure-storage continuity failures instead of silently continuing', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/App.tsx'), 'utf8');
+  assert.ok(source.includes('continuity.securityError'), 'App never surfaces a continuity secure-storage failure');
+  assert.ok(source.includes('secure Drive key storage could not be checked'), 'Secure-storage warning does not explain the degraded state');
+});
+
+test('periodic continuity sync never overlaps a slow Telegram reconciliation', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('let periodicSyncInFlight = false'), 'Continuity polling has no effect-local in-flight guard');
+  assert.ok(source.includes('if (periodicSyncInFlight) return'), 'A slow sync can overlap the next interval tick');
+  assert.ok(source.includes('periodicSyncInFlight = true'), 'Periodic sync never acquires its in-flight guard');
+  assert.ok(source.includes('periodicSyncInFlight = false'), 'Periodic sync can leave its in-flight guard stuck');
+});
+
+test('continuity cancellation cannot leave a late signed-out desktop mount active', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.match(source, /if \(disposed\) return;\s*if \(!isMobile\)/, 'Cancelled initial continuity can still start a desktop mount');
+  assert.match(source, /await invoke\('cmd_drive_mount'\);\s*if \(disposed\) \{[\s\S]*shouldDetachNativeDriveRef\.current[\s\S]*cmd_drive_unmount/, 'A mount that completes after resolved sign-out is not immediately undone');
+});
+
+test('native Drive lifetime is not owned by WebView effect cleanup', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('authResolved && !authenticated && !isMobile'), 'Resolved signed-out state does not explicitly detach desktop Drive');
+  const cleanupStart = source.indexOf('return () => {');
+  const cleanupEnd = source.indexOf('};\n  }, [authenticated, authResolved, isMobile]);', cleanupStart);
+  assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, 'Continuity effect cleanup could not be inspected');
+  const cleanup = source.slice(cleanupStart, cleanupEnd);
+  assert.ok(!cleanup.includes('cmd_drive_unmount'), 'WebView/effect teardown still owns native Drive unmounting');
+  const appSource = fs.readFileSync(path.join(root, 'app/src/App.tsx'), 'utf8');
+  assert.ok(appSource.includes('authResolved: authStatus !== "loading"'), 'Continuity cannot distinguish transient session loading from resolved sign-out');
+});
+
+test('cancelled continuity cannot mutate the next session crypto decision', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  const safeCryptoChecks = source.match(/crypto = await invoke<DriveCryptoStatusLike>\('cmd_drive_crypto_status'\);\s*if \(disposed\) return;/g) || [];
+  assert.ok(safeCryptoChecks.length >= 2, 'An old async crypto check can still mutate startup state after its effect was cancelled');
+});
+
+test('cancelled initial snapshot cannot overwrite a newer continuity baseline', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.match(source, /before = await invoke<DriveSnapshotLike>\('cmd_drive_get_snapshot'\);\s*if \(disposed\) return;\s*initialSnapshotRef\.current = before;/, 'A stale startup snapshot can overwrite the next session baseline');
+});
+
+test('successful continuity reconciliation advances the restore baseline', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  const updates = source.match(/initialSnapshotRef\.current = after;/g) || [];
+  assert.ok(updates.length >= 2, 'Initial and periodic successful reconciliation must both advance the baseline');
+});
+
+test('continuity retries the startup unlock decision after secure storage recovers', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('startupCryptoCheckPendingRef'), 'A failed startup crypto check is forgotten');
+  assert.ok(source.includes('allowStartupUnlock'), 'Periodic sync cannot distinguish startup recovery from a later manual Drive lock');
+  assert.ok(source.includes('allowStartupUnlock && assessment.needsDriveUnlock'), 'Recovered secure storage never re-opens the existing-passphrase unlock path');
+});
+
 Promise.all(pending).then(() => { process.exitCode = failures ? 1 : 0; });

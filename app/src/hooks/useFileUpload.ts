@@ -12,6 +12,11 @@ import { useTransferMethod } from '../context/TransferMethodContext';
 import { useUploadSuggestion, type UploadPreflightResult } from '../context/UploadSuggestionContext';
 import type { Store } from '@tauri-apps/plugin-store';
 import { normalizeUploadQueue, useRecoverableTransferQueue } from '../transferQueue';
+import {
+    recordRemoteImportUploadOutcome,
+    type PreparedImportInput,
+    type RemoteImportUploadOutcome,
+} from '../remoteImport';
 
 interface ProgressPayload {
     id: string;
@@ -138,8 +143,8 @@ export function useFileUpload(
         };
     }, []);
 
-    // Linux TeraRelay Drive writes land in a bounded staging area first. The
-    // mounted filesystem emits a durable pending ID on close; feed that exact
+    // Desktop TeraRelay Drive writes land in a bounded staging area first. The
+    // native filesystem provider emits a durable pending ID on close; feed that exact
     // record into the normal recoverable upload queue so app restarts, pause,
     // cancel, SHA-256 duplicate detection and transfer progress keep working.
     useEffect(() => {
@@ -257,6 +262,20 @@ export function useFileUpload(
         }
     };
 
+    const persistRemoteImportOutcome = async (
+        item: QueueItem,
+        outcome: Omit<RemoteImportUploadOutcome, 'queueId' | 'selectionId' | 'label' | 'height'>,
+    ) => {
+        if (!item.remoteImportJobId || !item.remoteImportSelectionId) return;
+        await recordRemoteImportUploadOutcome(store, item.remoteImportJobId, {
+            queueId: item.id,
+            selectionId: item.remoteImportSelectionId,
+            label: item.remoteImportLabel,
+            height: item.remoteImportHeight,
+            ...outcome,
+        });
+    };
+
     const processItem = async (item: QueueItem) => {
         if (activeIdsRef.current.has(item.id)) return;
         // Reserve synchronously, before any save/auth await can trigger another render.
@@ -315,13 +334,17 @@ export function useFileUpload(
                         candidate: preflight.exact_duplicate,
                     });
                     if (decision !== 'upload_anyway') {
+                        await persistRemoteImportOutcome(workingItem, {
+                            status: 'skipped',
+                            logicalFileId: preflight.exact_duplicate.logical_file_id,
+                        });
                         const next = queueRef.current.filter(i => i.id !== workingItem.id);
                         setUploadQueue(next);
                         await persist(next);
                         toast.info('Duplicate upload skipped');
                         return;
                     }
-                } else if (!workingItem.versionStackId && !workingItem.versionBaseFileId && !workingItem.drivePendingId) {
+                } else if (!workingItem.versionStackId && !workingItem.versionBaseFileId && !workingItem.drivePendingId && !workingItem.remoteImportJobId) {
                     const versionMatch = preflight.similar_files
                         .map(candidate => ({
                             candidate,
@@ -389,7 +412,13 @@ export function useFileUpload(
                 uploadPhase: workingItem.url ? undefined : 'uploading',
             } : i));
 
-            if (workingItem.url) {
+            if (workingItem.remoteImportLogicalFileId) {
+                await persistRemoteImportOutcome(workingItem, {
+                    status: 'success',
+                    logicalFileId: workingItem.remoteImportLogicalFileId,
+                });
+                completed = true;
+            } else if (workingItem.url) {
                 await invoke('cmd_upload_from_url', {
                     url: workingItem.url,
                     folderId: workingItem.folderId,
@@ -415,8 +444,28 @@ export function useFileUpload(
                     transferEngine,
                     sourceSha256: workingItem.sourceSha256,
                     sourceIdentity: workingItem.sourceIdentity,
+                    uploadName: workingItem.uploadName,
                 });
                 completed = true;
+
+                if (workingItem.remoteImportJobId && workingItem.remoteImportSelectionId) {
+                    if (!uploadResult.logical_file_id) {
+                        throw new Error('Upload completed, but Remote Import did not receive a stable logical file ID');
+                    }
+                    workingItem = {
+                        ...workingItem,
+                        remoteImportLogicalFileId: uploadResult.logical_file_id,
+                    };
+                    const durableUpload = queueRef.current.map(current =>
+                        current.id === workingItem.id ? workingItem : current
+                    );
+                    setUploadQueue(durableUpload);
+                    await persist(durableUpload);
+                    await persistRemoteImportOutcome(workingItem, {
+                        status: 'success',
+                        logicalFileId: uploadResult.logical_file_id,
+                    });
+                }
 
                 if (workingItem.drivePendingId) {
                     if (!uploadResult.logical_file_id) {
@@ -497,6 +546,7 @@ export function useFileUpload(
             } else if (cancelledRef.current.has(workingItem.id)) {
                 cancelledRef.current.delete(workingItem.id);
                 try {
+                    await persistRemoteImportOutcome(workingItem, { status: 'cancelled' });
                     await persist();
                     const current = queueRef.current.find(i => i.id === workingItem.id);
                     if (!current || current.status === 'cancelled') await cleanupTempZip(workingItem);
@@ -514,10 +564,17 @@ export function useFileUpload(
                         speedBytesPerSec: 0,
                     } : i));
                 } else if (!completed && errMsg.includes('Transfer cancelled')) {
+                    await persistRemoteImportOutcome(workingItem, { status: 'cancelled' }).catch(() => {});
                     setUploadQueue(q => q.map(i => i.id === workingItem.id
                         ? { ...i, status: 'cancelled', speedBytesPerSec: 0 }
                         : i));
                 } else {
+                    if (!completed) {
+                        await persistRemoteImportOutcome(workingItem, {
+                            status: 'error',
+                            error: errMsg,
+                        }).catch(() => {});
+                    }
                     setUploadQueue(q => q.map(i => i.id === workingItem.id ? {
                         ...i, status: 'error', error: errMsg, speedBytesPerSec: 0,
                     } : i));
@@ -550,6 +607,43 @@ export function useFileUpload(
         }));
         setUploadQueue(prev => [...prev, ...newItems]);
         toast.info(`Queued ${paths.length} file${paths.length !== 1 ? 's' : ''} for upload`);
+    };
+
+    /**
+     * Hand already-acquired Remote Import outputs to the normal resilient upload
+     * queue. They are local files now, never legacy URL uploads. One transfer
+     * engine choice applies to the whole import batch.
+     */
+    const enqueuePreparedImports = async (inputs: PreparedImportInput[]): Promise<string[]> => {
+        if (!inputs.length) return [];
+        const transferEngine = await chooseTransferMethod('upload');
+        if (!transferEngine) return [];
+
+        const newItems: QueueItem[] = inputs.map(input => ({
+            id: `remote-${Math.random().toString(36).slice(2, 11)}`,
+            path: input.path,
+            folderId: input.folderId,
+            transferEngine,
+            status: 'pending',
+            uploadName: input.uploadName,
+            remoteImportJobId: input.remoteImportJobId,
+            remoteImportSelectionId: input.remoteImportSelectionId,
+            remoteImportLabel: input.remoteImportLabel,
+            remoteImportHeight: input.remoteImportHeight,
+        }));
+
+        const previous = queueRef.current;
+        const next = [...previous, ...newItems];
+        setUploadQueue(next);
+        try {
+            await persist(next);
+        } catch (error) {
+            setUploadQueue(previous);
+            await persist(previous).catch(() => {});
+            throw error;
+        }
+        toast.info(`Queued ${newItems.length} remote import${newItems.length === 1 ? '' : 's'} for upload`);
+        return newItems.map(item => item.id);
     };
 
     const performManualUpload = async () => {
@@ -684,6 +778,9 @@ export function useFileUpload(
 
     const finishCancellation = async (items: QueueItem[]) => {
         try {
+            for (const item of items) {
+                await persistRemoteImportOutcome(item, { status: 'cancelled' });
+            }
             await persist();
             for (const item of items) {
                 // The running worker cleans its source after the backend unwinds.
@@ -822,6 +919,7 @@ export function useFileUpload(
         handleVersionUpload,
         handleDropUpload,
         handleUrlUpload,
+        enqueuePreparedImports,
         cancelAll,
         cancelItem,
         pauseItem,

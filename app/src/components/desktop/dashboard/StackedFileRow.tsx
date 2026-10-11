@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
     ChevronDown,
@@ -60,7 +60,7 @@ export function StackedFileRow({
 
     const title = getPremiumFileTitle(file);
 
-    const load = async (): Promise<FileStackView | null> => {
+    const load = useCallback(async (): Promise<FileStackView | null> => {
         if (!file.stack_id) return null;
         if (stack) return stack;
         if (loading) return null;
@@ -80,7 +80,13 @@ export function StackedFileRow({
         } finally {
             setLoading(false);
         }
-    };
+    }, [file.stack_id, folderId, stack, loading]);
+
+    useEffect(() => {
+        if (expanded && !stack && !loading) {
+            if (!failed) void load();
+        }
+    }, [expanded, failed, load, loading, stack]);
 
     const toggle = async (event: React.MouseEvent) => {
         event.stopPropagation();

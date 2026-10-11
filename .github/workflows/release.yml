@@ -13,26 +13,54 @@ jobs:
   desktop:
     name: Desktop release / ${{ matrix.name }}
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:
           - name: Linux x64
             platform: ubuntu-22.04
+            helper_target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
             args: ""
           - name: Windows x64
             platform: windows-latest
-            args: ""
+            helper_target: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            args: "--config src-tauri/tauri.windows-signing.conf.json"
           - name: macOS Apple Silicon
             platform: macos-latest
-            args: "--target aarch64-apple-darwin"
+            helper_target: macos-arm64
+            rust_target: aarch64-apple-darwin
+            swift_triple: arm64-apple-macosx12.0
+            macos_arch: arm64
+            args: "--config src-tauri/tauri.macos-signing.conf.json --target aarch64-apple-darwin"
           - name: macOS Intel
             platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            helper_target: macos-x64
+            rust_target: x86_64-apple-darwin
+            swift_triple: x86_64-apple-macosx12.0
+            macos_arch: x86_64
+            args: "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Validate release tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./app/package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Require desktop updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
 
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -58,11 +86,166 @@ jobs:
         working-directory: app
         run: npm ci
 
+      - name: Validate native Drive platform contract
+        shell: bash
+        run: node scripts/test-native-drive-platforms.cjs
+
+      - name: Configure Windows code signing
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: app
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) { throw 'WINDOWS_CERTIFICATE is required' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { throw 'WINDOWS_CERTIFICATE_PASSWORD is required' }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'terarelay-code-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate -or [string]::IsNullOrWhiteSpace($certificate.Thumbprint)) { throw 'Windows code-signing certificate import failed' }
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = 'sha256'
+                timestampUrl = 'http://timestamp.digicert.com'
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path 'src-tauri/tauri.windows-signing.conf.json' -Value $config -Encoding utf8
+
+      - name: Require macOS Developer ID and notarization credentials
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_APP_PROVISION_PROFILE: ${{ secrets.MACOS_APP_PROVISION_PROFILE }}
+          MACOS_FILE_PROVIDER_PROVISION_PROFILE: ${{ secrets.MACOS_FILE_PROVIDER_PROVISION_PROFILE }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$KEYCHAIN_PASSWORD"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$MACOS_APP_PROVISION_PROFILE"
+          test -n "$MACOS_FILE_PROVIDER_PROVISION_PROFILE"
+
+      - name: Import macOS Developer ID certificate
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/terarelay-developer-id.p12"
+          keychain="$RUNNER_TEMP/terarelay-build.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$identity"
+          echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Prepare and validate macOS File Provider provisioning
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_APP_PROVISION_PROFILE: ${{ secrets.MACOS_APP_PROVISION_PROFILE }}
+          MACOS_FILE_PROVIDER_PROVISION_PROFILE: ${{ secrets.MACOS_FILE_PROVIDER_PROVISION_PROFILE }}
+        run: |
+          set -euo pipefail
+          main_profile="$RUNNER_TEMP/terarelay-main.provisionprofile"
+          provider_profile="$RUNNER_TEMP/terarelay-file-provider.provisionprofile"
+          printf '%s' "$MACOS_APP_PROVISION_PROFILE" | base64 --decode > "$main_profile"
+          printf '%s' "$MACOS_FILE_PROVIDER_PROVISION_PROFILE" | base64 --decode > "$provider_profile"
+          security cms -D -i "$main_profile" > "$RUNNER_TEMP/terarelay-main-profile.plist"
+          security cms -D -i "$provider_profile" > "$RUNNER_TEMP/terarelay-provider-profile.plist"
+          python3 - "$RUNNER_TEMP/terarelay-main-profile.plist" "$RUNNER_TEMP/terarelay-provider-profile.plist" "$APPLE_TEAM_ID" <<'PY'
+          import plistlib, sys
+          main_path, provider_path, team = sys.argv[1:]
+          group = 'group.io.terarelay.drive'
+          def check(path, bundle):
+              with open(path, 'rb') as f:
+                  profile = plistlib.load(f)
+              ent = profile.get('Entitlements', {})
+              app_id = ent.get('com.apple.application-identifier') or ent.get('application-identifier') or ''
+              if not app_id.endswith('.' + bundle):
+                  raise SystemExit(f'Provisioning profile App ID does not match {bundle}')
+              groups = ent.get('com.apple.security.application-groups', [])
+              if group not in groups:
+                  raise SystemExit(f'Provisioning profile for {bundle} does not authorize {group}')
+              team_ids = profile.get('TeamIdentifier') or []
+              if team and team not in team_ids:
+                  raise SystemExit(f'Provisioning profile for {bundle} belongs to a different Apple team')
+          check(main_path, 'io.terarelay.desktop')
+          check(provider_path, 'io.terarelay.desktop.FileProvider')
+          print('MACOS-FILE-PROVIDER-PROFILES-PASS')
+          PY
+          echo "TERARELAY_MAIN_APP_PROFILE_PATH=$main_profile" >> "$GITHUB_ENV"
+          echo "TERARELAY_FILE_PROVIDER_PROFILE_PATH=$provider_profile" >> "$GITHUB_ENV"
+          cat > app/src-tauri/tauri.macos-signing.conf.json <<'JSON'
+          {
+            "bundle": {
+              "macOS": {
+                "files": {
+                  "PlugIns/TeraRelayFileProvider.appex": "macos-file-provider/build/TeraRelayFileProvider.appex",
+                  "embedded.provisionprofile": "macos-file-provider/build/TeraRelayMain.provisionprofile"
+                }
+              }
+            }
+          }
+          JSON
+
+      - name: Compile Windows native Drive provider
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: cargo check --manifest-path app/src-tauri/Cargo.toml --target "${{ matrix.rust_target }}"
+
+      - name: Compile and sign macOS native Drive provider
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          TERARELAY_MAIN_APP_PROFILE_PATH: ${{ env.TERARELAY_MAIN_APP_PROFILE_PATH }}
+          TERARELAY_FILE_PROVIDER_PROFILE_PATH: ${{ env.TERARELAY_FILE_PROVIDER_PROFILE_PATH }}
+          TERARELAY_MACOS_BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.swift_triple }}
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path app/src-tauri/Cargo.toml --target "${{ matrix.rust_target }}"
+          ./scripts/build-macos-file-provider.sh
+
+      - name: Prepare verified Remote Import helpers
+        shell: bash
+        run: python3 scripts/prepare-remote-import-engines.py --target "${{ matrix.helper_target }}"
+
       - name: Build and attach desktop bundles
         uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.swift_triple }}
         with:
           projectPath: app
           tagName: v__VERSION__
@@ -70,7 +253,60 @@ jobs:
           releaseBody: "TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
           releaseDraft: true
           prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
           args: ${{ matrix.args }}
+
+      - name: Verify bundled macOS File Provider and signatures
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="$(find app/src-tauri/target -type d -path '*/bundle/macos/TeraRelay.app' -print -quit)"
+          test -n "$app_bundle"
+          appex="$app_bundle/Contents/PlugIns/TeraRelayFileProvider.appex"
+          test -d "$appex"
+          test -x "$appex/Contents/MacOS/TeraRelayFileProvider"
+          lipo -verify_arch "${{ matrix.macos_arch }}" "$appex/Contents/MacOS/TeraRelayFileProvider"
+          test -f "$appex/Contents/embedded.provisionprofile"
+          test -f "$app_bundle/Contents/embedded.provisionprofile"
+          codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          codesign --verify --strict --verbose=2 "$appex"
+          codesign -d --entitlements :- "$app_bundle" > "$RUNNER_TEMP/terarelay-app-entitlements.plist" 2>/dev/null
+          codesign -d --entitlements :- "$appex" > "$RUNNER_TEMP/terarelay-provider-entitlements.plist" 2>/dev/null
+          python3 - "$RUNNER_TEMP/terarelay-app-entitlements.plist" "$RUNNER_TEMP/terarelay-provider-entitlements.plist" <<'PY'
+          import plistlib, sys
+          group = 'group.io.terarelay.drive'
+          with open(sys.argv[1], 'rb') as f:
+              app = plistlib.load(f)
+          with open(sys.argv[2], 'rb') as f:
+              provider = plistlib.load(f)
+          if group not in app.get('com.apple.security.application-groups', []):
+              raise SystemExit('Signed main app is missing the TeraRelay App Group entitlement')
+          if group not in provider.get('com.apple.security.application-groups', []):
+              raise SystemExit('Signed File Provider is missing the TeraRelay App Group entitlement')
+          if provider.get('com.apple.security.app-sandbox') is not True:
+              raise SystemExit('Signed File Provider is not sandboxed')
+          if provider.get('com.apple.security.network.client') is not True:
+              raise SystemExit('Signed File Provider cannot reach the loopback bridge')
+          print('MACOS-FILE-PROVIDER-SIGNATURE-PASS')
+          PY
+
+      - name: Verify Windows Authenticode signatures
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: app
+        run: |
+          $bundles = @(Get-ChildItem 'src-tauri/target' -Recurse -File | Where-Object {
+            $_.FullName -match '[\\/]bundle[\\/]' -and @('.exe', '.msi') -contains $_.Extension.ToLowerInvariant()
+          })
+          if ($bundles.Count -eq 0) { throw 'No Windows installer bundles were produced' }
+          foreach ($bundle in $bundles) {
+            $signature = Get-AuthenticodeSignature -FilePath $bundle.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "Invalid Authenticode signature for $($bundle.FullName): $($signature.Status)"
+            }
+          }
 
       - name: Attach license and third-party notices
         if: matrix.name == 'Linux x64'
@@ -84,12 +320,21 @@ jobs:
 
   android:
     name: Android release build
+    needs: desktop
     runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: app
     steps:
       - uses: actions/checkout@v7
+
+      - name: Validate release tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
 
       - uses: actions/setup-node@v7
         with:
@@ -183,7 +428,7 @@ jobs:
       - name: Build signed release APK and AAB
         run: npm run tauri -- android build --apk true --aab true --target aarch64 --ci
 
-      - name: Verify Android release signatures
+      - name: Verify Android release signatures and package metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -196,23 +441,136 @@ jobs:
           jarsigner -verify "$aab" | tee "$aab_verify_log"
           grep -Fq "jar verified." "$aab_verify_log"
 
+          badging="$("$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" | head -n 1)"
+          [[ "$badging" =~ name=\'([^\']+)\' ]] || { echo "Could not read APK application ID" >&2; exit 1; }
+          actual_package="${BASH_REMATCH[1]}"
+          [[ "$badging" =~ versionCode=\'([^\']+)\' ]] || { echo "Could not read APK versionCode" >&2; exit 1; }
+          actual_code="${BASH_REMATCH[1]}"
+          [[ "$badging" =~ versionName=\'([^\']+)\' ]] || { echo "Could not read APK versionName" >&2; exit 1; }
+          actual_version="${BASH_REMATCH[1]}"
+
+          expected_package="$(node -p "require('./src-tauri/tauri.conf.json').identifier")"
+          expected_version="$(node -p "require('./package.json').version")"
+          expected_code="$(node - <<'NODE'
+          const version = require('./package.json').version.replace(/^v/, '').split('-')[0];
+          const [major, minor, patch] = version.split('.').map(Number);
+          if (![major, minor, patch].every(Number.isSafeInteger)) throw new Error('Invalid package version');
+          console.log(major * 1000000 + minor * 1000 + patch);
+          NODE
+          )"
+          test "$expected_package" = "io.terarelay.desktop"
+          test "$actual_package" = "$expected_package"
+          test "$actual_version" = "$expected_version"
+          test "$actual_code" = "$expected_code"
+
+      - name: Prepare Android updater release assets
+        env:
+          IOS_UPDATE_URL: ${{ vars.IOS_UPDATE_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          apk="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          aab="$(find src-tauri/gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -n 1)"
+          test -n "$apk"
+          test -n "$aab"
+
+          release_dir="$RUNNER_TEMP/terarelay-android-release"
+          mkdir -p "$release_dir"
+          apk_name="TeraRelay-$version-android-arm64.apk"
+          aab_name="TeraRelay-$version-android-arm64.aab"
+          cp "$apk" "$release_dir/$apk_name"
+          cp "$aab" "$release_dir/$aab_name"
+
+          notes="TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
+          manifest_args=(
+            --version "$version"
+            --apk "$release_dir/$apk_name"
+            --apk-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v$version/$apk_name"
+            --notes "$notes"
+            --published-at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            --output "$release_dir/mobile-latest.json"
+          )
+          if [ -n "${IOS_UPDATE_URL:-}" ]; then
+            manifest_args+=(--ios-store-url "$IOS_UPDATE_URL")
+          fi
+          node ../scripts/build-mobile-update-manifest.mjs "${manifest_args[@]}"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          npx --no-install tauri signer sign "$release_dir/mobile-latest.json"
+          test -s "$release_dir/mobile-latest.json.sig"
+
+          echo "ANDROID_RELEASE_DIR=$release_dir" >> "$GITHUB_ENV"
+          echo "ANDROID_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "ANDROID_RELEASE_APK=$apk_name" >> "$GITHUB_ENV"
+          echo "ANDROID_RELEASE_AAB=$aab_name" >> "$GITHUB_ENV"
+
+      - name: Attach Android updater assets to draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "v$ANDROID_RELEASE_VERSION" \
+            "$ANDROID_RELEASE_DIR/$ANDROID_RELEASE_APK" \
+            "$ANDROID_RELEASE_DIR/$ANDROID_RELEASE_AAB" \
+            "$ANDROID_RELEASE_DIR/mobile-latest.json" \
+            "$ANDROID_RELEASE_DIR/mobile-latest.json.sig" \
+            --clobber
+
       - name: Upload signed Android release outputs
         uses: actions/upload-artifact@v7
         with:
           name: terarelay-android-signed
           if-no-files-found: error
           path: |
-            app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-            app/src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+            ${{ env.ANDROID_RELEASE_DIR }}/*.apk
+            ${{ env.ANDROID_RELEASE_DIR }}/*.aab
+            ${{ env.ANDROID_RELEASE_DIR }}/mobile-latest.json
+            ${{ env.ANDROID_RELEASE_DIR }}/mobile-latest.json.sig
 
-  ios-simulator:
-    name: iOS simulator release validation
+  ios-release:
+    name: iOS App Store Connect release
+    needs: android
     runs-on: macos-latest
     defaults:
       run:
         working-directory: app
     steps:
       - uses: actions/checkout@v7
+
+      - name: Validate release tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Require iOS distribution credentials and public update URL
+        shell: bash
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          IOS_UPDATE_URL: ${{ vars.IOS_UPDATE_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$IOS_CERTIFICATE"
+          test -n "$IOS_CERTIFICATE_PASSWORD"
+          test -n "$IOS_MOBILE_PROVISION"
+          test -n "$APPLE_API_KEY_ID"
+          test -n "$APPLE_API_ISSUER"
+          test -n "$APPLE_API_KEY_BASE64"
+          test -n "$IOS_UPDATE_URL"
+          case "$IOS_UPDATE_URL" in
+            https://apps.apple.com/*|https://testflight.apple.com/*) ;;
+            *) echo "IOS_UPDATE_URL must be an Apple App Store or TestFlight HTTPS URL" >&2; exit 1 ;;
+          esac
 
       - uses: actions/setup-node@v7
         with:
@@ -222,18 +580,34 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios-sim
+          targets: aarch64-apple-ios
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri -> target
-          key: ios-simulator-release
+          key: ios-app-store-release
 
       - name: Ensure CocoaPods is available
         run: command -v pod >/dev/null || brew install cocoapods
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Configure App Store Connect API key
+        shell: bash
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          key_dir="$HOME/.private_keys"
+          key_path="$key_dir/AuthKey_${APPLE_API_KEY_ID}.p8"
+          mkdir -p "$key_dir"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_KEY=$APPLE_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Initialize iOS native project
         run: npm run tauri -- ios init --ci
@@ -245,12 +619,63 @@ jobs:
           xcodebuild -deleteComponent MetalToolchain || true
           rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
 
-      - name: Build iOS simulator application
-        run: npm run tauri -- ios build --target aarch64-sim --ci
+      - name: Stamp unique iOS App Store build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ios_build_version="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          IOS_BUILD_VERSION="$ios_build_version" node - <<'NODE'
+          const fs = require('fs');
+          const buildVersion = process.env.IOS_BUILD_VERSION;
+          if (!/^\d+\.\d+$/.test(buildVersion)) throw new Error(`Invalid iOS build version: ${buildVersion}`);
+          fs.writeFileSync('src-tauri/tauri.ios-release.conf.json', JSON.stringify({
+            bundle: { iOS: { bundleVersion: buildVersion } }
+          }, null, 2) + '\n');
+          NODE
+          echo "IOS_BUILD_VERSION=$ios_build_version" >> "$GITHUB_ENV"
 
-      - name: Upload iOS simulator output
+      - name: Build signed iOS IPA for App Store Connect
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        run: npm run tauri -- ios build --ci --export-method app-store-connect --config src-tauri/tauri.ios-release.conf.json
+
+      - name: Validate and upload IPA to App Store Connect
+        shell: bash
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          ipa="$(find src-tauri/gen/apple/build -type f -name '*.ipa' | head -n 1)"
+          test -n "$ipa"
+
+          inspect_dir="$RUNNER_TEMP/terarelay-ios-inspect"
+          rm -rf "$inspect_dir"
+          mkdir -p "$inspect_dir"
+          unzip -q "$ipa" -d "$inspect_dir"
+          info_plist="$(find "$inspect_dir/Payload" -maxdepth 2 -type f -name Info.plist | head -n 1)"
+          test -n "$info_plist"
+          actual_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
+          actual_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist")"
+          actual_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$info_plist")"
+          expected_identifier="$(node -p "require('./src-tauri/tauri.conf.json').identifier")"
+          expected_version="$(node -p "require('./package.json').version")"
+          test "$actual_identifier" = "$expected_identifier"
+          test "$actual_version" = "$expected_version"
+          test "$actual_build" = "$IOS_BUILD_VERSION"
+
+          xcrun altool --validate-app --type ios --file "$ipa" --apiKey "$APPLE_API_KEY_ID" --apiIssuer "$APPLE_API_ISSUER"
+          xcrun altool --upload-app --type ios --file "$ipa" --apiKey "$APPLE_API_KEY_ID" --apiIssuer "$APPLE_API_ISSUER"
+          echo "IOS_RELEASE_IPA=$ipa" >> "$GITHUB_ENV"
+
+      - name: Upload signed iOS IPA as workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: terarelay-ios-simulator
+          name: terarelay-ios-app-store
           if-no-files-found: error
-          path: app/src-tauri/gen/apple/build/**/*
+          path: ${{ env.IOS_RELEASE_IPA }}

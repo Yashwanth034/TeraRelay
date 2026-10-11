@@ -211,9 +211,9 @@ export function TopBar({
                         <HardDrive />
                     </PremiumIconButton>
 
-                    {!readOnly && (
+                    {channelMode && !readOnly && (
                         <PremiumIconButton
-                            label={t('files.remote_upload')}
+                            label="Upload from Link"
                             onClick={onRemoteUploadClick}
                         >
                             <Globe />

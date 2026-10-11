@@ -7,9 +7,10 @@ use grammers_client::types::{Media, Peer};
 use grammers_client::{Client, InputMessage};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
+use unicode_normalization::UnicodeNormalization;
 
 pub const DRIVE_SCHEMA_VERSION: u32 = 3;
 const LEGACY_DRIVE_SCHEMA_VERSION: u32 = 1;
@@ -20,6 +21,7 @@ const DRIVE_MANIFEST_CAPTION: &str = "TRD1:index";
 // can contain tens of thousands of remote parts, so the old 4 MiB cap was too
 // small even though the actual file bytes never live in this manifest.
 const MAX_DRIVE_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DRIVE_DIRECTORY_DEPTH: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriveDirectoryRecord {
@@ -254,20 +256,61 @@ pub fn new_drive_id() -> String {
 }
 
 fn validate_drive_name(name: &str) -> Result<String, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
+    if name.is_empty() {
         return Err("Drive name cannot be empty".to_string());
     }
-    if trimmed == "." || trimmed == ".." {
+    // The Drive namespace is shared by Linux, Windows and macOS. Keep names
+    // portable at the metadata boundary instead of allowing one device to
+    // create an item that another device cannot project into Explorer/Finder.
+    if name.trim() != name {
+        return Err("Drive name cannot start or end with whitespace".to_string());
+    }
+    if name == "." || name == ".." || name.ends_with('.') {
         return Err("Drive name is reserved".to_string());
     }
-    if trimmed.contains('/') || trimmed.contains('\0') {
-        return Err("Drive name contains an invalid character".to_string());
+    if name.chars().any(|ch| {
+        ch == '\0'
+            || ch.is_control()
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    }) {
+        return Err("Drive name contains a cross-platform invalid character".to_string());
     }
-    if trimmed.len() > 255 {
+    let device_stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let reserved_device = matches!(device_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || matches!(
+            device_stem.as_str(),
+            "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+                | "COM¹"
+                | "COM²"
+                | "COM³"
+                | "LPT¹"
+                | "LPT²"
+                | "LPT³"
+        );
+    if reserved_device {
+        return Err("Drive name is reserved by Windows".to_string());
+    }
+    if name.len() > 255 {
         return Err("Drive name is too long".to_string());
     }
-    Ok(trimmed.to_string())
+    Ok(name.to_string())
 }
 
 pub fn init_drive_schema(conn: &sqlite::Connection) -> Result<(), String> {
@@ -280,6 +323,13 @@ pub fn init_drive_schema(conn: &sqlite::Connection) -> Result<(), String> {
         );
         INSERT OR IGNORE INTO drive_state(singleton, revision, dirty)
             VALUES (1, 0, 0);
+
+        CREATE TABLE IF NOT EXISTS drive_provider_local_state (
+            provider TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS drive_directories (
             id TEXT PRIMARY KEY,
@@ -625,35 +675,39 @@ fn set_drive_clean(
     Ok(())
 }
 
+fn portable_name_key(name: &str) -> String {
+    name.nfc().flat_map(char::to_lowercase).collect()
+}
+
 fn directory_name_exists(
     conn: &sqlite::Connection,
     parent_id: Option<&str>,
     name: &str,
     ignore_dir_id: Option<&str>,
 ) -> Result<bool, String> {
+    let wanted = portable_name_key(name);
     let mut stmt = conn
         .prepare(
-            "SELECT id FROM drive_directories
+            "SELECT id, name FROM drive_directories
              WHERE ((parent_id IS NULL AND ? IS NULL) OR parent_id = ?)
-               AND trashed_at IS NULL
-               AND lower(name) = lower(?)
-             LIMIT 1",
+               AND trashed_at IS NULL",
         )
         .map_err(|e: sqlite::Error| e.to_string())?;
     stmt.bind((1, parent_id))
         .map_err(|e: sqlite::Error| e.to_string())?;
     stmt.bind((2, parent_id))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((3, name))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    if !matches!(
-        stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
-        sqlite::State::Row
-    ) {
-        return Ok(false);
+    while let sqlite::State::Row = stmt.next().map_err(|e: sqlite::Error| e.to_string())? {
+        let id = stmt.read::<String, _>("id").map_err(|e| e.to_string())?;
+        if ignore_dir_id == Some(id.as_str()) {
+            continue;
+        }
+        let existing = stmt.read::<String, _>("name").map_err(|e| e.to_string())?;
+        if portable_name_key(&existing) == wanted {
+            return Ok(true);
+        }
     }
-    let id = stmt.read::<String, _>(0).map_err(|e| e.to_string())?;
-    Ok(ignore_dir_id != Some(id.as_str()))
+    Ok(false)
 }
 
 fn file_name_exists(
@@ -663,82 +717,49 @@ fn file_name_exists(
     ignore_entry_id: Option<&str>,
     ignore_pending_id: Option<&str>,
 ) -> Result<bool, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT entry_id FROM drive_file_entries
-             WHERE ((directory_id IS NULL AND ? IS NULL) OR directory_id = ?)
-               AND trashed_at IS NULL
-               AND lower(display_name) = lower(?)
-             LIMIT 1",
-        )
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((1, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((2, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((3, name))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    if matches!(
-        stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
-        sqlite::State::Row
-    ) {
-        let id = stmt.read::<String, _>(0).map_err(|e| e.to_string())?;
-        if ignore_entry_id != Some(id.as_str()) {
-            return Ok(true);
-        }
-    }
-    drop(stmt);
-
-    let mut v2 = conn
-        .prepare(
-            "SELECT entry_id FROM drive_entries_v2
-             WHERE ((directory_id IS NULL AND ? IS NULL) OR directory_id = ?)
-               AND trashed_at IS NULL
-               AND lower(display_name) = lower(?)
-             LIMIT 1",
-        )
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    v2.bind((1, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    v2.bind((2, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    v2.bind((3, name))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    if matches!(
-        v2.next().map_err(|e: sqlite::Error| e.to_string())?,
-        sqlite::State::Row
-    ) {
-        let id = v2.read::<String, _>(0).map_err(|e| e.to_string())?;
-        if ignore_entry_id != Some(id.as_str()) {
-            return Ok(true);
-        }
-    }
-    drop(v2);
-
-    let mut pending = conn
-        .prepare(
-            "SELECT id FROM drive_pending_files
-             WHERE ((directory_id IS NULL AND ? IS NULL) OR directory_id = ?)
-               AND lower(display_name) = lower(?)
-             LIMIT 1",
-        )
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    pending
-        .bind((1, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    pending
-        .bind((2, directory_id))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    pending
-        .bind((3, name))
-        .map_err(|e: sqlite::Error| e.to_string())?;
-    if matches!(
-        pending.next().map_err(|e: sqlite::Error| e.to_string())?,
-        sqlite::State::Row
-    ) {
-        let id = pending.read::<String, _>(0).map_err(|e| e.to_string())?;
-        if ignore_pending_id != Some(id.as_str()) {
-            return Ok(true);
+    let wanted = portable_name_key(name);
+    for (table, id_column, name_column, trashed) in [
+        ("drive_file_entries", "entry_id", "display_name", true),
+        ("drive_entries_v2", "entry_id", "display_name", true),
+        ("drive_pending_files", "id", "display_name", false),
+    ] {
+        let sql = if trashed {
+            format!(
+                "SELECT {id_column}, {name_column} FROM {table}
+                 WHERE ((directory_id IS NULL AND ? IS NULL) OR directory_id = ?)
+                   AND trashed_at IS NULL"
+            )
+        } else {
+            format!(
+                "SELECT {id_column}, {name_column} FROM {table}
+                 WHERE ((directory_id IS NULL AND ? IS NULL) OR directory_id = ?)"
+            )
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        stmt.bind((1, directory_id))
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        stmt.bind((2, directory_id))
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        while let sqlite::State::Row = stmt.next().map_err(|e: sqlite::Error| e.to_string())? {
+            let id = stmt
+                .read::<String, _>(id_column)
+                .map_err(|e| e.to_string())?;
+            let ignored = if table == "drive_pending_files" {
+                ignore_pending_id == Some(id.as_str())
+            } else {
+                ignore_entry_id == Some(id.as_str())
+            };
+            if ignored {
+                continue;
+            }
+            let existing = stmt
+                .read::<String, _>(name_column)
+                .map_err(|e| e.to_string())?;
+            if portable_name_key(&existing) == wanted {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1807,6 +1828,7 @@ pub fn create_drive_directory(
     // are first uploaded through the dedicated Drive storage pool.
     let backing: Option<String> = None;
     let id = new_drive_id();
+    validate_prospective_directory_parent(conn, &id, parent_id, true)?;
     let now = now_ms();
     let mut stmt = conn
         .prepare(
@@ -2810,6 +2832,7 @@ pub fn rename_drive_directory(
             }
         }
     }
+    validate_prospective_directory_parent(conn, id, new_parent_id, false)?;
     let mut stmt = conn
         .prepare(
             "UPDATE drive_directories
@@ -4101,6 +4124,174 @@ pub fn finalize_drive_streamed_pending(
     Ok(Some(pending.staging_path))
 }
 
+const MAX_DRIVE_PROVIDER_LOCAL_STATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DRIVE_PROVIDER_PROJECTION_RECORDS: usize = 100_000;
+
+pub fn load_drive_provider_projection(
+    conn: &sqlite::Connection,
+    provider: &str,
+    expected_schema_version: i64,
+) -> Result<Option<Vec<crate::drive_fs_core::DriveProjectionRecord>>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT schema_version, length(state_json) AS state_bytes, state_json
+             FROM drive_provider_local_state WHERE provider = ?",
+        )
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    stmt.bind((1, provider))
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    if !matches!(
+        stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
+        sqlite::State::Row
+    ) {
+        return Ok(None);
+    }
+    let schema_version = stmt
+        .read::<i64, _>("schema_version")
+        .map_err(|e| e.to_string())?;
+    if schema_version != expected_schema_version {
+        return Err(format!(
+            "Drive provider checkpoint schema mismatch: expected {expected_schema_version}, found {schema_version}"
+        ));
+    }
+    let state_bytes = stmt
+        .read::<i64, _>("state_bytes")
+        .map_err(|e| e.to_string())?;
+    if state_bytes < 0 || state_bytes as usize > MAX_DRIVE_PROVIDER_LOCAL_STATE_BYTES {
+        return Err("Drive provider checkpoint exceeds the safe size limit".to_string());
+    }
+    let payload = stmt
+        .read::<String, _>("state_json")
+        .map_err(|e| e.to_string())?;
+    let records: Vec<crate::drive_fs_core::DriveProjectionRecord> = serde_json::from_str(&payload)
+        .map_err(|e| format!("Drive provider checkpoint JSON is invalid: {e}"))?;
+    if records.len() > MAX_DRIVE_PROVIDER_PROJECTION_RECORDS {
+        return Err("Drive provider checkpoint contains too many records".to_string());
+    }
+    let mut identities = HashSet::new();
+    if records.iter().any(|record| !identities.insert(&record.id)) {
+        return Err("Drive provider checkpoint contains duplicate identities".to_string());
+    }
+    Ok(Some(records))
+}
+
+pub fn save_drive_provider_projection(
+    conn: &sqlite::Connection,
+    provider: &str,
+    schema_version: i64,
+    records: &[crate::drive_fs_core::DriveProjectionRecord],
+) -> Result<(), String> {
+    if records.len() > MAX_DRIVE_PROVIDER_PROJECTION_RECORDS {
+        return Err("Drive provider checkpoint contains too many records".to_string());
+    }
+    let mut identities = HashSet::new();
+    if records.iter().any(|record| !identities.insert(&record.id)) {
+        return Err("Drive provider checkpoint contains duplicate identities".to_string());
+    }
+    let payload = serde_json::to_string(records)
+        .map_err(|e| format!("Could not serialize Drive provider checkpoint: {e}"))?;
+    if payload.len() > MAX_DRIVE_PROVIDER_LOCAL_STATE_BYTES {
+        return Err("Drive provider checkpoint exceeds the safe size limit".to_string());
+    }
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO drive_provider_local_state(provider, schema_version, state_json, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(provider) DO UPDATE SET
+                 schema_version = excluded.schema_version,
+                 state_json = excluded.state_json,
+                 updated_at = excluded.updated_at",
+        )
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    stmt.bind((1, provider))
+        .and_then(|_| stmt.bind((2, schema_version)))
+        .and_then(|_| stmt.bind((3, payload.as_str())))
+        .and_then(|_| stmt.bind((4, now_ms())))
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    stmt.next().map_err(|e: sqlite::Error| e.to_string())?;
+    Ok(())
+}
+
+fn validate_directory_topology(directories: &[DriveDirectoryRecord]) -> Result<(), String> {
+    let parents: HashMap<&str, Option<&str>> = directories
+        .iter()
+        .map(|directory| (directory.id.as_str(), directory.parent_id.as_deref()))
+        .collect();
+    let mut resolved_depths: HashMap<&str, usize> = HashMap::new();
+
+    for directory in directories {
+        if resolved_depths.contains_key(directory.id.as_str()) {
+            continue;
+        }
+        let mut current = directory.id.as_str();
+        let mut chain = Vec::new();
+        let mut active = HashSet::new();
+        let base_depth = loop {
+            if let Some(depth) = resolved_depths.get(current) {
+                break *depth;
+            }
+            if !active.insert(current) {
+                return Err("Drive metadata contains a directory cycle".to_string());
+            }
+            chain.push(current);
+            match parents.get(current).copied().flatten() {
+                Some(parent) => {
+                    if !parents.contains_key(parent) {
+                        return Err("Drive metadata references a missing parent folder".to_string());
+                    }
+                    current = parent;
+                }
+                None => break 0,
+            }
+        };
+
+        let mut depth = base_depth;
+        while let Some(id) = chain.pop() {
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| "Drive directory depth overflow".to_string())?;
+            if depth > MAX_DRIVE_DIRECTORY_DEPTH {
+                return Err("Drive metadata directory hierarchy is too deep".to_string());
+            }
+            resolved_depths.insert(id, depth);
+        }
+    }
+    Ok(())
+}
+
+fn validate_prospective_directory_parent(
+    conn: &sqlite::Connection,
+    directory_id: &str,
+    parent_id: Option<&str>,
+    is_new: bool,
+) -> Result<(), String> {
+    let mut directories = load_manifest_directories(conn)?;
+    if is_new {
+        if directories
+            .iter()
+            .any(|directory| directory.id == directory_id)
+        {
+            return Err("Drive directory ID already exists".to_string());
+        }
+        directories.push(DriveDirectoryRecord {
+            id: directory_id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            name: "_prospective_".to_string(),
+            backing_logical_channel_id: None,
+            created_at: 0,
+            updated_at: 0,
+            trashed_at: None,
+        });
+    } else {
+        let directory = directories
+            .iter_mut()
+            .find(|directory| directory.id == directory_id && directory.trashed_at.is_none())
+            .ok_or_else(|| "Drive folder does not exist".to_string())?;
+        directory.parent_id = parent_id.map(str::to_string);
+    }
+    validate_directory_topology(&directories)
+}
+
 fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
     if manifest.schema_version != LEGACY_DRIVE_SCHEMA_VERSION
         && manifest.schema_version != PRE_STORAGE_POOL_DRIVE_SCHEMA_VERSION
@@ -4120,11 +4311,20 @@ fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
         }
     }
     let mut directory_ids = HashSet::new();
+    let mut active_namespace = HashSet::new();
     for directory in &manifest.directories {
         if directory.id.is_empty() || !directory_ids.insert(directory.id.clone()) {
             return Err("Drive metadata contains an invalid or duplicate directory ID".to_string());
         }
         validate_drive_name(&directory.name)?;
+        if directory.trashed_at.is_none()
+            && !active_namespace.insert((
+                directory.parent_id.clone(),
+                portable_name_key(&directory.name),
+            ))
+        {
+            return Err("Drive metadata contains colliding sibling names".to_string());
+        }
     }
     for directory in &manifest.directories {
         if let Some(parent) = directory.parent_id.as_deref() {
@@ -4133,6 +4333,7 @@ fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
             }
         }
     }
+    validate_directory_topology(&manifest.directories)?;
     let valid_hex_64 = |value: &str| {
         value.len() == 64
             && value
@@ -4153,6 +4354,14 @@ fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
             if !directory_ids.contains(directory_id) {
                 return Err("Drive metadata references a missing file folder".to_string());
             }
+        }
+        if entry.trashed_at.is_none()
+            && !active_namespace.insert((
+                entry.directory_id.clone(),
+                portable_name_key(&entry.display_name),
+            ))
+        {
+            return Err("Drive metadata contains colliding sibling names".to_string());
         }
 
         match entry.encryption_version {
@@ -4330,6 +4539,14 @@ fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
             if !directory_ids.contains(directory_id) {
                 return Err("Drive V2 metadata references a missing file folder".to_string());
             }
+        }
+        if entry.trashed_at.is_none()
+            && !active_namespace.insert((
+                entry.directory_id.clone(),
+                portable_name_key(&entry.display_name),
+            ))
+        {
+            return Err("Drive metadata contains colliding sibling names".to_string());
         }
     }
     Ok(())
@@ -4616,6 +4833,19 @@ fn merge_drive_manifests(
 fn apply_manifest(conn: &sqlite::Connection, manifest: &DriveManifestV1) -> Result<(), String> {
     validate_manifest(manifest)?;
     crate::drive_storage::init_drive_storage_schema(conn)?;
+    let last_remote_message_id = {
+        let mut stmt = conn
+            .prepare("SELECT last_remote_message_id FROM drive_state WHERE singleton = 1")
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        if matches!(
+            stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
+            sqlite::State::Row
+        ) {
+            stmt.read::<Option<i64>, _>(0).ok().flatten()
+        } else {
+            None
+        }
+    };
     let objects_by_id: BTreeMap<&str, &DriveObjectRecord> = manifest
         .objects
         .iter()
@@ -4910,7 +5140,7 @@ fn apply_manifest(conn: &sqlite::Connection, manifest: &DriveManifestV1) -> Resu
         }
 
         crate::drive_crypto::save_crypto_envelope(conn, manifest.crypto.as_ref())?;
-        set_drive_clean(conn, manifest.revision, None)?;
+        set_drive_clean(conn, manifest.revision, last_remote_message_id)?;
         Ok::<(), String>(())
     })();
 
@@ -5057,6 +5287,21 @@ async fn publish_manifest(
     Ok(new_id)
 }
 
+fn notify_native_drive_metadata_changed(app_handle: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    if let Err(error) = crate::drive_windows::refresh() {
+        log::warn!("Could not refresh Windows TeraRelay Drive after metadata sync: {error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::drive_provider_ipc::signal_changes(app_handle) {
+        log::warn!("Could not signal macOS TeraRelay Drive after metadata sync: {error}");
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let _ = app_handle;
+}
+
 #[tauri::command]
 pub async fn cmd_drive_sync_metadata(
     app_handle: AppHandle,
@@ -5127,6 +5372,8 @@ pub async fn cmd_drive_sync_metadata(
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         apply_manifest(&conn, &manifest)?;
         set_drive_clean(&conn, manifest.revision, Some(message_id as i64))?;
+        drop(conn);
+        notify_native_drive_metadata_changed(&app_handle);
         return Ok(DriveSyncResult {
             revision: manifest.revision,
             dirty: false,
@@ -5153,6 +5400,8 @@ pub async fn cmd_drive_sync_metadata(
             let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
             apply_manifest(&conn, &manifest)?;
             set_drive_clean(&conn, manifest.revision, Some(message_id as i64))?;
+            drop(conn);
+            notify_native_drive_metadata_changed(&app_handle);
             return Ok(DriveSyncResult {
                 revision: manifest.revision,
                 dirty: false,
@@ -5165,6 +5414,8 @@ pub async fn cmd_drive_sync_metadata(
             let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
             apply_manifest(&conn, &manifest)?;
             set_drive_clean(&conn, manifest.revision, message_id)?;
+            drop(conn);
+            notify_native_drive_metadata_changed(&app_handle);
             return Ok(DriveSyncResult {
                 revision: manifest.revision,
                 dirty: false,
@@ -5179,6 +5430,8 @@ pub async fn cmd_drive_sync_metadata(
         if manifest.revision == local_revision {
             let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
             apply_manifest(&conn, &manifest)?;
+            drop(conn);
+            notify_native_drive_metadata_changed(&app_handle);
         }
     }
 
@@ -5224,6 +5477,65 @@ mod tests {
         conn
     }
 
+    #[test]
+    fn drive_namespace_rejects_unicode_case_collisions() {
+        let conn = memory_db();
+        create_drive_directory(&conn, None, "Résumé").unwrap();
+        assert!(create_drive_directory(&conn, None, "résumé").is_err());
+
+        create_drive_pending_file(
+            &conn,
+            "11111111222222223333333344444444",
+            None,
+            "Ångström.txt",
+            "staging-a",
+        )
+        .unwrap();
+        assert!(create_drive_pending_file(
+            &conn,
+            "55555555666666667777777788888888",
+            None,
+            "ångström.txt",
+            "staging-b",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn drive_names_are_portable_to_windows_explorer() {
+        for invalid in [
+            "CON",
+            "nul.txt",
+            "COM1.log",
+            "LPT9",
+            "a:b.txt",
+            "what?.txt",
+            "star*.txt",
+            "pipe|name",
+            "quote\"name",
+            "back\\slash",
+            "angle<name>",
+            "trailing.",
+            " leading.txt",
+            "trailing.txt ",
+            "control\u{001f}name",
+        ] {
+            assert!(
+                validate_drive_name(invalid).is_err(),
+                "expected Windows-incompatible Drive name to be rejected: {invalid:?}"
+            );
+        }
+        for valid in [
+            "report.txt",
+            ".env",
+            "COM10.txt",
+            "project 2026",
+            "résumé.pdf",
+        ] {
+            assert_eq!(validate_drive_name(valid).unwrap(), valid);
+        }
+    }
+
     fn insert_v2_test_file(
         conn: &sqlite::Connection,
         entry_id: &str,
@@ -5261,6 +5573,25 @@ mod tests {
                      'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd');"
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn applying_manifest_preserves_known_remote_message_id() {
+        let conn = memory_db();
+        let manifest = build_manifest(&conn).unwrap();
+        set_drive_clean(&conn, manifest.revision, Some(77)).unwrap();
+
+        apply_manifest(&conn, &manifest).unwrap();
+
+        let mut state = conn
+            .prepare("SELECT last_remote_message_id FROM drive_state WHERE singleton = 1")
+            .unwrap();
+        assert!(matches!(state.next().unwrap(), sqlite::State::Row));
+        assert_eq!(
+            state.read::<Option<i64>, _>(0).unwrap(),
+            Some(77),
+            "Re-applying an equal remote manifest must not forget which Telegram message supplied it"
+        );
     }
 
     #[test]
@@ -6571,6 +6902,228 @@ mod tests {
         assert_eq!(merged.objects.len(), 1);
         assert_eq!(merged.parts.len(), 1);
         assert_eq!(merged.v2_entries.len(), 1);
+    }
+
+    #[test]
+    fn provider_projection_checkpoint_round_trips_atomically_without_dirtying_drive_state() {
+        use crate::drive_fs_core::{DriveNodeId, DriveNodeKind, DriveProjectionRecord};
+
+        let conn = memory_db();
+        let records = vec![DriveProjectionRecord {
+            id: DriveNodeId::File("entry-a".to_string()),
+            path: vec!["Folder".to_string(), "File.txt".to_string()],
+            kind: DriveNodeKind::File,
+            content_version: "object-a".to_string(),
+            size: 42,
+            updated_at_ms: 123,
+        }];
+        assert!(load_drive_provider_projection(&conn, "windows-cfapi", 1)
+            .unwrap()
+            .is_none());
+        save_drive_provider_projection(&conn, "windows-cfapi", 1, &records).unwrap();
+        assert_eq!(
+            load_drive_provider_projection(&conn, "windows-cfapi", 1)
+                .unwrap()
+                .unwrap(),
+            records
+        );
+        assert!(load_drive_provider_projection(&conn, "windows-cfapi", 2).is_err());
+
+        let state = state_row(&conn).unwrap();
+        assert_eq!(state.0, 0);
+        assert!(
+            !state.1,
+            "local provider checkpoint must not enter Device Continuity"
+        );
+    }
+
+    #[test]
+    fn local_directory_creation_enforces_native_provider_depth_limit() {
+        let conn = memory_db();
+        let mut parent: Option<String> = None;
+        for depth in 0..MAX_DRIVE_DIRECTORY_DEPTH {
+            let directory =
+                create_drive_directory(&conn, parent.as_deref(), &format!("Folder {depth}"))
+                    .unwrap();
+            parent = Some(directory.id);
+        }
+        assert!(create_drive_directory(&conn, parent.as_deref(), "Too Deep").is_err());
+    }
+
+    #[test]
+    fn local_directory_move_cannot_push_descendants_beyond_provider_depth_limit() {
+        let conn = memory_db();
+        let mut parent: Option<String> = None;
+        for depth in 0..(MAX_DRIVE_DIRECTORY_DEPTH - 1) {
+            let directory =
+                create_drive_directory(&conn, parent.as_deref(), &format!("Chain {depth}"))
+                    .unwrap();
+            parent = Some(directory.id);
+        }
+        let moving = create_drive_directory(&conn, None, "Moving").unwrap();
+        let leaf = create_drive_directory(&conn, Some(&moving.id), "Leaf").unwrap();
+        assert!(rename_drive_directory(&conn, &moving.id, parent.as_deref(), "Moving").is_err());
+        assert_eq!(
+            load_directories(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|directory| directory.id == leaf.id)
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(moving.id.as_str())
+        );
+    }
+
+    #[test]
+    fn remote_manifest_rejects_portable_sibling_namespace_collisions() {
+        let mut manifest = DriveManifestV1 {
+            schema_version: DRIVE_SCHEMA_VERSION,
+            revision: 1,
+            crypto: None,
+            directories: vec![
+                DriveDirectoryRecord {
+                    id: "dir-a".into(),
+                    parent_id: None,
+                    name: "Résumé".into(),
+                    backing_logical_channel_id: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    trashed_at: None,
+                },
+                DriveDirectoryRecord {
+                    id: "dir-b".into(),
+                    parent_id: None,
+                    name: "résumé".into(),
+                    backing_logical_channel_id: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    trashed_at: None,
+                },
+            ],
+            entries: Vec::new(),
+            storage_channels: vec![],
+            objects: vec![],
+            parts: vec![],
+            v2_entries: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+
+        manifest.directories.truncate(1);
+        manifest.directories[0].name = "Café.txt".into();
+        manifest.entries.push(DriveEntryRecord {
+            entry_id: "legacy-entry".into(),
+            file_id: "legacy-file".into(),
+            directory_id: None,
+            display_name: "Cafe\u{301}.txt".into(),
+            created_at: 1,
+            updated_at: 1,
+            encryption_version: 0,
+            plaintext_size: None,
+            crypto_id: None,
+            content_fingerprint: None,
+            trashed_at: None,
+        });
+        assert!(validate_manifest(&manifest).is_err());
+
+        let source = memory_db();
+        crate::drive_storage::init_drive_storage_schema(&source).unwrap();
+        crate::drive_storage::register_storage_channel(
+            &source,
+            1,
+            202,
+            "TeraRelay Drive Storage",
+            "active",
+            None,
+        )
+        .unwrap();
+        insert_v2_test_file(
+            &source,
+            "v2-entry",
+            "12121212343434345656565678787878",
+            None,
+            "Ångström.txt",
+            202,
+            8101,
+        );
+        let mut v2_manifest = build_manifest(&source).unwrap();
+        v2_manifest.directories.push(DriveDirectoryRecord {
+            id: "v2-collision-dir".into(),
+            parent_id: None,
+            name: "ångström.txt".into(),
+            backing_logical_channel_id: None,
+            created_at: 1,
+            updated_at: 1,
+            trashed_at: None,
+        });
+        assert!(validate_manifest(&v2_manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_directory_cycles() {
+        let manifest = DriveManifestV1 {
+            schema_version: DRIVE_SCHEMA_VERSION,
+            revision: 1,
+            crypto: None,
+            directories: vec![
+                DriveDirectoryRecord {
+                    id: "a".into(),
+                    parent_id: Some("b".into()),
+                    name: "A".into(),
+                    backing_logical_channel_id: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    trashed_at: None,
+                },
+                DriveDirectoryRecord {
+                    id: "b".into(),
+                    parent_id: Some("a".into()),
+                    name: "B".into(),
+                    backing_logical_channel_id: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    trashed_at: None,
+                },
+            ],
+            entries: Vec::new(),
+            storage_channels: vec![],
+            objects: vec![],
+            parts: vec![],
+            v2_entries: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_directory_hierarchy_deeper_than_native_provider_limit() {
+        let mut directories = Vec::new();
+        for depth in 0..=512usize {
+            directories.push(DriveDirectoryRecord {
+                id: format!("dir-{depth}"),
+                parent_id: if depth == 0 {
+                    None
+                } else {
+                    Some(format!("dir-{}", depth - 1))
+                },
+                name: format!("Folder {depth}"),
+                backing_logical_channel_id: None,
+                created_at: 1,
+                updated_at: 1,
+                trashed_at: None,
+            });
+        }
+        let manifest = DriveManifestV1 {
+            schema_version: DRIVE_SCHEMA_VERSION,
+            revision: 1,
+            crypto: None,
+            directories,
+            entries: Vec::new(),
+            storage_channels: vec![],
+            objects: vec![],
+            parts: vec![],
+            v2_entries: vec![],
+        };
+        assert!(validate_manifest(&manifest).is_err());
     }
 
     #[test]

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR">
+      <Component Id="TeraRelayExplorerNamespace" Guid="*">
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}" Action="createAndRemoveOnUninstall">
+          <RegistryValue Type="string" Value="TeraRelay" />
+          <RegistryValue Name="System.IsPinnedToNameSpaceTree" Type="integer" Value="1" KeyPath="yes" />
+          <RegistryValue Name="SortOrderIndex" Type="integer" Value="66" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}\DefaultIcon" Action="createAndRemoveOnUninstall">
+          <RegistryValue Type="expandable" Value="%SystemRoot%\system32\imageres.dll,-1043" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}\InProcServer32" Action="createAndRemoveOnUninstall">
+          <RegistryValue Type="expandable" Value="%SystemRoot%\system32\shell32.dll" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}\Instance" Action="createAndRemoveOnUninstall">
+          <RegistryValue Name="CLSID" Type="string" Value="{0E5AAE11-A475-4c5b-AB00-C66DE400274E}" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}\Instance\InitPropertyBag" Action="createAndRemoveOnUninstall">
+          <RegistryValue Name="Attributes" Type="integer" Value="17" />
+          <RegistryValue Name="TargetFolderPath" Type="expandable" Value="%USERPROFILE%\TeraRelay Drive" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}\ShellFolder" Action="createAndRemoveOnUninstall">
+          <RegistryValue Name="FolderValueFlags" Type="integer" Value="40" />
+          <RegistryValue Name="Attributes" Type="integer" Value="4034920525" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}" Action="createAndRemoveOnUninstall">
+          <RegistryValue Type="string" Value="TeraRelay" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel" Action="createAndRemoveOnUninstall">
+          <RegistryValue Name="{3F1DA139-ED78-4BD2-9C96-EBF7981E5E4B}" Type="integer" Value="1" />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+
+    <!-- Full uninstall only. Upgrades keep the existing Cloud Files sync root
+         so dehydrated placeholders are not torn down between app versions. -->
+    <CustomAction
+      Id="TeraRelayUnregisterCloudFiles"
+      Directory="INSTALLDIR"
+      ExeCommand="&quot;[INSTALLDIR]terarelay.exe&quot; --unregister-drive-sync-root"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check"
+    />
+    <InstallExecuteSequence>
+      <Custom Action="TeraRelayUnregisterCloudFiles" Before="RemoveFiles"><![CDATA[REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE]]></Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

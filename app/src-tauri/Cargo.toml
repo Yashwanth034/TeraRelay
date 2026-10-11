@@ -58,6 +58,7 @@ bitflags = "=2.10.0"
 tauri-plugin-clipboard-manager = "2"
 rand = "0.9"
 sha2 = "0.10"
+minisign-verify = "0.3"
 md5 = "0.8"
 bcrypt = "0.16"
 constant_time_eq = "0.3"
@@ -74,13 +75,38 @@ tokio-rustls = "0.26"
 rustls = "0.23"
 webpki-roots = "0.26"
 mime_guess = "2"
+unicode-normalization = "0.1"
+librqbit = "9.0.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Foundation",
+  "Storage",
+  "Storage_Provider",
+  "Win32_Foundation",
+  "Win32_Storage_CloudFilters",
+  "Win32_Storage_FileSystem",
+  "Win32_System_CorrelationVector",
+  "Win32_System_IO",
+  "Win32_System_Threading",
+] }
+notify = { version = "8.2.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.1"
+libc = "0.2"
+objc2 = "0.6.2"
+objc2-file-provider = { version = "0.3.2", default-features = false, features = ["std", "Extension", "NSFileProviderDomain", "NSFileProviderItem", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

@@ -6,6 +6,17 @@
 const BUNDLE_ID: &str = "io.terarelay.desktop";
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().any(|arg| arg == "--unregister-drive-sync-root") {
+        match terarelay_lib::drive_windows::unregister_known_sync_root() {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("TeraRelay Drive uninstall cleanup failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Fix EGL_BAD_ALLOC on Linux distros (especially Arch) where the AppImage's
     // bundled Mesa conflicts with the host's GPU driver stack.
     // This must be set BEFORE tauri::Builder initializes the WebKitGTK WebView.

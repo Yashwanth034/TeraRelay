@@ -60,9 +60,14 @@ pub mod api_routes;
 pub mod db;
 mod download_output;
 pub mod drive_crypto;
+pub mod drive_fs_core;
 pub mod drive_mount;
+#[cfg(target_os = "macos")]
+pub mod drive_provider_ipc;
 pub mod drive_storage;
 pub mod drive_stream;
+#[cfg(target_os = "windows")]
+pub mod drive_windows;
 pub mod fmp4_remux;
 pub mod mp4_utils;
 pub mod server;
@@ -318,8 +323,11 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init());
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build());
 
     let app = builder
         .setup(move |app| {
@@ -458,7 +466,7 @@ pub fn run() {
             // it from the native application lifecycle so Nemo/other programs
             // can see TeraRelay Drive even while the WebView is reloading. The
             // existing local metadata remains useful while Telegram reconnects.
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 match drive_mount::cmd_drive_mount(
                     app.handle().clone(),
@@ -477,9 +485,10 @@ pub fn run() {
                         }
                     }
                     Err(error) => {
-                        // Keep the main app usable if FUSE is unavailable on a
-                        // particular machine. The Settings/status command can
-                        // expose the failure and a later retry remains possible.
+                        // Keep the main app usable if the platform-native Drive
+                        // provider is unavailable on a particular machine. The
+                        // Settings/status command can expose the failure and a
+                        // later retry remains possible.
                         log::error!("TeraRelay Drive mount failed: {}", error);
                         #[cfg(debug_assertions)]
                         if let Ok(cache_dir) = app.path().app_cache_dir() {
@@ -624,6 +633,17 @@ pub fn run() {
             tdlib_fast::cmd_fast_transfer_code,
             tdlib_fast::cmd_fast_transfer_password,
             tdlib_fast::cmd_fast_transfer_logout_saved,
+            commands::cmd_remote_import_update_engines,
+            commands::cmd_remote_import_engine_status,
+            commands::cmd_remote_import_analyze,
+            commands::cmd_remote_import_acquire,
+            commands::cmd_remote_import_cancel,
+            commands::cmd_remote_import_cleanup,
+            commands::cmd_mobile_check_update,
+            commands::cmd_android_download_update,
+            commands::cmd_android_can_install_packages,
+            commands::cmd_android_open_install_permission,
+            commands::cmd_android_install_update,
             commands::cmd_upload_from_url,
             cmd_open_file_externally,
             upload_service::cmd_start_foreground_service,

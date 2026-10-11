@@ -3,6 +3,16 @@
   "plugins": {
     "shell": {
       "open": true
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEOTAzN0I2MzZDODcwQjAKUldTd2NNZzJ0amVRclNINTFwUUl2Y3c0Wk5iRmxzUEVNcHhXR2loRkFxejdkV2gvZkJzZVI2d1YK",
+      "requireSignedVersion": true,
+      "endpoints": [
+        "https://github.com/Yashwanth034/TeraRelay/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "productName": "TeraRelay",
@@ -11,7 +21,8 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && node ../scripts/configure-android-updater.mjs --project-root src-tauri/gen/android",
+    "beforeBundleCommand": "node ../scripts/prepare-macos-file-provider.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -29,6 +40,8 @@
       "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* https://asset.localhost http://asset.localhost; media-src 'self' blob: http://localhost:*; img-src 'self' data: blob: asset: https: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https:; frame-src 'self' blob: https: http://127.0.0.1:*; worker-src 'self' blob:;",
       "capabilities": [
         "default",
+        "desktop-updater",
+        "ios-updater",
         "mobile-only"
       ]
     }
@@ -36,7 +49,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -45,10 +58,30 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "entitlements": "entitlements.plist"
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "12.0",
+      "files": {
+        "PlugIns/TeraRelayFileProvider.appex": "macos-file-provider/build/TeraRelayFileProvider.appex"
+      }
     },
     "android": {
       "minSdkVersion": 24
+    },
+    "resources": [
+      "resources/remote-import"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/nsis/explorer-drive.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "windows/fragments/explorer-drive.wxs"
+        ],
+        "componentRefs": [
+          "TeraRelayExplorerNamespace"
+        ]
+      }
     }
   }
 }

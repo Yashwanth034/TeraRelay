@@ -9,6 +9,8 @@ use crate::commands::drive_metadata::{
     DriveFileRecord, DrivePendingRecord,
 };
 use crate::db::DbConnection;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use crate::drive_fs_core::DriveFsCore;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -24,6 +26,7 @@ pub struct DriveMountStatus {
     pub mount_point: Option<String>,
     pub read_streaming: bool,
     pub write_staging: bool,
+    pub provider_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,16 +199,46 @@ impl DriveMountState {
         }
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub(crate) fn mark_provider_connected(&self, path: Option<PathBuf>) {
+        if let Ok(mut slot) = self.inner.mount_point.lock() {
+            *slot = path;
+        }
+        self.inner.mounting.store(false, Ordering::SeqCst);
+        self.inner.mounted.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub(crate) fn mark_provider_disconnected(&self) {
+        self.inner.mounted.store(false, Ordering::SeqCst);
+        self.inner.mounting.store(false, Ordering::SeqCst);
+    }
+
     fn status(&self) -> DriveMountStatus {
+        let desktop = cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        ));
+        let provider_kind = if cfg!(target_os = "linux") {
+            "fuse"
+        } else if cfg!(target_os = "windows") {
+            "windows-cloud-files"
+        } else if cfg!(target_os = "macos") {
+            "macos-file-provider"
+        } else {
+            "unsupported"
+        };
         DriveMountStatus {
-            supported: cfg!(target_os = "linux"),
+            supported: desktop,
             mounted: self.inner.mounted.load(Ordering::SeqCst),
             mount_point: self.inner.mount_point.lock().ok().and_then(|path| {
                 path.as_ref()
                     .map(|value| value.to_string_lossy().into_owned())
             }),
-            read_streaming: cfg!(target_os = "linux"),
-            write_staging: cfg!(target_os = "linux"),
+            read_streaming: desktop,
+            write_staging: desktop,
+            provider_kind: provider_kind.to_string(),
         }
     }
 }
@@ -215,59 +248,139 @@ pub fn cmd_drive_status(state: State<'_, DriveMountState>) -> DriveMountStatus {
     state.status()
 }
 
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-pub fn cmd_drive_mount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
-    let _ = state;
-    Err("TeraRelay Drive V1 is currently available on Linux only".to_string())
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn build_drive_fs_core(
+    app_handle: &AppHandle,
+    state: &DriveMountState,
+    db_pool: &DbConnection,
+    telegram_state: &crate::commands::TelegramState,
+) -> Result<DriveFsCore, String> {
+    desktop::build_core(app_handle, state, db_pool, telegram_state)
 }
 
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-pub fn cmd_drive_unmount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
-    Ok(state.status())
-}
-
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-pub fn cmd_drive_recover_pending(
-    _app_handle: AppHandle,
-    _state: State<'_, DriveMountState>,
-    _db_pool: State<'_, DbConnection>,
-    _telegram_state: State<'_, crate::commands::TelegramState>,
-) -> Result<DriveRecoveryResult, String> {
-    Ok(DriveRecoveryResult {
-        recovered: 0,
-        remaining: 0,
-        failures: 0,
-    })
-}
-
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod desktop {
     use super::*;
     use crate::commands::drive_metadata::DriveSnapshot;
+    use crate::drive_fs_core::{
+        DriveFsBackend, DriveFsCore, DriveFsError, DriveNodeId, DriveNodeKind, DriveNodeMetadata,
+        DriveRecoverySummary, DriveVirtualCapacity,
+    };
+    #[cfg(target_os = "linux")]
     use fuser::{
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
         ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
         TimeOrNow,
     };
+    #[cfg(target_os = "linux")]
     use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EROFS};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
-    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    #[cfg(windows)]
+    use std::os::windows::fs::{FileExt as WindowsFileExt, OpenOptionsExt};
+    #[cfg(target_os = "linux")]
     use std::process::Command;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
+    #[cfg(target_os = "linux")]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(target_os = "linux")]
     const ROOT_INODE: u64 = 1;
+    #[cfg(target_os = "linux")]
     const TTL: Duration = Duration::from_secs(1);
     const CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
     const CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     // Only bounded chunks may reside locally. Scatter/random writes must not
     // silently consume the entire local disk while waiting to be completed.
     const STAGING_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+    fn reject_symlink_file(path: &Path) -> Result<(), String> {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                return Err("Drive staging path cannot be a symbolic link".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn open_private_read(path: &Path) -> Result<File, String> {
+        reject_symlink_file(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        options
+            .open(path)
+            .map_err(|e| format!("Could not open private Drive file for reading: {e}"))
+    }
+
+    fn create_private_file(path: &Path, truncate: bool) -> Result<File, String> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(truncate);
+        if !truncate {
+            options.create_new(true);
+        }
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        options
+            .open(path)
+            .map_err(|e| format!("Could not create private Drive file: {e}"))
+    }
+
+    fn open_or_create_private_file(path: &Path) -> Result<File, String> {
+        reject_symlink_file(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        options
+            .open(path)
+            .map_err(|e| format!("Could not open Drive staging file: {e}"))
+    }
+
+    #[cfg(unix)]
+    fn positioned_read(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        UnixFileExt::read_at(file, data, offset)
+    }
+
+    #[cfg(windows)]
+    fn positioned_read(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        WindowsFileExt::seek_read(file, data, offset)
+    }
+
+    #[cfg(unix)]
+    fn positioned_write(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+        UnixFileExt::write_at(file, data, offset)
+    }
+
+    #[cfg(windows)]
+    fn positioned_write(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+        WindowsFileExt::seek_write(file, data, offset)
+    }
+
+    fn allocated_file_bytes(metadata: &std::fs::Metadata) -> u64 {
+        #[cfg(unix)]
+        {
+            return metadata.blocks().saturating_mul(512);
+        }
+        #[cfg(not(unix))]
+        {
+            metadata.len()
+        }
+    }
 
     fn ensure_private_staging_directory(path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(path)
@@ -277,8 +390,12 @@ mod linux {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err("Drive staging path is not a private directory".to_string());
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("Could not secure Drive staging directory: {e}"))
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("Could not secure Drive staging directory: {e}"))?;
+        }
+        Ok(())
     }
 
     fn sync_local_staging_for_pending(pending: &DrivePendingRecord) -> Result<(), String> {
@@ -299,19 +416,20 @@ mod linux {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err("Drive staging contains an unsafe non-file entry".to_string());
             }
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(entry.path())
-                .and_then(|file| file.sync_all())
+            open_private_read(&entry.path())?
+                .sync_all()
                 .map_err(|e| format!("Could not sync local Drive staged bytes: {e}"))?;
         }
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(dir)
-            .and_then(|file| file.sync_all())
-            .map_err(|e| format!("Could not sync Drive staging directory: {e}"))
+        #[cfg(unix)]
+        {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(dir)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| format!("Could not sync Drive staging directory: {e}"))?;
+        }
+        Ok(())
     }
 
     fn allocated_stage_bytes(root: &Path) -> Result<u64, String> {
@@ -335,7 +453,7 @@ mod linux {
                 if meta.is_dir() {
                     pending.push(entry.path());
                 } else {
-                    total = total.saturating_add(meta.blocks().saturating_mul(512));
+                    total = total.saturating_add(allocated_file_bytes(&meta));
                 }
             }
         }
@@ -429,6 +547,7 @@ mod linux {
     }
 
     impl Node {
+        #[cfg(target_os = "linux")]
         fn inode(&self) -> u64 {
             match self {
                 Node::Root => ROOT_INODE,
@@ -443,6 +562,7 @@ mod linux {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn inode_for(kind: &str, id: &str) -> u64 {
         let mut hasher = Sha256::new();
         hasher.update(kind.as_bytes());
@@ -455,6 +575,7 @@ mod linux {
         value.max(2)
     }
 
+    #[cfg(target_os = "linux")]
     fn millis_to_time(value: i64) -> SystemTime {
         if value <= 0 {
             return UNIX_EPOCH;
@@ -462,6 +583,7 @@ mod linux {
         UNIX_EPOCH + Duration::from_millis(value as u64)
     }
 
+    #[cfg(target_os = "linux")]
     fn seconds_to_time(value: i64) -> SystemTime {
         if value <= 0 {
             return UNIX_EPOCH;
@@ -469,11 +591,13 @@ mod linux {
         UNIX_EPOCH + Duration::from_secs(value as u64)
     }
 
+    #[cfg(target_os = "linux")]
     fn current_ids() -> (u32, u32) {
         // SAFETY: getuid/getgid are side-effect-free libc calls.
         unsafe { (libc::getuid(), libc::getgid()) }
     }
 
+    #[cfg(target_os = "linux")]
     fn attr_for(node: &Node) -> FileAttr {
         let (uid, gid) = current_ids();
         match node {
@@ -576,6 +700,69 @@ mod linux {
         mount_state: DriveMountState,
         emitted_uploads: Mutex<std::collections::HashSet<String>>,
         writer_counts: Mutex<HashMap<u64, u32>>,
+    }
+
+    fn build_backend(
+        app_handle: &AppHandle,
+        state: &DriveMountState,
+        db_pool: &DbConnection,
+        telegram_state: &crate::commands::TelegramState,
+    ) -> Result<Arc<TeraRelayFs>, String> {
+        Ok(Arc::new(TeraRelayFs {
+            db: db_pool.clone(),
+            app: app_handle.clone(),
+            stream_port: state.stream_port,
+            stream_token: state.stream_token.clone(),
+            cache_root: state.cache_root.clone(),
+            staging_root: state.staging_root.clone(),
+            http: reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(90))
+                .build()
+                .map_err(|e| format!("Failed to initialize Drive HTTP client: {e}"))?,
+            telegram: telegram_state.clone(),
+            mount_state: state.clone(),
+            emitted_uploads: Mutex::new(std::collections::HashSet::new()),
+            writer_counts: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub(super) fn build_core(
+        app_handle: &AppHandle,
+        state: &DriveMountState,
+        db_pool: &DbConnection,
+        telegram_state: &crate::commands::TelegramState,
+    ) -> Result<DriveFsCore, String> {
+        Ok(DriveFsCore::new(build_backend(
+            app_handle,
+            state,
+            db_pool,
+            telegram_state,
+        )?))
+    }
+
+    fn visible_snapshot_revision(snapshot: &DriveSnapshot) -> Result<u64, String> {
+        // File Provider sync anchors must describe the filesystem view, not only
+        // the cloud manifest. Pending copy-on-write/new-file rows are intentionally
+        // local until finalization and therefore must not dirty Device Continuity,
+        // but they still participate in native-provider enumeration consistency.
+        let mut normalized = snapshot.clone();
+        normalized
+            .directories
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        normalized
+            .files
+            .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+        normalized
+            .pending
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        let encoded = serde_json::to_vec(&normalized)
+            .map_err(|error| format!("Could not fingerprint Drive provider snapshot: {error}"))?;
+        let digest = Sha256::digest(encoded);
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        Ok(u64::from_be_bytes(prefix))
     }
 
     impl TeraRelayFs {
@@ -1161,14 +1348,7 @@ mod linux {
             let staging_dir = self.staging_root.join(&pending_id);
             ensure_private_staging_directory(&staging_dir)?;
             let marker = staging_dir.join(".pending");
-            if let Err(error) = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&marker)
-            {
+            if let Err(error) = create_private_file(&marker, false) {
                 let _ = std::fs::remove_dir_all(&staging_dir);
                 return Err(format!("Could not create Drive edit marker: {error}"));
             }
@@ -1449,8 +1629,7 @@ mod linux {
 
             let local_path = crate::drive_stream::local_chunk_path(pending, chunk_index);
             if local_path.exists() {
-                let local = File::open(&local_path)
-                    .map_err(|e| format!("Could not open Drive write chunk: {e}"))?;
+                let local = open_private_read(&local_path)?;
                 let ranges = {
                     let conn = self.db.lock().map_err(|_| "DB poisoned".to_string())?;
                     drive_pending_ranges(&conn, &pending.id)?
@@ -1464,8 +1643,7 @@ mod linux {
                     let local_offset = overlap_start - chunk_start;
                     let length = (overlap_end - overlap_start) as usize;
                     let mut bytes = vec![0u8; length];
-                    let read = local
-                        .read_at(&mut bytes, local_offset)
+                    let read = positioned_read(&local, &mut bytes, local_offset)
                         .map_err(|e| format!("Could not read Drive write chunk: {e}"))?;
                     if read != length {
                         return Err("Drive write chunk is incomplete".to_string());
@@ -1536,15 +1714,8 @@ mod linux {
                 if let Some(parent) = path.parent() {
                     ensure_private_staging_directory(parent)?;
                 }
-                let file = OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                    .map_err(|e| format!("Could not open Drive chunk staging: {e}"))?;
-                file.write_at(&data[consumed..consumed + take], chunk_offset)
+                let file = open_or_create_private_file(&path)?;
+                positioned_write(&file, &data[consumed..consumed + take], chunk_offset)
                     .map_err(|e| format!("Could not write Drive chunk staging: {e}"))?;
                 consumed += take;
             }
@@ -1665,16 +1836,8 @@ mod linux {
                 if let Some(parent) = path.parent() {
                     ensure_private_staging_directory(parent)?;
                 }
-                let file = OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .write(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                    .map_err(|e| format!("Could not stage resized Drive chunk: {e}"))?;
-                file.write_at(&bytes, 0)
+                let file = create_private_file(&path, true)?;
+                positioned_write(&file, &bytes, 0)
                     .map_err(|e| format!("Could not preserve resized Drive chunk: {e}"))?;
                 let start = index * chunk_size;
                 let conn = self.db.lock().map_err(|_| "DB poisoned".to_string())?;
@@ -1991,7 +2154,642 @@ mod linux {
         }
     }
 
-    impl Filesystem for TeraRelayFs {
+    fn core_error(error: String) -> DriveFsError {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("not found") || lower.contains("disappeared") {
+            DriveFsError::NotFound
+        } else if lower.contains("already exists") {
+            DriveFsError::AlreadyExists
+        } else if lower.contains("not a directory") {
+            DriveFsError::NotDirectory
+        } else if lower.contains("not empty") {
+            DriveFsError::DirectoryNotEmpty
+        } else if lower.contains("locked") {
+            DriveFsError::Locked(error)
+        } else if lower.contains("staging limit reached") || lower.contains("no space") {
+            DriveFsError::NoSpace(error)
+        } else if lower.contains("denied") || lower.contains("permission") {
+            DriveFsError::AccessDenied(error)
+        } else if lower.contains("invalid") || lower.contains("overflow") {
+            DriveFsError::InvalidInput(error)
+        } else {
+            DriveFsError::Internal(error)
+        }
+    }
+
+    fn errno_for_core(error: &DriveFsError) -> i32 {
+        match error {
+            DriveFsError::NotFound => ENOENT,
+            DriveFsError::AlreadyExists => EEXIST,
+            DriveFsError::NotDirectory => ENOTDIR,
+            DriveFsError::IsDirectory => EISDIR,
+            DriveFsError::DirectoryNotEmpty => ENOTEMPTY,
+            DriveFsError::InvalidInput(_) => EINVAL,
+            DriveFsError::AccessDenied(_) | DriveFsError::Locked(_) => EACCES,
+            DriveFsError::NoSpace(_) => ENOSPC,
+            DriveFsError::Cancelled | DriveFsError::Unavailable(_) | DriveFsError::Internal(_) => {
+                EIO
+            }
+        }
+    }
+
+    fn core_parent_id(parent: &DriveNodeId) -> Result<Option<String>, DriveFsError> {
+        match parent {
+            DriveNodeId::Root => Ok(None),
+            DriveNodeId::Directory(id) => Ok(Some(id.clone())),
+            DriveNodeId::File(_) | DriveNodeId::Pending(_) => Err(DriveFsError::NotDirectory),
+        }
+    }
+
+    fn core_node_id(node: &Node) -> DriveNodeId {
+        match node {
+            Node::Root => DriveNodeId::Root,
+            Node::Directory(directory) => DriveNodeId::Directory(directory.id.clone()),
+            Node::Remote(file) => DriveNodeId::File(file.entry_id.clone()),
+            Node::Pending(pending) => DriveNodeId::Pending(pending.id.clone()),
+        }
+    }
+
+    fn core_parent_node(parent_id: Option<&str>) -> DriveNodeId {
+        parent_id
+            .map(|id| DriveNodeId::Directory(id.to_string()))
+            .unwrap_or(DriveNodeId::Root)
+    }
+
+    fn core_metadata(node: &Node) -> DriveNodeMetadata {
+        match node {
+            Node::Root => DriveNodeMetadata {
+                id: DriveNodeId::Root,
+                parent: DriveNodeId::Root,
+                name: "TeraRelay Drive".to_string(),
+                kind: DriveNodeKind::Directory,
+                size: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                content_version: "root".to_string(),
+                pending: false,
+            },
+            Node::Directory(directory) => DriveNodeMetadata {
+                id: DriveNodeId::Directory(directory.id.clone()),
+                parent: core_parent_node(directory.parent_id.as_deref()),
+                name: directory.name.clone(),
+                kind: DriveNodeKind::Directory,
+                size: 0,
+                created_at_ms: directory.created_at,
+                updated_at_ms: directory.updated_at,
+                content_version: directory.id.clone(),
+                pending: false,
+            },
+            Node::Remote(file) => DriveNodeMetadata {
+                id: DriveNodeId::File(file.entry_id.clone()),
+                parent: core_parent_node(file.directory_id.as_deref()),
+                name: file.display_name.clone(),
+                kind: DriveNodeKind::File,
+                size: file.plaintext_size.unwrap_or(file.total_size),
+                created_at_ms: file.created_at.saturating_mul(1000),
+                updated_at_ms: file.updated_at,
+                content_version: file.file_id.clone(),
+                pending: false,
+            },
+            Node::Pending(pending) => DriveNodeMetadata {
+                id: DriveNodeId::File(
+                    pending
+                        .base_entry_id
+                        .clone()
+                        .unwrap_or_else(|| pending.id.clone()),
+                ),
+                parent: core_parent_node(pending.directory_id.as_deref()),
+                name: pending.display_name.clone(),
+                kind: DriveNodeKind::File,
+                size: pending.size,
+                created_at_ms: pending.created_at,
+                updated_at_ms: pending.updated_at,
+                content_version: pending.id.clone(),
+                pending: true,
+            },
+        }
+    }
+
+    impl TeraRelayFs {
+        fn core_node(&self, id: &DriveNodeId) -> Result<Node, DriveFsError> {
+            if matches!(id, DriveNodeId::Root) {
+                return Ok(Node::Root);
+            }
+            let snapshot = self.snapshot().map_err(core_error)?;
+            match id {
+                DriveNodeId::Root => Ok(Node::Root),
+                DriveNodeId::Directory(id) => snapshot
+                    .directories
+                    .into_iter()
+                    .find(|directory| directory.id == *id)
+                    .map(Node::Directory)
+                    .ok_or(DriveFsError::NotFound),
+                DriveNodeId::Pending(id) => snapshot
+                    .pending
+                    .into_iter()
+                    .find(|pending| pending.id == *id)
+                    .map(Node::Pending)
+                    .ok_or(DriveFsError::NotFound),
+                DriveNodeId::File(id) => {
+                    if let Some(pending) = snapshot
+                        .pending
+                        .iter()
+                        .find(|pending| {
+                            pending.base_entry_id.as_deref() == Some(id.as_str())
+                                || pending.id == *id
+                        })
+                        .cloned()
+                    {
+                        return Ok(Node::Pending(pending));
+                    }
+                    snapshot
+                        .files
+                        .into_iter()
+                        .find(|file| file.entry_id == *id)
+                        .map(Node::Remote)
+                        .ok_or(DriveFsError::NotFound)
+                }
+            }
+        }
+
+        fn core_lookup_node(&self, parent: &DriveNodeId, name: &str) -> Result<Node, DriveFsError> {
+            let parent_id = core_parent_id(parent)?;
+            let snapshot = self.snapshot().map_err(core_error)?;
+            let same_parent = |candidate: Option<&str>| candidate == parent_id.as_deref();
+            if let Some(directory) = snapshot.directories.into_iter().find(|directory| {
+                same_parent(directory.parent_id.as_deref()) && directory.name == name
+            }) {
+                return Ok(Node::Directory(directory));
+            }
+            if let Some(pending) = snapshot.pending.iter().find(|pending| {
+                same_parent(pending.directory_id.as_deref()) && pending.display_name == name
+            }) {
+                return Ok(Node::Pending(pending.clone()));
+            }
+            let replaced: std::collections::HashSet<&str> = snapshot
+                .pending
+                .iter()
+                .filter_map(|pending| pending.base_entry_id.as_deref())
+                .collect();
+            snapshot
+                .files
+                .into_iter()
+                .find(|file| {
+                    same_parent(file.directory_id.as_deref())
+                        && file.display_name == name
+                        && !replaced.contains(file.entry_id.as_str())
+                })
+                .map(Node::Remote)
+                .ok_or(DriveFsError::NotFound)
+        }
+
+        fn core_create_pending(
+            &self,
+            parent: &DriveNodeId,
+            name: &str,
+        ) -> Result<DrivePendingRecord, DriveFsError> {
+            if self.core_lookup_node(parent, name).is_ok() {
+                return Err(DriveFsError::AlreadyExists);
+            }
+            self.ensure_write_key_ready().map_err(core_error)?;
+            let parent_id = core_parent_id(parent)?;
+            let pending_id = crate::commands::drive_metadata::new_drive_id();
+            let staging_dir = self.staging_root.join(&pending_id);
+            ensure_private_staging_directory(&staging_dir).map_err(core_error)?;
+            let staging_path = if crate::commands::qa_feature_a::enabled() {
+                staging_dir.join(name)
+            } else {
+                staging_dir.join(".pending")
+            };
+            let staging_string = staging_path.to_string_lossy().into_owned();
+            let pending = {
+                let conn = self
+                    .db
+                    .lock()
+                    .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+                create_drive_pending_file(
+                    &conn,
+                    &pending_id,
+                    parent_id.as_deref(),
+                    name,
+                    &staging_string,
+                )
+                .map_err(core_error)?
+            };
+            if let Err(error) = create_private_file(&staging_path, false) {
+                if let Ok(conn) = self.db.lock() {
+                    let _ = delete_drive_pending(&conn, &pending.id);
+                }
+                return Err(DriveFsError::Internal(format!(
+                    "Drive staging create failed: {error}"
+                )));
+            }
+            self.mount_state.set_pending_active(&pending.id, true);
+            Ok(pending)
+        }
+
+        fn core_flush_pending(&self, pending: &DrivePendingRecord) -> Result<(), DriveFsError> {
+            if !crate::commands::qa_feature_a::enabled() {
+                let count = pending
+                    .size
+                    .div_ceil(crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE);
+                if count > 0 {
+                    self.flush_completed_chunks(pending, 0, count - 1)
+                        .map_err(core_error)?;
+                }
+            }
+            sync_local_staging_for_pending(pending).map_err(core_error)
+        }
+    }
+
+    impl DriveFsBackend for TeraRelayFs {
+        fn revision(&self) -> Result<u64, DriveFsError> {
+            let snapshot = self.snapshot().map_err(core_error)?;
+            visible_snapshot_revision(&snapshot).map_err(core_error)
+        }
+
+        fn metadata(&self, id: &DriveNodeId) -> Result<DriveNodeMetadata, DriveFsError> {
+            self.core_node(id).map(|node| core_metadata(&node))
+        }
+
+        fn lookup(
+            &self,
+            parent: &DriveNodeId,
+            name: &str,
+        ) -> Result<DriveNodeMetadata, DriveFsError> {
+            self.core_lookup_node(parent, name)
+                .map(|node| core_metadata(&node))
+        }
+
+        fn list_directory(
+            &self,
+            parent: &DriveNodeId,
+        ) -> Result<Vec<DriveNodeMetadata>, DriveFsError> {
+            let parent_id = core_parent_id(parent)?;
+            let snapshot = self.snapshot().map_err(core_error)?;
+            let same_parent = |candidate: Option<&str>| candidate == parent_id.as_deref();
+            let replaced: std::collections::HashSet<&str> = snapshot
+                .pending
+                .iter()
+                .filter_map(|pending| pending.base_entry_id.as_deref())
+                .collect();
+            let mut items = Vec::new();
+            for directory in snapshot.directories {
+                if same_parent(directory.parent_id.as_deref()) {
+                    items.push(core_metadata(&Node::Directory(directory)));
+                }
+            }
+            for file in snapshot.files {
+                if same_parent(file.directory_id.as_deref())
+                    && !replaced.contains(file.entry_id.as_str())
+                {
+                    items.push(core_metadata(&Node::Remote(file)));
+                }
+            }
+            for pending in snapshot.pending {
+                if same_parent(pending.directory_id.as_deref()) {
+                    items.push(core_metadata(&Node::Pending(pending)));
+                }
+            }
+            items.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(items)
+        }
+
+        fn read(
+            &self,
+            id: &DriveNodeId,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>, DriveFsError> {
+            if length == 0 {
+                return Ok(Vec::new());
+            }
+            let node = self.core_node(id)?;
+            match node {
+                Node::Remote(file) => {
+                    let size = file.plaintext_size.unwrap_or(file.total_size);
+                    if offset >= size {
+                        return Ok(Vec::new());
+                    }
+                    let take = std::cmp::min(length, size - offset);
+                    self.read_remote_range(&file, offset, take as u32)
+                        .map_err(core_error)
+                }
+                Node::Pending(pending) => {
+                    if offset >= pending.size {
+                        return Ok(Vec::new());
+                    }
+                    let take = std::cmp::min(length, pending.size - offset);
+                    if crate::commands::qa_feature_a::enabled() {
+                        let local = File::open(&pending.staging_path).map_err(|error| {
+                            DriveFsError::Internal(format!("Drive QA staging open failed: {error}"))
+                        })?;
+                        let mut data = vec![0u8; take as usize];
+                        let read = positioned_read(&local, &mut data, offset).map_err(|error| {
+                            DriveFsError::Internal(format!("Drive QA staging read failed: {error}"))
+                        })?;
+                        data.truncate(read);
+                        Ok(data)
+                    } else {
+                        self.read_pending_range(&pending, offset, take as u32)
+                            .map_err(core_error)
+                    }
+                }
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn create_file(
+            &self,
+            parent: &DriveNodeId,
+            name: &str,
+        ) -> Result<DriveNodeMetadata, DriveFsError> {
+            self.core_create_pending(parent, name)
+                .map(|pending| core_metadata(&Node::Pending(pending)))
+        }
+
+        fn create_directory(
+            &self,
+            parent: &DriveNodeId,
+            name: &str,
+        ) -> Result<DriveNodeMetadata, DriveFsError> {
+            if self.core_lookup_node(parent, name).is_ok() {
+                return Err(DriveFsError::AlreadyExists);
+            }
+            let parent_id = core_parent_id(parent)?;
+            let directory = {
+                let conn = self
+                    .db
+                    .lock()
+                    .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+                create_drive_directory(&conn, parent_id.as_deref(), name).map_err(core_error)?
+            };
+            Ok(core_metadata(&Node::Directory(directory)))
+        }
+
+        fn begin_write(&self, id: &DriveNodeId) -> Result<DriveNodeMetadata, DriveFsError> {
+            match self.core_node(id)? {
+                Node::Pending(pending) => Ok(core_metadata(&Node::Pending(pending))),
+                Node::Remote(file) => self
+                    .create_replacement_pending(&file)
+                    .map(|pending| core_metadata(&Node::Pending(pending)))
+                    .map_err(core_error),
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn write(&self, id: &DriveNodeId, offset: u64, data: &[u8]) -> Result<u64, DriveFsError> {
+            let pending = match self.core_node(id)? {
+                Node::Pending(pending) => pending,
+                Node::Remote(file) => self.create_replacement_pending(&file).map_err(core_error)?,
+                Node::Directory(_) | Node::Root => return Err(DriveFsError::IsDirectory),
+            };
+            if crate::commands::qa_feature_a::enabled() {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&pending.staging_path)
+                    .map_err(|error| DriveFsError::Internal(error.to_string()))?;
+                let written = positioned_write(&file, data, offset)
+                    .map_err(|error| DriveFsError::Internal(error.to_string()))?;
+                let size = std::fs::metadata(&pending.staging_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(pending.size);
+                let conn = self
+                    .db
+                    .lock()
+                    .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+                update_drive_pending_size(&conn, &pending.id, size).map_err(core_error)?;
+                return Ok(written as u64);
+            }
+            let updated = self
+                .write_pending_bytes(&pending, offset, data)
+                .map_err(core_error)?;
+            if !data.is_empty() {
+                let chunk_size = crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE;
+                let first = offset / chunk_size;
+                let last = offset.saturating_add(data.len().saturating_sub(1) as u64) / chunk_size;
+                self.flush_completed_chunks(&updated, first, last)
+                    .map_err(core_error)?;
+            }
+            Ok(data.len() as u64)
+        }
+
+        fn resize(&self, id: &DriveNodeId, size: u64) -> Result<(), DriveFsError> {
+            match self.core_node(id)? {
+                Node::Pending(pending) => {
+                    self.resize_pending(&pending, size).map_err(core_error)?;
+                    Ok(())
+                }
+                Node::Remote(file) => {
+                    let visible = file.plaintext_size.unwrap_or(file.total_size);
+                    if size == visible {
+                        return Ok(());
+                    }
+                    let pending = self.create_replacement_pending(&file).map_err(core_error)?;
+                    if let Err(error) = self.resize_pending(&pending, size) {
+                        let _ = self.cancel_pending_sync(&pending, false);
+                        return Err(core_error(error));
+                    }
+                    Ok(())
+                }
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn flush(&self, id: &DriveNodeId) -> Result<(), DriveFsError> {
+            match self.core_node(id)? {
+                Node::Pending(pending) => self.core_flush_pending(&pending),
+                Node::Remote(_) => Ok(()),
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn close_write(&self, id: &DriveNodeId) -> Result<(), DriveFsError> {
+            let mut pending = match self.core_node(id)? {
+                Node::Pending(pending) => pending,
+                Node::Remote(_) => return Ok(()),
+                Node::Directory(_) | Node::Root => return Err(DriveFsError::IsDirectory),
+            };
+            if crate::commands::qa_feature_a::enabled() {
+                if pending.base_entry_id.is_some() {
+                    if !self
+                        .pending_has_content_changes(&pending)
+                        .map_err(core_error)?
+                    {
+                        return self
+                            .cancel_pending_sync(&pending, false)
+                            .map_err(core_error);
+                    }
+                    self.mount_state.set_pending_active(&pending.id, false);
+                    return Ok(());
+                }
+                if let Ok(metadata) = std::fs::metadata(&pending.staging_path) {
+                    pending.size = metadata.len();
+                    if let Ok(conn) = self.db.lock() {
+                        let _ = update_drive_pending_size(&conn, &pending.id, pending.size);
+                    }
+                }
+                self.emit_upload_once(&pending);
+                self.mount_state.set_pending_active(&pending.id, false);
+                return Ok(());
+            }
+            if !self
+                .pending_has_content_changes(&pending)
+                .map_err(core_error)?
+            {
+                return self
+                    .cancel_pending_sync(&pending, false)
+                    .map_err(core_error);
+            }
+            let result = self.finalize_pending_sync(&pending.id).map_err(core_error);
+            self.mount_state.set_pending_active(&pending.id, false);
+            result
+        }
+
+        fn abort_write(&self, id: &DriveNodeId) -> Result<(), DriveFsError> {
+            match self.core_node(id)? {
+                Node::Pending(pending) => self
+                    .cancel_pending_sync(&pending, false)
+                    .map_err(core_error),
+                // The write may have finalized just before an OS-side error was
+                // reported. Never delete a completed remote file during cleanup.
+                Node::Remote(_) => Ok(()),
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn rename(
+            &self,
+            id: &DriveNodeId,
+            new_parent: &DriveNodeId,
+            new_name: &str,
+        ) -> Result<DriveNodeMetadata, DriveFsError> {
+            let node = self.core_node(id)?;
+            let parent_id = core_parent_id(new_parent)?;
+            {
+                let conn = self
+                    .db
+                    .lock()
+                    .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+                match &node {
+                    Node::Directory(directory) => {
+                        rename_drive_directory(&conn, &directory.id, parent_id.as_deref(), new_name)
+                    }
+                    Node::Remote(file) => {
+                        rename_drive_file(&conn, &file.entry_id, parent_id.as_deref(), new_name)
+                    }
+                    Node::Pending(file) => {
+                        rename_drive_pending(&conn, &file.id, parent_id.as_deref(), new_name)
+                    }
+                    Node::Root => Err("Cannot rename the Drive root".to_string()),
+                }
+                .map_err(core_error)?;
+            }
+            self.core_lookup_node(new_parent, new_name)
+                .map(|node| core_metadata(&node))
+        }
+
+        fn remove_file(&self, id: &DriveNodeId) -> Result<(), DriveFsError> {
+            match self.core_node(id)? {
+                Node::Remote(file) => {
+                    let conn = self
+                        .db
+                        .lock()
+                        .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+                    trash_drive_file(&conn, &file.entry_id).map_err(core_error)
+                }
+                Node::Pending(pending) => {
+                    self.cancel_pending_sync(&pending, true).map_err(core_error)
+                }
+                Node::Directory(_) | Node::Root => Err(DriveFsError::IsDirectory),
+            }
+        }
+
+        fn remove_directory(&self, id: &DriveNodeId) -> Result<(), DriveFsError> {
+            let Node::Directory(directory) = self.core_node(id)? else {
+                return Err(DriveFsError::NotDirectory);
+            };
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| DriveFsError::Internal("DB poisoned".to_string()))?;
+            trash_drive_directory(&conn, &directory.id).map_err(core_error)
+        }
+
+        fn recover_pending(&self) -> Result<DriveRecoverySummary, DriveFsError> {
+            if crate::commands::qa_feature_a::enabled() {
+                return Ok(DriveRecoverySummary {
+                    recovered: 0,
+                    remaining: 0,
+                    failures: 0,
+                });
+            }
+            let closed_ids: Vec<String> = self
+                .snapshot()
+                .map_err(core_error)?
+                .pending
+                .into_iter()
+                .filter(|pending| pending.closed_at.is_some())
+                .map(|pending| pending.id)
+                .collect();
+            let mut recovered = 0u32;
+            let mut failures = 0u32;
+            for pending_id in closed_ids {
+                if self.mount_state.is_pending_active(&pending_id) {
+                    continue;
+                }
+                self.mount_state.set_pending_active(&pending_id, true);
+                match self.finalize_pending_sync(&pending_id) {
+                    Ok(()) => recovered = recovered.saturating_add(1),
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        log::warn!("Deferred Drive recovery for {pending_id}: {error}");
+                    }
+                }
+                self.mount_state.set_pending_active(&pending_id, false);
+            }
+            let remaining = self
+                .snapshot()
+                .map_err(core_error)?
+                .pending
+                .iter()
+                .filter(|pending| pending.closed_at.is_some())
+                .count() as u32;
+            Ok(DriveRecoverySummary {
+                recovered,
+                remaining,
+                failures,
+            })
+        }
+
+        fn capacity(&self) -> DriveVirtualCapacity {
+            let values = virtual_statfs_values();
+            let total_bytes = values.blocks.saturating_mul(values.block_size as u64);
+            let available_bytes = values
+                .blocks_available
+                .saturating_mul(values.block_size as u64);
+            DriveVirtualCapacity {
+                total_bytes,
+                available_bytes,
+            }
+        }
+    }
+
+    struct LinuxFuseAdapter {
+        core: DriveFsCore,
+        backend: Arc<TeraRelayFs>,
+    }
+
+    impl std::ops::Deref for LinuxFuseAdapter {
+        type Target = TeraRelayFs;
+
+        fn deref(&self) -> &Self::Target {
+            self.backend.as_ref()
+        }
+    }
+
+    impl Filesystem for LinuxFuseAdapter {
         fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
             match self.lookup_child(parent, name) {
                 Ok(Some(node)) => reply.entry(&TTL, &attr_for(&node), 0),
@@ -2174,62 +2972,28 @@ mod linux {
             reply: ReplyData,
         ) {
             if offset < 0 {
-                reply.error(EIO);
+                reply.error(EINVAL);
                 return;
             }
-            match self.pending_for_inode(ino) {
-                Ok(Some(pending)) => {
-                    if crate::commands::qa_feature_a::enabled() {
-                        match File::open(&pending.staging_path) {
-                            Ok(local) => {
-                                let mut data = vec![0u8; size as usize];
-                                match local.read_at(&mut data, offset as u64) {
-                                    Ok(read) => {
-                                        data.truncate(read);
-                                        reply.data(&data);
-                                    }
-                                    Err(_) => reply.error(EIO),
-                                }
-                            }
-                            Err(_) => reply.error(ENOENT),
-                        }
-                    } else {
-                        match self.read_pending_range(&pending, offset as u64, size) {
-                            Ok(data) => reply.data(&data),
-                            Err(error) => {
-                                log::warn!("Drive pending read failed: {}", error);
-                                reply.error(EIO);
-                            }
-                        }
-                    }
+            let node = match self.node_for_inode(ino) {
+                Ok(Some(node)) => node,
+                Ok(None) => {
+                    reply.error(ENOENT);
                     return;
                 }
-                Ok(None) => {}
                 Err(error) => {
-                    log::warn!("Drive pending lookup failed: {}", error);
+                    log::warn!("Drive inode lookup failed before read: {error}");
                     reply.error(EIO);
                     return;
                 }
-            }
-
-            match self.node_for_inode(ino) {
-                Ok(Some(Node::Remote(file))) => {
-                    match self.read_remote_range(&file, offset as u64, size) {
-                        Ok(data) => reply.data(&data),
-                        Err(error) => {
-                            log::warn!(
-                                "TeraRelay Drive read failed for {}: {}",
-                                file.display_name,
-                                error
-                            );
-                            reply.error(EIO);
-                        }
-                    }
+            };
+            let id = core_node_id(&node);
+            match self.core.read(&id, offset as u64, size as u64) {
+                Ok(data) => reply.data(&data),
+                Err(error) => {
+                    log::warn!("TeraRelay Drive shared-core read failed: {error}");
+                    reply.error(errno_for_core(&error));
                 }
-                Ok(Some(Node::Directory(_))) | Ok(Some(Node::Root)) => reply.error(EISDIR),
-                Ok(Some(Node::Pending(_))) => reply.error(EIO),
-                Ok(None) => reply.error(ENOENT),
-                Err(_) => reply.error(EIO),
             }
         }
 
@@ -3078,22 +3842,15 @@ mod linux {
             crate::commands::drive_metadata::ensure_imported_layout(&conn)?;
         }
 
-        let filesystem = TeraRelayFs {
-            db: db_pool.inner().clone(),
-            app: app_handle.clone(),
-            stream_port: state.stream_port,
-            stream_token: state.stream_token.clone(),
-            cache_root: state.cache_root.clone(),
-            staging_root: state.staging_root.clone(),
-            http: reqwest::blocking::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(90))
-                .build()
-                .map_err(|e| format!("Failed to initialize Drive HTTP client: {e}"))?,
-            telegram: telegram_state.inner().clone(),
-            mount_state: state.inner().clone(),
-            emitted_uploads: Mutex::new(std::collections::HashSet::new()),
-            writer_counts: Mutex::new(HashMap::new()),
+        let backend = build_backend(
+            &app_handle,
+            state.inner(),
+            db_pool.inner(),
+            telegram_state.inner(),
+        )?;
+        let filesystem = LinuxFuseAdapter {
+            core: DriveFsCore::new(backend.clone()),
+            backend,
         };
 
         let inner = state.inner.clone();
@@ -3303,9 +4060,10 @@ mod linux {
         use super::{
             classify_existing_mount, encode_mountinfo_path, ensure_private_staging_directory,
             pending_storage_format, recorded_part_needs_reupload, should_lazy_detach_after_unmount,
-            staging_can_accept, virtual_statfs_values, ExistingMountDisposition,
-            PendingStorageFormat, STAGING_BUDGET_BYTES,
+            staging_can_accept, virtual_statfs_values, visible_snapshot_revision,
+            ExistingMountDisposition, PendingStorageFormat, STAGING_BUDGET_BYTES,
         };
+        use crate::commands::drive_metadata::{DrivePendingRecord, DriveSnapshot};
         use std::os::unix::fs::PermissionsExt;
 
         #[test]
@@ -3334,6 +4092,52 @@ mod linux {
         }
 
         #[test]
+        fn provider_snapshot_revision_tracks_pending_metadata_without_cloud_dirty_state() {
+            let mut snapshot = DriveSnapshot {
+                revision: 42,
+                dirty: false,
+                directories: Vec::new(),
+                files: Vec::new(),
+                pending: Vec::new(),
+            };
+            let empty_revision = visible_snapshot_revision(&snapshot).unwrap();
+            snapshot.pending.push(DrivePendingRecord {
+                id: "pending-a".to_string(),
+                directory_id: None,
+                display_name: "draft.bin".to_string(),
+                staging_path: "test-draft.bin".to_string(),
+                size: 0,
+                format_version: 2,
+                backing_channel_id: 0,
+                base_entry_id: None,
+                encryption_version: 0,
+                crypto_id: None,
+                closed_at: None,
+                created_at: 100,
+                updated_at: 100,
+            });
+            let created_revision = visible_snapshot_revision(&snapshot).unwrap();
+            assert_ne!(created_revision, empty_revision);
+
+            snapshot.pending[0].size = 8192;
+            snapshot.pending[0].updated_at = 101;
+            let resized_revision = visible_snapshot_revision(&snapshot).unwrap();
+            assert_ne!(resized_revision, created_revision);
+            assert_eq!(
+                visible_snapshot_revision(&snapshot).unwrap(),
+                resized_revision
+            );
+            assert_eq!(
+                snapshot.revision, 42,
+                "provider revision must not mutate cloud revision"
+            );
+            assert!(
+                !snapshot.dirty,
+                "provider revision must not mark Drive metadata dirty"
+            );
+        }
+
+        #[test]
         fn bounded_stage_accepts_exact_limit_and_rejects_overflow() {
             assert!(staging_can_accept(0, STAGING_BUDGET_BYTES).is_ok());
             assert!(staging_can_accept(STAGING_BUDGET_BYTES - 4096, 4096).is_ok());
@@ -3358,20 +4162,19 @@ mod linux {
 
         #[test]
         fn mountinfo_path_encoding_matches_linux_single_backslash_escapes() {
-            let path = std::path::Path::new("/home/yash/TeraRelay Drive\tQA");
+            let path = std::path::Path::new("/srv/terarelay/TeraRelay Drive\tQA");
             assert_eq!(
                 encode_mountinfo_path(path),
-                "/home/yash/TeraRelay\\040Drive\\011QA"
+                "/srv/terarelay/TeraRelay\\040Drive\\011QA"
             );
         }
 
         #[test]
         fn mountinfo_path_encoding_normalizes_dotdot_components() {
-            let path =
-                std::path::Path::new("/home/yash/Downloads/TeraRelay/app/../TeraRelay Drive QA");
+            let path = std::path::Path::new("/srv/terarelay/app/../TeraRelay Drive QA");
             assert_eq!(
                 encode_mountinfo_path(path),
-                "/home/yash/Downloads/TeraRelay/TeraRelay\\040Drive\\040QA"
+                "/srv/terarelay/TeraRelay\\040Drive\\040QA"
             );
         }
 
@@ -3452,7 +4255,7 @@ pub fn cmd_drive_mount(
     db_pool: State<'_, DbConnection>,
     telegram_state: State<'_, crate::commands::TelegramState>,
 ) -> Result<DriveMountStatus, String> {
-    linux::mount_impl(app_handle, state, db_pool, telegram_state)
+    desktop::mount_impl(app_handle, state, db_pool, telegram_state)
 }
 
 #[cfg(target_os = "linux")]
@@ -3463,17 +4266,163 @@ pub fn cmd_drive_recover_pending(
     db_pool: State<'_, DbConnection>,
     telegram_state: State<'_, crate::commands::TelegramState>,
 ) -> Result<DriveRecoveryResult, String> {
-    linux::recover_pending_impl(app_handle, state, db_pool, telegram_state)
+    desktop::recover_pending_impl(app_handle, state, db_pool, telegram_state)
 }
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
 pub fn cmd_drive_unmount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
-    linux::unmount_impl(state)
+    desktop::unmount_impl(state)
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn cmd_drive_mount(
+    app_handle: AppHandle,
+    state: State<'_, DriveMountState>,
+    db_pool: State<'_, DbConnection>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveMountStatus, String> {
+    let root = crate::drive_windows::connect(
+        &app_handle,
+        state.inner(),
+        db_pool.inner(),
+        telegram_state.inner(),
+    )?;
+    state.mark_provider_connected(Some(root));
+    Ok(state.status())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn cmd_drive_recover_pending(
+    app_handle: AppHandle,
+    state: State<'_, DriveMountState>,
+    db_pool: State<'_, DbConnection>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveRecoveryResult, String> {
+    let summary = build_drive_fs_core(
+        &app_handle,
+        state.inner(),
+        db_pool.inner(),
+        telegram_state.inner(),
+    )?
+    .recover_pending()
+    .map_err(|e| e.to_string())?;
+    crate::drive_windows::refresh()?;
+    Ok(DriveRecoveryResult {
+        recovered: summary.recovered,
+        remaining: summary.remaining,
+        failures: summary.failures,
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn cmd_drive_unmount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
+    crate::drive_windows::disconnect();
+    state.mark_provider_disconnected();
+    Ok(state.status())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn cmd_drive_mount(
+    app_handle: AppHandle,
+    state: State<'_, DriveMountState>,
+    db_pool: State<'_, DbConnection>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveMountStatus, String> {
+    crate::drive_provider_ipc::start(
+        &app_handle,
+        state.inner(),
+        db_pool.inner(),
+        telegram_state.inner(),
+    )?;
+    state.mark_provider_connected(None);
+    crate::drive_provider_ipc::signal_changes(&app_handle)?;
+    Ok(state.status())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn cmd_drive_recover_pending(
+    app_handle: AppHandle,
+    state: State<'_, DriveMountState>,
+    db_pool: State<'_, DbConnection>,
+    telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveRecoveryResult, String> {
+    let summary = build_drive_fs_core(
+        &app_handle,
+        state.inner(),
+        db_pool.inner(),
+        telegram_state.inner(),
+    )?
+    .recover_pending()
+    .map_err(|e| e.to_string())?;
+    crate::drive_provider_ipc::signal_changes(&app_handle)?;
+    Ok(DriveRecoveryResult {
+        recovered: summary.recovered,
+        remaining: summary.remaining,
+        failures: summary.failures,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn cmd_drive_unmount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
+    crate::drive_provider_ipc::stop();
+    state.mark_provider_disconnected();
+    Ok(state.status())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+#[tauri::command]
+pub fn cmd_drive_mount(
+    _app_handle: AppHandle,
+    state: State<'_, DriveMountState>,
+    _db_pool: State<'_, DbConnection>,
+    _telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveMountStatus, String> {
+    let _ = state;
+    Err("TeraRelay Drive native filesystem integration is only available on desktop".to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+#[tauri::command]
+pub fn cmd_drive_recover_pending(
+    _app_handle: AppHandle,
+    _state: State<'_, DriveMountState>,
+    _db_pool: State<'_, DbConnection>,
+    _telegram_state: State<'_, crate::commands::TelegramState>,
+) -> Result<DriveRecoveryResult, String> {
+    Ok(DriveRecoveryResult {
+        recovered: 0,
+        remaining: 0,
+        failures: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+#[tauri::command]
+pub fn cmd_drive_unmount(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
+    Ok(state.status())
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::unmount_best_effort;
+pub use desktop::unmount_best_effort;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn unmount_best_effort(state: &DriveMountState) {
+    crate::drive_windows::disconnect();
+    state.mark_provider_disconnected();
+}
+
+#[cfg(target_os = "macos")]
+pub fn unmount_best_effort(state: &DriveMountState) {
+    crate::drive_provider_ipc::stop();
+    state.mark_provider_disconnected();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn unmount_best_effort(_state: &DriveMountState) {}

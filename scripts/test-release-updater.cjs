@@ -14,6 +14,12 @@ assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY:\s*\$\{\{ secrets\.TAURI_SIGNI
 assert.match(workflow, /uploadUpdaterJson:\s*true/);
 assert.match(workflow, /uploadUpdaterSignatures:\s*true/);
 assert.match(workflow, /max-parallel:\s*1/, 'desktop updater JSON publication must be serialized to avoid latest.json races');
+assert.match(workflow, /release-capabilities:/, 'release credential capability preflight job is missing');
+assert.match(workflow, /fromJSON\(needs\.release-capabilities\.outputs\.desktop_matrix\)/, 'desktop matrix is not derived from credential-ready targets');
+assert.match(workflow, /windows_ready/, 'Windows signing readiness is not computed');
+assert.match(workflow, /macos_ready/, 'macOS signing readiness is not computed');
+assert.match(workflow, /ios_ready/, 'iOS distribution readiness is not computed');
+assert.match(workflow, /if:\s*needs\.release-capabilities\.outputs\.ios_ready\s*==\s*'true'/, 'iOS job is not gated by complete real distribution credentials');
 assert.match(workflow, /needs:\s*desktop/, 'Android publishing must wait for all desktop updater artifacts');
 assert.match(workflow, /mobile-latest\.json/);
 assert.match(workflow, /tauri signer sign[^\n]*mobile-latest\.json|mobile-latest\.json[^\n]*signer sign/s, 'mobile manifest is not cryptographically signed');
@@ -32,8 +38,8 @@ assert.match(workflow, /MACOS-FILE-PROVIDER-PROFILES-PASS/, 'macOS release does 
 assert.match(workflow, /MACOS-FILE-PROVIDER-SIGNATURE-PASS/, 'macOS release does not verify the final File Provider signature');
 assert.match(workflow, /cargo check --manifest-path app\/src-tauri\/Cargo\.toml --target/, 'native Windows/macOS Drive providers are not compile-gated on release runners');
 assert.match(workflow, /build-macos-file-provider\.sh/, 'macOS File Provider Swift build is not run in release CI');
-assert.match(workflow, /swift_triple:\s*arm64-apple-macosx12\.0/, 'Apple Silicon File Provider Swift target is not pinned');
-assert.match(workflow, /swift_triple:\s*x86_64-apple-macosx12\.0/, 'Intel File Provider Swift target is not pinned');
+assert.match(workflow, /\"swift_triple\":\s*\"arm64-apple-macosx12\.0\"/, 'Apple Silicon File Provider Swift target is not pinned');
+assert.match(workflow, /\"swift_triple\":\s*\"x86_64-apple-macosx12\.0\"/, 'Intel File Provider Swift target is not pinned');
 assert.match(workflow, /lipo -verify_arch/, 'macOS File Provider architecture is not verified after bundling');
 assert.match(workflow, /gh release upload/);
 assert.match(workflow, /ios-release:/, 'real iOS release job is missing');

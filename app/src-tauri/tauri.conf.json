@@ -5,7 +5,7 @@
       "open": true
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEOTAzN0I2MzZDODcwQjAKUldTd2NNZzJ0amVRclNINTFwUUl2Y3c0Wk5iRmxzUEVNcHhXR2loRkFxejdkV2gvZkJzZVI2d1YK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxNUFDMEZDOTUwMjczOEYKUldTUGN3S1YvTUJhSVhBWGF5UHN4dG4rOFJOQitkeVhtRGlraVUxV2Fzalk2cXZCV0VvUjc0aFQK",
       "requireSignedVersion": true,
       "endpoints": [
         "https://github.com/Yashwanth034/TeraRelay/releases/latest/download/latest.json"
@@ -16,7 +16,7 @@
     }
   },
   "productName": "TeraRelay",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "io.terarelay.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

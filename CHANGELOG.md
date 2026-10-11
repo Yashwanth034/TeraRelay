@@ -2,6 +2,32 @@
 
 All notable public changes to TeraRelay are documented here.
 
+## [0.2.0] - 2026-10-11
+
+### Files, versions, and media
+
+- Added explicit File Stacks / Versions with manual add-version, manage, rename, move, unstack, and delete behavior while preserving individual Telegram-backed files.
+- Added byte-verified duplicate detection and on-demand rich media metadata without bloating the main file list.
+- Added the premium desktop/mobile UI refresh while preserving existing file, transfer, sharing, and localization workflows.
+
+### Transfers and Remote Import
+
+- Added TeraRelay Boost as an explicit transfer-engine choice alongside the existing TDLib C++ path, with durable queue recovery and engine persistence across restarts.
+- Added Remote Import for direct URLs, supported media pages, galleries, and torrents, including quality/file selection, resumable acquisition, multi-link batches, and optional manual Version Stack grouping.
+- Added pinned, hash-verified helper preparation for yt-dlp, Deno, FFmpeg/ffprobe, aria2, and gallery-dl so release builds do not depend on user-installed helper tools.
+
+### Drive and device continuity
+
+- Added the TeraRelay Drive storage pool and cross-device Device Continuity reconciliation using the existing encrypted Drive metadata model.
+- Added native Windows Explorer and macOS File Provider integration with portable-name validation, crash/reconnect recovery, conflict fail-closed behavior, bounded staging, and provider-version checks.
+- Added Unicode/case portable namespace collision protection for Drive manifests and native filesystem projections.
+
+### Updates and release security
+
+- Added the signed in-app updater for desktop plus a signed mobile update manifest and Android APK hash re-verification immediately before installation.
+- Added release-time Android package/version/signature verification, Windows Authenticode signing gates, macOS Developer ID/notarization/File Provider provisioning gates, and a real App Store Connect/TestFlight pipeline for iOS when production Apple credentials are configured.
+- Release CI now selects only platforms with complete production signing credentials; unavailable Windows/macOS/iOS targets are skipped instead of producing unsigned or partially signed artifacts.
+
 ## [0.1.1] - 2026-10-06
 
 ### Transfers and playback
@@ -84,5 +110,6 @@ These measurements are test results, not guaranteed speeds. See [PERFORMANCE.md]
 - Worldwide public file sharing is not implemented
 - Cross-platform build/package validation is not exhaustive runtime/device testing
 
+[0.2.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.0

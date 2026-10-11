@@ -10,37 +10,137 @@ permissions:
   contents: write
 
 jobs:
+  release-capabilities:
+    name: Detect signed release targets
+    runs-on: ubuntu-24.04
+    outputs:
+      desktop_matrix: ${{ steps.detect.outputs.desktop_matrix }}
+      windows_ready: ${{ steps.detect.outputs.windows_ready }}
+      macos_ready: ${{ steps.detect.outputs.macos_ready }}
+      ios_ready: ${{ steps.detect.outputs.ios_ready }}
+    steps:
+      - name: Detect available production signing credentials
+        id: detect
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_APP_PROVISION_PROFILE: ${{ secrets.MACOS_APP_PROVISION_PROFILE }}
+          MACOS_FILE_PROVIDER_PROVISION_PROFILE: ${{ secrets.MACOS_FILE_PROVIDER_PROVISION_PROFILE }}
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          IOS_UPDATE_URL: ${{ vars.IOS_UPDATE_URL }}
+        run: |
+          set -euo pipefail
+
+          windows_ready=false
+          if [ -n "${WINDOWS_CERTIFICATE:-}" ] && [ -n "${WINDOWS_CERTIFICATE_PASSWORD:-}" ]; then
+            windows_ready=true
+          elif [ -n "${WINDOWS_CERTIFICATE:-}${WINDOWS_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "::warning::Windows release skipped because code-signing credentials are incomplete."
+          fi
+
+          macos_ready=false
+          if [ -n "${APPLE_CERTIFICATE:-}" ] \
+            && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] \
+            && [ -n "${KEYCHAIN_PASSWORD:-}" ] \
+            && [ -n "${APPLE_ID:-}" ] \
+            && [ -n "${APPLE_PASSWORD:-}" ] \
+            && [ -n "${APPLE_TEAM_ID:-}" ] \
+            && [ -n "${MACOS_APP_PROVISION_PROFILE:-}" ] \
+            && [ -n "${MACOS_FILE_PROVIDER_PROVISION_PROFILE:-}" ]; then
+            macos_ready=true
+          elif [ -n "${APPLE_CERTIFICATE:-}${APPLE_CERTIFICATE_PASSWORD:-}${KEYCHAIN_PASSWORD:-}${APPLE_ID:-}${APPLE_PASSWORD:-}${APPLE_TEAM_ID:-}${MACOS_APP_PROVISION_PROFILE:-}${MACOS_FILE_PROVIDER_PROVISION_PROFILE:-}" ]; then
+            echo "::warning::macOS release skipped because Developer ID/notarization/File Provider credentials are incomplete."
+          fi
+
+          ios_ready=false
+          if [ -n "${IOS_CERTIFICATE:-}" ] \
+            && [ -n "${IOS_CERTIFICATE_PASSWORD:-}" ] \
+            && [ -n "${IOS_MOBILE_PROVISION:-}" ] \
+            && [ -n "${APPLE_API_KEY_ID:-}" ] \
+            && [ -n "${APPLE_API_ISSUER:-}" ] \
+            && [ -n "${APPLE_API_KEY_BASE64:-}" ] \
+            && { [[ "${IOS_UPDATE_URL:-}" == https://apps.apple.com/* ]] || [[ "${IOS_UPDATE_URL:-}" == https://testflight.apple.com/* ]]; }; then
+            ios_ready=true
+          elif [ -n "${IOS_CERTIFICATE:-}${IOS_CERTIFICATE_PASSWORD:-}${IOS_MOBILE_PROVISION:-}${APPLE_API_KEY_ID:-}${APPLE_API_ISSUER:-}${APPLE_API_KEY_BASE64:-}${IOS_UPDATE_URL:-}" ]; then
+            echo "::warning::iOS release skipped because App Store Connect credentials or IOS_UPDATE_URL are incomplete."
+          fi
+
+          desktop_matrix="$(WINDOWS_READY="$windows_ready" MACOS_READY="$macos_ready" python3 - <<'PY'
+          import json
+          import os
+
+          include = [{
+              "name": "Linux x64",
+              "platform": "ubuntu-22.04",
+              "helper_target": "linux-x64",
+              "rust_target": "x86_64-unknown-linux-gnu",
+              "args": "",
+          }]
+          if os.environ["WINDOWS_READY"] == "true":
+              include.append({
+                  "name": "Windows x64",
+                  "platform": "windows-latest",
+                  "helper_target": "windows-x64",
+                  "rust_target": "x86_64-pc-windows-msvc",
+                  "args": "--config src-tauri/tauri.windows-signing.conf.json",
+              })
+          if os.environ["MACOS_READY"] == "true":
+              include.extend([
+                  {
+                      "name": "macOS Apple Silicon",
+                      "platform": "macos-latest",
+                      "helper_target": "macos-arm64",
+                      "rust_target": "aarch64-apple-darwin",
+                      "swift_triple": "arm64-apple-macosx12.0",
+                      "macos_arch": "arm64",
+                      "args": "--config src-tauri/tauri.macos-signing.conf.json --target aarch64-apple-darwin",
+                  },
+                  {
+                      "name": "macOS Intel",
+                      "platform": "macos-latest",
+                      "helper_target": "macos-x64",
+                      "rust_target": "x86_64-apple-darwin",
+                      "swift_triple": "x86_64-apple-macosx12.0",
+                      "macos_arch": "x86_64",
+                      "args": "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin",
+                  },
+              ])
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+
+          echo "windows_ready=$windows_ready" >> "$GITHUB_OUTPUT"
+          echo "macos_ready=$macos_ready" >> "$GITHUB_OUTPUT"
+          echo "ios_ready=$ios_ready" >> "$GITHUB_OUTPUT"
+          echo "desktop_matrix=$desktop_matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Signed release targets"
+            echo "- Linux x64: ready"
+            echo "- Windows x64: $windows_ready"
+            echo "- macOS Apple Silicon/Intel: $macos_ready"
+            echo "- iOS App Store Connect: $ios_ready"
+            echo "- Android ARM64: validated by its mandatory signing step"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   desktop:
     name: Desktop release / ${{ matrix.name }}
+    needs: release-capabilities
     strategy:
       max-parallel: 1
       fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            platform: ubuntu-22.04
-            helper_target: linux-x64
-            rust_target: x86_64-unknown-linux-gnu
-            args: ""
-          - name: Windows x64
-            platform: windows-latest
-            helper_target: windows-x64
-            rust_target: x86_64-pc-windows-msvc
-            args: "--config src-tauri/tauri.windows-signing.conf.json"
-          - name: macOS Apple Silicon
-            platform: macos-latest
-            helper_target: macos-arm64
-            rust_target: aarch64-apple-darwin
-            swift_triple: arm64-apple-macosx12.0
-            macos_arch: arm64
-            args: "--config src-tauri/tauri.macos-signing.conf.json --target aarch64-apple-darwin"
-          - name: macOS Intel
-            platform: macos-latest
-            helper_target: macos-x64
-            rust_target: x86_64-apple-darwin
-            swift_triple: x86_64-apple-macosx12.0
-            macos_arch: x86_64
-            args: "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin"
+      matrix: ${{ fromJSON(needs.release-capabilities.outputs.desktop_matrix) }}
 
     runs-on: ${{ matrix.platform }}
 
@@ -532,7 +632,10 @@ jobs:
 
   ios-release:
     name: iOS App Store Connect release
-    needs: android
+    needs:
+      - android
+      - release-capabilities
+    if: needs.release-capabilities.outputs.ios_ready == 'true'
     runs-on: macos-latest
     defaults:
       run:

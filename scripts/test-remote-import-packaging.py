@@ -48,6 +48,15 @@ if module:
         "linux-x64 aria2 uses the pinned self-contained musl static archive",
     )
 
+    linux_gallery = next(asset for asset in module.assets_for_target("linux-x64") if asset.name == "gallery-dl")
+    check(
+        getattr(linux_gallery, "build_kind", None) == "gallery-dl-pyinstaller"
+        and "mikf/gallery-dl" in linux_gallery.source
+        and "ef30ea97c68d0d03ec49bd810ffe3fb4965559b7" in linux_gallery.url
+        and linux_gallery.sha256 == "c2a4a83437d89d95018dd71281e0ead69dce3c02aa0cdccc3fcb4d0f220fc692",
+        "linux-x64 gallery-dl is built from pinned source on the release runner instead of using the upstream glibc-sensitive executable",
+    )
+
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--target", "linux-x64", "--dry-run"],
         cwd=ROOT,
@@ -56,6 +65,29 @@ if module:
     )
     check(result.returncode == 0, "packaging dry-run succeeds without downloading")
     check("yt-dlp" in result.stdout and "ffmpeg" in result.stdout and "gallery-dl" in result.stdout, "dry-run reports selected helpers")
+
+    hashed_requirements = getattr(module, "GALLERY_LINUX_BUILD_REQUIREMENTS", "")
+    requirement_lines = [line.strip() for line in hashed_requirements.splitlines() if line.strip()]
+    check(
+        bool(requirement_lines)
+        and any("pyinstaller-6.22.3" in line for line in requirement_lines)
+        and any("requests-2.34.2" in line for line in requirement_lines)
+        and all(line.startswith("https://files.pythonhosted.org/") and "#sha256=" in line for line in requirement_lines),
+        "linux gallery-dl build dependencies use direct hash-pinned wheel URLs without package-index resolution",
+    )
+
+    check(hasattr(module, "_prepare_asset"), "helper preparation dispatches source-built helpers explicitly")
+    if hasattr(module, "_prepare_asset"):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(prefix="terarelay-gallery-build-dispatch-") as temp_dir:
+            temp = pathlib.Path(temp_dir)
+            source = temp / "source.tar.gz"
+            source.write_bytes(b"fixture")
+            destination = temp / "gallery-dl"
+            gallery_asset = module._gallery_linux_source_asset()
+            with mock.patch.object(module, "_build_gallery_dl_from_source") as build_gallery, mock.patch.object(module, "_extract_or_copy") as extract_copy:
+                module._prepare_asset(gallery_asset, source, destination)
+                check(build_gallery.call_count == 1 and extract_copy.call_count == 0, "linux gallery-dl preparation uses the source-build path")
 
     check(hasattr(module, "_probe_prepared_asset"), "helper preparation runtime-probes extracted executables")
     if hasattr(module, "_probe_prepared_asset"):

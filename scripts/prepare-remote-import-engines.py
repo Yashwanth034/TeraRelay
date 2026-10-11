@@ -17,6 +17,8 @@ import pathlib
 import shutil
 import stat
 import subprocess
+import sys
+import tarfile
 import tempfile
 import urllib.request
 import zipfile
@@ -31,6 +33,21 @@ FFMPEG_TAG = "n8.1.2-1"
 ARIA_TAG = "release-2.0.3"
 ARIA_LINUX_TAG = "1.37.0"
 GALLERY_TAG = "2026.10.10"
+GALLERY_LINUX_SOURCE_COMMIT = "ef30ea97c68d0d03ec49bd810ffe3fb4965559b7"
+GALLERY_LINUX_SOURCE_SHA256 = "c2a4a83437d89d95018dd71281e0ead69dce3c02aa0cdccc3fcb4d0f220fc692"
+GALLERY_LINUX_BUILD_REQUIREMENTS = """\
+https://files.pythonhosted.org/packages/a9/ba/000a1996d4308bc65120167c21241a3b205464a2e0b58deda26ae8ac21d1/altgraph-0.17.5-py2.py3-none-any.whl#sha256=f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl#sha256=62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
+https://files.pythonhosted.org/packages/7f/c5/38806a25ab5e65fc178f39affeda20858efafede2fce1ffc2556cfc9fe73/charset_normalizer-3.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl#sha256=3d31298449090ab8d47b7b1b2a555ff73cac7ed438a08b7ac160980c7ebed649
+https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl#sha256=ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl#sha256=d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+https://files.pythonhosted.org/packages/7b/b6/dd21d61fc5e25377be24eabf13e99e4e46548a5abe2bf7b15d8b3d9cc74a/pyinstaller-6.22.3-py3-none-manylinux2014_x86_64.whl#sha256=451a4ae14b719365bf1a2f0a99dae7b3463060061c3a394c70d5264cfb439528
+https://files.pythonhosted.org/packages/8f/f1/3eee0263b487e571aed9204257b45bc2a0b6fec34d0a1adade4d8d8a968c/pyinstaller_hooks_contrib-2026.8-py3-none-any.whl#sha256=6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084
+https://files.pythonhosted.org/packages/8d/59/b4572118e098ac8e46e399a1dd0f2d85403ce8bbaad9ec79373ed6badaf9/PySocks-1.7.1-py3-none-any.whl#sha256=2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5
+https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl#sha256=2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl#sha256=51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670
+https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl#sha256=0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,6 +59,7 @@ class Asset:
     archive_member: str | None = None
     executable: bool = True
     source: str = ""
+    build_kind: str | None = None
 
 
 def _asset(name: str, destination: str, repo: str, tag: str, filename: str, sha256: str,
@@ -56,6 +74,18 @@ def _asset(name: str, destination: str, repo: str, tag: str, filename: str, sha2
     )
 
 
+def _gallery_linux_source_asset() -> Asset:
+    commit = GALLERY_LINUX_SOURCE_COMMIT
+    return Asset(
+        name="gallery-dl",
+        destination="gallery-dl",
+        url=f"https://github.com/mikf/gallery-dl/archive/{commit}.tar.gz",
+        sha256=GALLERY_LINUX_SOURCE_SHA256,
+        source=f"mikf/gallery-dl@{commit}:source",
+        build_kind="gallery-dl-pyinstaller",
+    )
+
+
 def assets_for_target(target: str) -> list[Asset]:
     if target == "linux-x64":
         return [
@@ -64,7 +94,7 @@ def assets_for_target(target: str) -> list[Asset]:
             _asset("ffmpeg", "ffmpeg", "shaka-project/static-ffmpeg-binaries", FFMPEG_TAG, "ffmpeg-linux-x64", "9eac5b2b5076db5ff853a6fa0dcd6b8de7d0cac8481eadda6c47cd935825f1ee"),
             _asset("ffprobe", "ffprobe", "shaka-project/static-ffmpeg-binaries", FFMPEG_TAG, "ffprobe-linux-x64", "065d3c56926052a76e884c4e4b51b7d95248da9391ab7effdcca6b94ceab98cf"),
             _asset("aria2c", "aria2c", "abcfy2/aria2-static-build", ARIA_LINUX_TAG, "aria2-x86_64-linux-musl_static.zip", "e0a09b12ef67f35f8a8e4fdddbec851d235b7c31da549d0578bff459032b499a", "aria2c"),
-            _asset("gallery-dl", "gallery-dl", "gdl-org/builds", GALLERY_TAG, "gallery-dl_linux", "69901ef68ace81fb01377ac6e7ebca4894e66c74be8c243b8f414691d179062a"),
+            _gallery_linux_source_asset(),
         ]
     if target == "windows-x64":
         return [
@@ -130,6 +160,84 @@ def _extract_or_copy(asset: Asset, downloaded: pathlib.Path, destination: pathli
         destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _safe_extract_tar(archive_path: pathlib.Path, destination: pathlib.Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        for member in members:
+            parts = pathlib.PurePosixPath(member.name).parts
+            if not parts or member.name.startswith("/") or ".." in parts:
+                raise RuntimeError(f"Verified source archive contains unsafe path {member.name!r}")
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"Verified source archive contains unsupported link {member.name!r}")
+        archive.extractall(destination, members=members)
+
+
+def _build_gallery_dl_from_source(
+    asset: Asset, downloaded: pathlib.Path, destination: pathlib.Path
+) -> None:
+    if sys.platform != "linux":
+        raise RuntimeError("Linux gallery-dl source build requested on a non-Linux host")
+
+    build_root = downloaded.parent / "gallery-dl-build"
+    source_root = build_root / "source"
+    venv_root = build_root / "venv"
+    _safe_extract_tar(downloaded, source_root)
+
+    expected_source = source_root / f"gallery-dl-{GALLERY_LINUX_SOURCE_COMMIT}"
+    if not (expected_source / "scripts" / "pyinstaller.py").is_file():
+        raise RuntimeError("Pinned gallery-dl source archive is missing its PyInstaller build script")
+
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(venv_root)],
+        cwd=build_root,
+        check=True,
+        timeout=120,
+    )
+    venv_python = venv_root / "bin" / "python"
+    requirements = build_root / "requirements.lock"
+    requirements.write_text(GALLERY_LINUX_BUILD_REQUIREMENTS, encoding="utf-8")
+    subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--no-index",
+            "--only-binary=:all:",
+            "--require-hashes",
+            "-r",
+            str(requirements),
+        ],
+        cwd=build_root,
+        check=True,
+        timeout=300,
+    )
+    subprocess.run(
+        [str(venv_python), "scripts/pyinstaller.py", "--label", "linux"],
+        cwd=expected_source,
+        check=True,
+        timeout=300,
+    )
+
+    built = expected_source / "dist" / "gallery-dl_linux"
+    if not built.is_file():
+        raise RuntimeError("gallery-dl source build completed without producing gallery-dl_linux")
+    shutil.copy2(built, destination)
+    destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _prepare_asset(asset: Asset, downloaded: pathlib.Path, destination: pathlib.Path) -> None:
+    if asset.build_kind == "gallery-dl-pyinstaller":
+        _build_gallery_dl_from_source(asset, downloaded, destination)
+        return
+    if asset.build_kind is not None:
+        raise RuntimeError(f"Unsupported helper build kind {asset.build_kind!r}")
+    _extract_or_copy(asset, downloaded, destination)
+
+
 _PROBE_ARGS = {
     "yt-dlp": ("--version",),
     "deno": ("--version",),
@@ -191,7 +299,7 @@ def prepare(target: str) -> None:
             print(f"Downloading {asset.name}: {asset.source}")
             _download(asset, downloaded)
             destination = OUTPUT_DIR / asset.destination
-            _extract_or_copy(asset, downloaded, destination)
+            _prepare_asset(asset, downloaded, destination)
             _probe_prepared_asset(asset, destination)
             manifest["assets"].append({
                 "name": asset.name,

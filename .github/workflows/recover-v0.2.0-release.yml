@@ -1,6 +1,7 @@
 name: Recover unpublished v0.2.0 release
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main

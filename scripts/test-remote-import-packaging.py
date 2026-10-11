@@ -75,6 +75,11 @@ if module:
         and all(line.startswith("https://files.pythonhosted.org/") and "#sha256=" in line for line in requirement_lines),
         "linux gallery-dl build dependencies use direct hash-pinned wheel URLs without package-index resolution",
     )
+    check(
+        any("charset_normalizer-3.5.2-py3-none-any.whl" in line for line in requirement_lines)
+        and not any("charset_normalizer-3.5.2-cp" in line for line in requirement_lines),
+        "linux gallery-dl dependency lock avoids a CPython-minor-specific charset-normalizer wheel",
+    )
 
     check(hasattr(module, "_prepare_asset"), "helper preparation dispatches source-built helpers explicitly")
     if hasattr(module, "_prepare_asset"):

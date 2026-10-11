@@ -211,7 +211,7 @@ jobs:
         run: |
           set -o pipefail
           log_file="$RUNNER_TEMP/terarelay-android-build.log"
-          if npm run tauri -- android build --apk true --target aarch64 --ci 2>&1 | tee "$log_file"; then
+          if npm run tauri -- android build --apk --target aarch64 --ci 2>&1 | tee "$log_file"; then
             exit 0
           fi
           details="$(tail -n 60 "$log_file")"

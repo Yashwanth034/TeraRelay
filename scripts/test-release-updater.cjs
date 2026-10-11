@@ -7,6 +7,7 @@ const cp = require('child_process');
 
 const root = path.resolve(__dirname, '..');
 const workflow = fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8');
+const ciWorkflow = fs.readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8');
 const generator = path.join(root, 'scripts/build-mobile-update-manifest.mjs');
 
 assert.ok(fs.existsSync(generator), 'mobile update manifest generator is missing');
@@ -59,6 +60,10 @@ assert.match(workflow, /WINDOWS_CERTIFICATE_PASSWORD/, 'Windows code-signing cer
 assert.match(workflow, /certificateThumbprint/, 'Windows Tauri signing config is not generated from the imported certificate');
 assert.match(workflow, /tauri\.windows-signing\.conf\.json/, 'Windows release does not consume its runtime signing config');
 assert.match(workflow, /GITHUB_REF_NAME/, 'release workflow does not validate the vX.Y.Z tag against package version');
+assert.match(workflow, /android build --apk --aab --target aarch64 --ci/, 'Android release build must use Tauri boolean APK/AAB flags without values');
+assert.doesNotMatch(workflow, /--apk\s+true|--aab\s+true/, 'release workflow still passes obsolete boolean values to Tauri Android build flags');
+assert.match(ciWorkflow, /android build --apk --target aarch64 --ci/, 'Android CI build must use the Tauri APK boolean flag without a value');
+assert.doesNotMatch(ciWorkflow, /--apk\s+true|--aab\s+true/, 'CI workflow still passes obsolete boolean values to Tauri Android build flags');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'terarelay-update-manifest-'));
 try {

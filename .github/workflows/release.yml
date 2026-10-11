@@ -526,7 +526,7 @@ jobs:
           python3 ../scripts/configure-android-signing.py
 
       - name: Build signed release APK and AAB
-        run: npm run tauri -- android build --apk true --aab true --target aarch64 --ci
+        run: npm run tauri -- android build --apk --aab --target aarch64 --ci
 
       - name: Verify Android release signatures and package metadata
         shell: bash

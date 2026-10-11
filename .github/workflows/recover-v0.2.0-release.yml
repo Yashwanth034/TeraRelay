@@ -26,11 +26,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_rows="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.tag_name == "v0.2.0") | [.id, .draft, (.published_at // ""), (.target_commitish // "")] | @tsv')"
-          if [ -n "$release_rows" ]; then
-            count="$(printf '%s\n' "$release_rows" | sed '/^$/d' | wc -l | tr -d ' ')"
-            test "$count" = "1"
-            IFS=$'\t' read -r release_id is_draft published_at target_commitish <<< "$release_rows"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          release_meta="$(python3 -c 'import json,sys; rows=[r for r in json.load(sys.stdin) if r.get("tag_name")=="v0.2.0"]; len(rows)<=1 or sys.exit("Multiple v0.2.0 Release objects exist; refusing recovery."); print("NONE" if not rows else "{}|{}|{}|{}".format(rows[0]["id"], str(bool(rows[0].get("draft"))).lower(), rows[0].get("published_at") or "", rows[0].get("target_commitish") or ""))' <<< "$release_json")"
+          if [ "$release_meta" != "NONE" ]; then
+            IFS='|' read -r release_id is_draft published_at target_commitish <<< "$release_meta"
             if [ "$is_draft" != "true" ] || [ -n "$published_at" ]; then
               echo "v0.2.0 has a published/non-draft GitHub Release; refusing recovery." >&2
               exit 1

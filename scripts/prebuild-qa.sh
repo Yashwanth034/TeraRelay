@@ -10,6 +10,7 @@ echo "== TeraRelay prebuild QA =="
 node scripts/test-focused-ui.cjs
 node scripts/test-app-updater.cjs
 node scripts/test-android-updater-config.cjs
+node scripts/test-android-rustls.cjs
 node scripts/test-release-updater.cjs
 node scripts/test-native-drive-platforms.cjs
 node scripts/test-playback-seeking.cjs

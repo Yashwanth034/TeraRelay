@@ -154,6 +154,10 @@ test('Android updater backend and generated native wiring are present', () => {
   assert.ok(backend.includes('FileProvider'), 'Android FileProvider installer path missing');
   assert.ok(backend.includes('getPackageName'), 'Android FileProvider authority is not derived from the runtime package name');
   assert.ok(!backend.includes('const FILE_PROVIDER_AUTHORITY'), 'Android FileProvider authority must not be hard-coded');
+  assert.ok(
+    !backend.includes('get_string((&jni::objects::JString::from('),
+    'Android JNI strings must be bound before get_string so the borrowed JavaStr outlives the call',
+  );
   assert.ok(backend.includes('mobile_manifest_targets_platform'), 'backend mobile platform targeting guard missing');
 
   assert.ok(exists('scripts/configure-android-updater.mjs'), 'Android native configurator missing');

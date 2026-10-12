@@ -600,8 +600,9 @@ fn android_open_install_permission_impl() -> Result<(), String> {
                 .map_err(|error| format!("Could not read Android package name: {error}"))?
                 .l()
                 .map_err(|error| format!("Android package name is unavailable: {error}"))?;
+            let package_jstring = jni::objects::JString::from(package);
             let package_string = env
-                .get_string((&jni::objects::JString::from(package)).into())
+                .get_string(&package_jstring)
                 .map_err(|error| format!("Could not decode Android package name: {error}"))?;
             let uri_text = env
                 .new_string(format!("package:{}", package_string.to_string_lossy()))
@@ -657,8 +658,9 @@ fn android_install_apk_impl(path: &Path) -> Result<(), String> {
             .map_err(|error| format!("Could not read Android package name: {error}"))?
             .l()
             .map_err(|error| format!("Android package name is unavailable: {error}"))?;
+        let package_jstring = jni::objects::JString::from(package_name);
         let package_name = env
-            .get_string((&jni::objects::JString::from(package_name)).into())
+            .get_string(&package_jstring)
             .map_err(|error| format!("Could not decode Android package name: {error}"))?
             .to_string_lossy()
             .into_owned();

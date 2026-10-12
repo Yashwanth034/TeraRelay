@@ -340,7 +340,7 @@ jobs:
         if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready != 'true'
         shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
           TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.swift_triple }}
         run: bash scripts/build-macos-file-provider.sh
 

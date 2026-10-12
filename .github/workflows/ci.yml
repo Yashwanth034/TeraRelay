@@ -151,6 +151,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build macOS File Provider against minimum OS
+        if: runner.os == 'macOS'
+        working-directory: .
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.name == 'macOS Intel' && 'x86_64-apple-macosx12.0' || 'arm64-apple-macosx12.0' }}
+        run: bash scripts/build-macos-file-provider.sh
+
       - name: Configure CI bundles without release updater artifacts
         shell: bash
         run: |

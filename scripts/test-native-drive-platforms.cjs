@@ -281,6 +281,8 @@ requireText(swiftExtension, 'NSFileProviderEnumerating', 'macOS File Provider mu
 requireText(swiftExtension, '.mayAlreadyExist', 'macOS File Provider must make replayed creates idempotent');
 rejectText(swiftExtension, '.versionOutOfDate', 'macOS File Provider must not use an unavailable Apple SDK error case');
 requireText(swiftExtension, '.versionNoLongerAvailable', 'macOS File Provider must reject stale requested and mutation base versions using the supported SDK error');
+requireText(swiftExtension, 'if #available(macOS 12.3, *)', 'macOS 12.0 compatibility must guard the versionNoLongerAvailable error introduced in 12.3');
+requireText(swiftExtension, 'throw self.staleVersionError()', 'stale version failures must use the minimum-OS-compatible error path');
 requireText(swiftExtension, 'BridgeClient.maxContentChunkBytes', 'macOS File Provider transfers must remain bounded');
 requireText(swiftExtension, 'NSFileProviderManager(for:', 'File Provider downloads must resolve the active domain manager');
 requireText(swiftExtension, 'temporaryDirectoryURL()', 'File Provider downloads must use the system same-volume temporary directory');

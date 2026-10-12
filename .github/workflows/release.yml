@@ -336,6 +336,14 @@ jobs:
           cargo check --manifest-path app/src-tauri/Cargo.toml --target "${{ matrix.rust_target }}"
           ./scripts/build-macos-file-provider.sh
 
+      - name: Build ad-hoc macOS File Provider against minimum OS
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready != 'true'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.swift_triple }}
+        run: bash scripts/build-macos-file-provider.sh
+
       - name: Prepare verified Remote Import helpers
         shell: bash
         run: python3 scripts/prepare-remote-import-engines.py --target "${{ matrix.helper_target }}"

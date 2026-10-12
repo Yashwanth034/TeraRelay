@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download TeraRelay v0.1.1</strong></a>
+  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download TeraRelay v0.2.0</strong></a>
   ·
   <a href="SECURITY.md">Security</a>
   ·
@@ -108,18 +108,33 @@ There is no separate TeraRelay cloud-storage account or remote file-storage back
 - **Proxy support and localization**
 - **Linux acceleration** — optional TDLib/C++ fast-transfer path on Linux x86_64
 
+## What's new in v0.2.0
+
+Version 2 expands TeraRelay from file storage into version management, remote acquisition, and Drive workflows.
+
+- **File Stacks / Versions:** group related files into a stack, add versions manually, and manage, rename, move, unstack, or delete them while preserving the individual Telegram-backed files.
+- **Duplicate detection and media details:** identify byte-verified duplicates and load rich media metadata on demand.
+- **Refreshed desktop and mobile interfaces:** updated layouts while retaining file management, transfers, sharing, and localization.
+- **TeraRelay Boost:** choose a transfer engine explicitly, with saved engine preferences and durable queue recovery across restarts.
+- **Remote Import:** acquire files from direct URLs, supported media pages, galleries, and torrents. Select quality or files, resume acquisition, import multiple links, and optionally group results into Version Stacks. Release builds prepare pinned, hash-verified helper tools.
+- **TeraRelay Drive and Device Continuity:** organize a storage pool and reconcile Drive metadata across devices. Native Windows Explorer and macOS File Provider integration include portable-name checks, conflict protection, bounded staging, and reconnect recovery. macOS File Provider distribution requires Apple provisioning.
+- **Signed updates:** desktop updater packages and the mobile update manifest are signed. Android checks the downloaded APK hash again immediately before installation.
+- **Release fixes:** corrected cross-platform Drive compilation, macOS 12.0 compatibility, and mobile update signature handling.
+
+See the [v0.2.0 changelog](CHANGELOG.md#020---2026-10-11) for the detailed changes.
+
 ## Downloads
 
-The current public release is **v0.1.1**.
+The current public release is **v0.2.0**.
 
 | Platform | Release status | Packages |
 | --- | --- | --- |
 | Linux x86_64 | ✅ Packaged and release-validated | DEB, RPM, AppImage |
-| Windows x64 | ✅ Packaged and release-validated | EXE, MSI |
-| macOS Apple Silicon | ✅ Packaged and release-validated | DMG, app archive |
-| macOS Intel | ✅ Packaged and release-validated | DMG, app archive |
+| Windows x64 | ✅ Packaged and release-validated; unsigned for Authenticode | EXE, MSI |
+| macOS Apple Silicon | ✅ Packaged and release-validated; ad-hoc signed, not notarized | DMG, app archive |
+| macOS Intel | ✅ Packaged and release-validated; ad-hoc signed, not notarized | DMG, app archive |
 | Android ARM64 | ✅ Signed and release-validated | APK, AAB |
-| iOS | ⚠️ Simulator build validated only | No signed device IPA in v0.1.1 |
+| iOS | ⚠️ Simulator build validated only | No signed device IPA in v0.2.0 |
 
 **Download:** [GitHub Releases →](https://github.com/Yashwanth034/TeraRelay/releases/latest)
 
@@ -191,12 +206,13 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark conditions and limitation
 5. Use Personal Vault or create/join a TeraRelay channel.
 6. Upload and manage files normally; TeraRelay handles the Telegram storage details.
 
-### v0.1.1 platform notes
+### v0.2.0 platform notes
 
 - **Android:** ARM64 only.
 - **iOS:** simulator build validation only; physical-device/App Store distribution requires Apple signing/provisioning.
-- **Desktop signing:** v0.1.1 is distributed through GitHub Releases rather than an OS app store; platform reputation/security prompts may appear depending on the OS.
-- **Worldwide public sharing:** not enabled in v0.1.1. Desktop share links are local application features.
+- **Desktop signing:** Windows installers are unsigned for Authenticode. macOS packages are ad-hoc signed and not notarized; native File Provider distribution requires Apple provisioning. OS security prompts may appear.
+- **Update integrity:** desktop updater payloads and the Android update manifest have verified signatures. The release includes `SHA256SUMS.txt` for download checksums.
+- **Worldwide public sharing:** not enabled in v0.2.0. Desktop share links are local application features.
 
 ## Security model
 
@@ -252,12 +268,14 @@ Cross-platform CI also validates Linux, Windows, macOS, Android ARM64, and the i
 
 ## Project status
 
-**v0.1.1** is the current stable release. **v0.1.0** was the first public release.
+**[v0.2.0](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.0)** is the current stable release. **v0.1.0** was the first public release.
 
-Current v0.1.1 limitations:
+All seven CI jobs and all required release jobs passed for v0.2.0. The iOS App Store Connect release job was skipped because production Apple credentials were unavailable; iOS simulator validation passed.
+
+Current v0.2.0 limitations:
 
 - Telegram cloud storage is not end-to-end encrypted.
-- Android 32-bit ABIs are not part of the v0.1.1 release.
+- Android 32-bit ABIs are not part of the v0.2.0 release.
 - iOS physical-device/App Store distribution is not published.
 - Worldwide public file sharing is not implemented.
 - Cross-platform build/package validation is not the same as exhaustive device/runtime testing.

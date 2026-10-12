@@ -26,7 +26,8 @@ All notable public changes to TeraRelay are documented here.
 
 - Added the signed in-app updater for desktop plus a signed mobile update manifest and Android APK hash re-verification immediately before installation.
 - Added release-time Android package/version/signature verification, Windows Authenticode signing gates, macOS Developer ID/notarization/File Provider provisioning gates, and a real App Store Connect/TestFlight pipeline for iOS when production Apple credentials are configured.
-- Release CI now selects only platforms with complete production signing credentials; unavailable Windows/macOS/iOS targets are skipped instead of producing unsigned or partially signed artifacts.
+- Production signing steps run only when their required credentials are configured. The published v0.2.0 Windows installers are unsigned for Authenticode, and macOS packages are ad-hoc signed without notarization. Native macOS File Provider distribution requires Apple provisioning. iOS simulator validation passed; the App Store Connect release was skipped and no signed device IPA is included.
+- Fixed cross-platform Drive compilation, macOS 12.0 File Provider compatibility, and mobile updater public-key/signature decoding. Desktop updater payloads and the mobile update manifest were cryptographically verified; the release includes SHA256SUMS.txt.
 
 ## [0.1.1] - 2026-10-06
 

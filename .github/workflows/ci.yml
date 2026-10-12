@@ -66,6 +66,15 @@ jobs:
       - name: Frontend build
         run: npm run build
 
+      - name: Desktop interaction regression tests
+        working-directory: .
+        run: >-
+          node --test
+          scripts/test-file-selection-scroll.cjs
+          scripts/test-thumbnail-visibility.cjs
+          scripts/test-remote-import-recovery-controls.cjs
+          scripts/test-auth-query-isolation.cjs
+
       - name: Locale structure
         run: node check-i18n.cjs
 

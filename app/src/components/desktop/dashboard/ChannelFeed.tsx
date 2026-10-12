@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
     Check,
     Download,
@@ -104,6 +104,11 @@ export function ChannelFeed({
 }: ChannelFeedProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [collapsedStackIds, setCollapsedStackIds] = useState<Set<string>>(() => new Set());
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const contentRef = useRef<HTMLDivElement>(null);
+    const scrollState = useRef({ folderId: activeFolderId, initialized: false, followNewest: true });
+    const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+    const selectionMode = selectedIds.length > 0;
 
     const orderedFiles = useMemo(
         () => [...files].sort((a, b) => {
@@ -113,6 +118,35 @@ export function ChannelFeed({
         }),
         [files],
     );
+
+    // Initialize after the channel's files have mounted, then follow incoming
+    // files only while the reader stays near the bottom.
+    useLayoutEffect(() => {
+        if (scrollState.current.folderId !== activeFolderId) {
+            scrollState.current = { folderId: activeFolderId, initialized: false, followNewest: true };
+        }
+        const scroller = scrollRef.current;
+        if (loading || error || !scroller) return;
+        if (!scrollState.current.initialized || scrollState.current.followNewest) {
+            scroller.scrollTop = scroller.scrollHeight;
+            scrollState.current.initialized = true;
+        }
+    }, [activeFolderId, loading, error, orderedFiles]);
+
+    // Expanded version stacks and loaded thumbnails can change height after
+    // the initial render. Keep the newest row visible without moving a reader
+    // who has scrolled upward.
+    useLayoutEffect(() => {
+        const scroller = scrollRef.current;
+        const content = contentRef.current;
+        if (loading || error || !scroller || !content) return;
+        const observer = new ResizeObserver(() => {
+            if (scrollState.current.followNewest) scroller.scrollTop = scroller.scrollHeight;
+        });
+        observer.observe(content);
+        observer.observe(scroller);
+        return () => observer.disconnect();
+    }, [activeFolderId, loading, error]);
 
     if (loading) {
         return (
@@ -150,8 +184,15 @@ export function ChannelFeed({
                 onDrop?.(event, activeFolderId);
             }}
         >
-            <div className="tr-channel-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3">
-                <div className="mx-auto max-w-[820px] space-y-1.5">
+            <div
+                ref={scrollRef}
+                className="tr-channel-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3"
+                onScroll={(event) => {
+                    const scroller = event.currentTarget;
+                    scrollState.current.followNewest = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+                }}
+            >
+                <div ref={contentRef} className="mx-auto max-w-[820px] space-y-1.5">
                     {orderedFiles.length === 0 ? (
                         <div className="flex min-h-[420px] flex-col items-center justify-center px-6 text-center">
                             <div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl border border-telegram-primary/15 bg-telegram-primary/10">
@@ -170,7 +211,7 @@ export function ChannelFeed({
                         </div>
                     ) : (
                         orderedFiles.map((file, index) => {
-                            const selected = selectedIds.includes(file.id);
+                            const selected = selectedIdSet.has(file.id);
                             const title = getPremiumFileTitle(file);
                             const dayKey = channelDayKey(file.created_at);
                             const previousDayKey = index > 0 ? channelDayKey(orderedFiles[index - 1].created_at) : '';
@@ -196,6 +237,9 @@ export function ChannelFeed({
                                         <StackedFileRow
                                             file={file}
                                             folderId={activeFolderId}
+                                            selected={selected}
+                                            selectionMode={selectionMode}
+                                            onToggleSelection={() => onToggleSelection(file.id)}
                                             expanded={!collapsedStackIds.has(file.stack_id)}
                                             onExpandedChange={(nextExpanded) => {
                                                 setCollapsedStackIds(current => {
@@ -234,7 +278,7 @@ export function ChannelFeed({
                                             selected ? 'tr-file-row--selected' : '',
                                         ].join(' ')}
                                     >
-                                        <button
+                                        {selectionMode && <button
                                             type="button"
                                             onClick={(event) => {
                                                 event.stopPropagation();
@@ -247,8 +291,8 @@ export function ChannelFeed({
                                             title={selected ? 'Deselect file' : 'Select file'}
                                             aria-label={selected ? `Deselect ${displayFileName(file.name)}` : `Select ${displayFileName(file.name)}`}
                                         >
-                                            <Check className="h-3.5 w-3.5" />
-                                        </button>
+                                            {selected && <Check className="h-3.5 w-3.5" />}
+                                        </button>}
 
                                         <PremiumFileThumbnail
                                             file={file}
@@ -347,6 +391,10 @@ export function ChannelFeed({
                     y={contextMenu.y}
                     file={contextMenu.file}
                     onClose={() => setContextMenu(null)}
+                    selected={selectedIdSet.has(contextMenu.file.id)}
+                    onSelect={orderedFiles.some(file => file.id === contextMenu.file.id)
+                        ? () => onToggleSelection(contextMenu.file.id)
+                        : undefined}
                     onDownload={() => {
                         onDownload(contextMenu.file.id, contextMenu.file.name);
                         setContextMenu(null);

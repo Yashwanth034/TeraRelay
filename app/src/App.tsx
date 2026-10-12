@@ -48,6 +48,12 @@ function AppContent() {
   const continuityWarningNotifiedRef = useRef(false);
   const continuitySecurityNotifiedRef = useRef(false);
 
+  const handleLogout = () => {
+    // Cancel in-flight queries and discard account data before another login.
+    queryClient.clear();
+    setAuthStatus("unauthenticated");
+  };
+
   // Handle active language and RTL direction changes
   useEffect(() => {
     if (!isLoaded) return;
@@ -223,11 +229,11 @@ function AppContent() {
         }>
           {isMobile ? (
             <ErrorBoundary>
-              <MobileDashboard onLogout={() => setAuthStatus("unauthenticated")} />
+              <MobileDashboard onLogout={handleLogout} />
             </ErrorBoundary>
           ) : (
             <ErrorBoundary>
-              <DesktopDashboard onLogout={() => setAuthStatus("unauthenticated")} />
+              <DesktopDashboard onLogout={handleLogout} />
             </ErrorBoundary>
           )}
         </Suspense>

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import { FileText, Play } from 'lucide-react';
 import { TelegramFile } from '../../types';
@@ -37,40 +38,47 @@ export function PremiumFileThumbnail({
     const isImage = IMAGE_EXTS.has(ext);
     const isPdf = ext === 'pdf';
     const shouldFetch = isVideo || isImage || isPdf;
-    const [thumbnail, setThumbnail] = useState<string | null>(null);
-    const [loading, setLoading] = useState(false);
+    const thumbnailRef = useRef<HTMLButtonElement>(null);
+    const [nearViewport, setNearViewport] = useState(false);
 
     useEffect(() => {
-        let cancelled = false;
-        setThumbnail(null);
-
-        if (!shouldFetch) {
-            setLoading(false);
+        setNearViewport(false);
+        const element = thumbnailRef.current;
+        if (!shouldFetch || !element) return;
+        if (typeof IntersectionObserver === 'undefined') {
+            setNearViewport(true);
             return;
         }
-
-        setLoading(true);
-        invoke<string>('cmd_get_thumbnail', {
-            messageId: file.id,
-            folderId,
-        })
-            .then((result) => {
-                if (!cancelled && result) setThumbnail(result);
-            })
-            .catch(() => {
-                // Thumbnail is optional. Premium fallback remains available.
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
-            });
-
-        return () => {
-            cancelled = true;
-        };
+        const observer = new IntersectionObserver(([entry]) => {
+            setNearViewport(Boolean(entry?.isIntersecting));
+        }, { rootMargin: '180px' });
+        observer.observe(element);
+        return () => observer.disconnect();
     }, [file.id, folderId, shouldFetch]);
+
+    const { data: thumbnail, isFetching: loading } = useQuery({
+        queryKey: ['file-thumbnail', folderId, file.id],
+        queryFn: async () => {
+            try {
+                return await invoke<string>('cmd_get_thumbnail', {
+                    messageId: file.id,
+                    folderId,
+                }) || null;
+            } catch {
+                // Optional media artwork must never block browsing.
+                return null;
+            }
+        },
+        enabled: shouldFetch && nearViewport,
+        staleTime: 30 * 60 * 1000,
+        gcTime: 5 * 60 * 1000,
+        refetchOnWindowFocus: false,
+        retry: false,
+    });
 
     return (
         <button
+            ref={thumbnailRef}
             type="button"
             className={[
                 'tr-media-thumb',
@@ -88,7 +96,7 @@ export function PremiumFileThumbnail({
             aria-label={'Open ' + file.name}
         >
             {thumbnail ? (
-                <img src={thumbnail} alt="" className="tr-media-thumb__image" />
+                <img src={thumbnail} alt="" loading="lazy" decoding="async" className="tr-media-thumb__image" />
             ) : loading ? (
                 <span className="tr-media-thumb__skeleton" aria-hidden="true" />
             ) : (

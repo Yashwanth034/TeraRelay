@@ -1,0 +1,31 @@
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
+const {createRequire}=require('node:module');
+const appRequire=createRequire(path.resolve(__dirname,'../app/package.json'));
+const ts=appRequire('typescript'),{QueryClient}=appRequire('@tanstack/react-query');
+const source=fs.readFileSync(path.resolve(__dirname,'../app/src/App.tsx'),'utf8');
+const ast=ts.createSourceFile('App.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+let handlerExpression;const logoutBindings=[];
+function visit(node){
+ if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='handleLogout')handlerExpression=node.initializer.getText(ast);
+ if(ts.isJsxSelfClosingElement(node)&&['DesktopDashboard','MobileDashboard'].includes(node.tagName.getText(ast)))logoutBindings.push(node.attributes.properties.find(a=>a.name?.getText(ast)==='onLogout')?.initializer?.expression?.getText(ast));
+ ts.forEachChild(node,visit);
+}visit(ast);
+(async()=>{
+ assert.ok(handlerExpression,'Logout must clear account-specific query state');
+ assert.deepEqual(logoutBindings,['handleLogout','handleLogout']);
+ const queryClient=new QueryClient({defaultOptions:{queries:{retry:false}}});
+ const key=['file-thumbnail',null,1];queryClient.setQueryData(key,'account-A-artwork');
+ queryClient.setQueryData(['files',null],['account-A-file']);
+ let resolve,cancelled=false;
+ const pending=queryClient.fetchQuery({queryKey:['file-thumbnail',null,2],queryFn:({signal})=>new Promise(done=>{resolve=done;signal.addEventListener('abort',()=>{cancelled=true})})});
+ pending.catch(()=>{});
+ let auth;
+ const js=ts.transpileModule('const logout='+handlerExpression+';logout;', {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
+ const logout=vm.runInNewContext(js,{queryClient,setAuthStatus:value=>{assert.equal(queryClient.getQueryCache().getAll().length,0);auth=value}});
+ logout();assert.equal(auth,'unauthenticated');assert.equal(cancelled,true);
+ assert.equal(queryClient.getQueryData(key),undefined);
+ resolve('account-A-late-artwork');await new Promise(done=>setImmediate(done));
+ assert.equal(queryClient.getQueryCache().getAll().length,0);
+ assert.equal(await queryClient.fetchQuery({queryKey:key,queryFn:async()=> 'account-B-artwork'}),'account-B-artwork');
+ queryClient.clear();console.log('PASS both dashboards clear cached account data and cancel in-flight queries before logout; account B fetches fresh artwork');
+})().catch(error=>{console.error(error);process.exitCode=1});

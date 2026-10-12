@@ -482,10 +482,14 @@ fn executable_name(name: &str) -> String {
 }
 
 async fn command_version(path: &Path) -> Option<String> {
+    let version_flag = match path.file_stem().and_then(|name| name.to_str()) {
+        Some("ffmpeg" | "ffprobe") => "-version",
+        _ => "--version",
+    };
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::process::Command::new(path)
-            .arg("--version")
+            .arg(version_flag)
             .kill_on_drop(true)
             .output(),
     )
@@ -519,9 +523,17 @@ fn managed_engine_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn bundled_engine_path(app: &tauri::AppHandle, name: &str) -> Option<PathBuf> {
-    let executable = executable_name(name);
     let resource_dir = app.path().resource_dir().ok()?;
+    bundled_engine_path_in(&resource_dir, name)
+}
+
+fn bundled_engine_path_in(resource_dir: &Path, name: &str) -> Option<PathBuf> {
+    let executable = executable_name(name);
     [
+        resource_dir
+            .join("resources")
+            .join("remote-import")
+            .join(&executable),
         resource_dir.join("remote-import").join(&executable),
         resource_dir.join(&executable),
     ]
@@ -2248,6 +2260,94 @@ async fn acquire_torrent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg_helpers_are_available_with_their_native_version_flag() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("terarelay-version-probe-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["ffmpeg", "ffprobe"] {
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                r#"#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = '-version' ] || exit 1
+printf '%s\n' 'FFmpeg helper version fixture'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                command_version(&path).await.as_deref(),
+                Some("FFmpeg helper version fixture"),
+                "{name} must be detected using its supported version flag",
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_engines_keep_their_double_dash_version_flag() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-other-version-probe-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["yt-dlp", "deno", "aria2c", "gallery-dl"] {
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                r#"#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = '--version' ] || exit 1
+printf '%s\n' 'Other engine version fixture'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                command_version(&path).await.as_deref(),
+                Some("Other engine version fixture")
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_engines_follow_tauri_resource_directory_layout() {
+        let root =
+            std::env::temp_dir().join(format!("terarelay-resource-layout-{}", std::process::id()));
+        let nested = root.join("resources").join("remote-import");
+        std::fs::create_dir_all(&nested).unwrap();
+        let helper = nested.join(executable_name("ffprobe"));
+        std::fs::write(&helper, b"bundled fixture").unwrap();
+        assert_eq!(bundled_engine_path_in(&root, "ffprobe"), Some(helper));
+        assert!(bundled_engine_path_in(&root, "missing-helper").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_engines_keep_legacy_resource_layouts() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-legacy-resource-layout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("remote-import")).unwrap();
+        let helper = root.join("remote-import").join(executable_name("ffprobe"));
+        std::fs::write(&helper, b"legacy fixture").unwrap();
+        assert_eq!(
+            bundled_engine_path_in(&root, "ffprobe"),
+            Some(helper.clone())
+        );
+        std::fs::remove_file(helper).unwrap();
+        let flat = root.join(executable_name("ffprobe"));
+        std::fs::write(&flat, b"flat fixture").unwrap();
+        assert_eq!(bundled_engine_path_in(&root, "ffprobe"), Some(flat));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn classifies_magnet_direct_file_and_web_sources() {

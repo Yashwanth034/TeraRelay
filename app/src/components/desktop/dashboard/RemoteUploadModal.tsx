@@ -227,7 +227,7 @@ export function RemoteUploadModal({
     };
 
     const handleBatchImport = () => {
-        if (!batch) return;
+        if (!batch || busy) return;
         setError(null);
         void remoteImportBatch.startBatch(batch.id)
             .catch(cause => {
@@ -237,6 +237,19 @@ export function RemoteUploadModal({
                 void onBatchSettled?.();
             });
         onClose();
+    };
+
+    const handleSkipBatchEntry = async (entryId: string) => {
+        if (!batch || busy) return;
+        setBusy(true);
+        setError(null);
+        try {
+            await remoteImportBatch.skipEntry(batch.id, entryId);
+        } catch (cause) {
+            setError(errorMessage(cause));
+        } finally {
+            setBusy(false);
+        }
     };
 
     const toggleBatchSelection = async (entryId: string, selectionId: string) => {
@@ -469,7 +482,7 @@ export function RemoteUploadModal({
                                                 >
                                                     <RotateCcw className="w-3 h-3" /> {entryJob?.analysis ? 'Retry import' : 'Retry analysis'}
                                                 </button>
-                                                <button type="button" className="text-xs text-telegram-subtext" onClick={() => void remoteImportBatch.skipEntry(batch.id, entry.id)}>Skip</button>
+                                                <button type="button" className="text-xs text-telegram-subtext" disabled={busy} onClick={() => void handleSkipBatchEntry(entry.id)}>Skip</button>
                                             </div>
                                         )}
                                     </div>
@@ -586,7 +599,7 @@ export function RemoteUploadModal({
                             type="button"
                             onClick={handleBatchImport}
                             className="tr-button tr-button--primary tr-button--sm"
-                            disabled={!selectionReady}
+                            disabled={busy || !selectionReady}
                         >
                             Import
                         </button>

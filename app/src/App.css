@@ -811,7 +811,10 @@ body,
   mask-image: radial-gradient(circle at 70% 4%, #000 0, transparent 63%);
 }
 
-.terarelay-shell > * {
+/* Only layout panels participate in the shell's decorative stacking layer.
+   Dialogs and transfer docks must retain their viewport-fixed positioning. */
+.terarelay-shell > .tr-sidebar,
+.terarelay-shell > .tr-main-panel {
   position: relative;
   z-index: 1;
 }

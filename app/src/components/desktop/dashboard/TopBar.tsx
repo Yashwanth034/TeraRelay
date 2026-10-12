@@ -30,6 +30,7 @@ interface TopBarProps {
     onBulkShare: () => void;
     onDownloadFolder: () => void;
     onClearSelection: () => void;
+    onSelectAll?: () => void;
     viewMode: 'grid' | 'list';
     setViewMode: (mode: 'grid' | 'list') => void;
     searchTerm: string;
@@ -52,6 +53,7 @@ export function TopBar({
     onBulkShare,
     onDownloadFolder,
     onClearSelection,
+    onSelectAll,
     viewMode,
     setViewMode,
     searchTerm,
@@ -132,6 +134,11 @@ export function TopBar({
                     <PremiumBadge tone="primary">
                         {t('files.items_selected', { count: selectedIds.length })}
                     </PremiumBadge>
+                    {onSelectAll && (
+                        <PremiumButton variant="secondary" size="sm" onClick={onSelectAll}>
+                            {t('files.select_all')}
+                        </PremiumButton>
+                    )}
                     <PremiumIconButton
                         label={t('files.clear_selection')}
                         onClick={onClearSelection}

@@ -797,6 +797,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onBulkShare={handleBulkShare}
                     onDownloadFolder={handleDownloadFolder}
                     onClearSelection={clearSelection}
+                    onSelectAll={handleSelectAll}
                     viewMode={viewMode}
                     setViewMode={setViewMode}
                     searchTerm={searchTerm}

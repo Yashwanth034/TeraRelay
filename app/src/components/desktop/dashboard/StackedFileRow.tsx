@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
+    Check,
     ChevronDown,
     ChevronRight,
     Download,
@@ -16,6 +17,9 @@ interface StackedFileRowProps {
     file: TelegramFile;
     folderId: number;
     expanded: boolean;
+    selected?: boolean;
+    selectionMode?: boolean;
+    onToggleSelection?: () => void;
     onExpandedChange: (expanded: boolean) => void;
     onPreview: (file: TelegramFile, orderedFiles?: TelegramFile[]) => void;
     onDetails?: (file: TelegramFile) => void;
@@ -47,6 +51,9 @@ export function StackedFileRow({
     file,
     folderId,
     expanded,
+    selected = false,
+    selectionMode = false,
+    onToggleSelection,
     onExpandedChange,
     onPreview,
     onDetails,
@@ -110,7 +117,21 @@ export function StackedFileRow({
                 expanded ? 'tr-version-group--expanded' : '',
             ].join(' ')}
         >
-            <article className="tr-version-group__parent group relative flex items-center gap-2 px-2.5 select-none">
+            <article className={['tr-version-group__parent group relative flex items-center gap-2 px-2.5 select-none', selected ? 'tr-file-row--selected' : ''].join(' ')}>
+                {selectionMode && onToggleSelection && (
+                    <button
+                        type="button"
+                        className={['tr-file-select', selected ? 'tr-file-select--active' : ''].join(' ')}
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onToggleSelection();
+                        }}
+                        aria-label={selected ? `Deselect ${title}` : `Select ${title}`}
+                        title={selected ? 'Deselect stack' : 'Select stack'}
+                    >
+                        {selected && <Check className="h-3.5 w-3.5" />}
+                    </button>
+                )}
                 <button
                     type="button"
                     className="tr-version-group__toggle"

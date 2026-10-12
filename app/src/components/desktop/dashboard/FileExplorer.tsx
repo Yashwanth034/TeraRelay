@@ -96,7 +96,12 @@ export function FileExplorer({
     const handleContextMenu = useCallback((e: React.MouseEvent, file: TelegramFile) => {
         e.preventDefault();
         e.stopPropagation();
-        setContextMenu({ x: e.clientX, y: e.clientY, file });
+        if (e.type === 'contextmenu') {
+            setContextMenu({ x: e.clientX, y: e.clientY, file });
+        } else {
+            const rect = e.currentTarget.getBoundingClientRect();
+            setContextMenu({ x: rect.right, y: rect.bottom + 4, file });
+        }
     }, []);
 
     const sortedFiles = useMemo(() => {
@@ -318,6 +323,7 @@ export function FileExplorer({
                                                 key={file.id}
                                                 file={file}
                                                 isSelected={selectedIds.includes(file.id)}
+                                                selectionMode={selectedIds.length > 0}
                                                 onClick={(e) => onFileClick(e, file.id)}
                                                 onContextMenu={(e) => handleContextMenu(e, file)}
                                                 onDelete={() => onDelete(file.id)}
@@ -422,6 +428,8 @@ export function FileExplorer({
                     y={contextMenu.y}
                     file={contextMenu.file}
                     onClose={() => setContextMenu(null)}
+                    selected={selectedIds.includes(contextMenu.file.id)}
+                    onSelect={() => onToggleSelection(contextMenu.file.id)}
                     onDownload={() => {
                         onDownload(contextMenu.file.id, contextMenu.file.name);
                         setContextMenu(null);

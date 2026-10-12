@@ -1,6 +1,5 @@
-import { motion } from 'framer-motion';
 import { useState } from 'react';
-import { Check, Download, Eye, Folder, Link, Trash2 } from 'lucide-react';
+import { Check, Download, Eye, Folder, Link, MoreVertical, Trash2 } from 'lucide-react';
 import { TelegramFile } from '../../../types';
 import { createDragGhost, displayFileName } from '../../../utils';
 import { getPremiumFileMeta, getPremiumFileTitle } from '../../../filePresentation';
@@ -16,6 +15,7 @@ interface FileCardProps {
     onPreview?: () => void;
     onShare?: () => void;
     isSelected: boolean;
+    selectionMode?: boolean;
     onClick?: (e: React.MouseEvent) => void;
     onContextMenu?: (e: React.MouseEvent) => void;
     onDrop?: (e: React.DragEvent, folderId: number) => void;
@@ -34,6 +34,7 @@ export function FileCard({
     onPreview,
     onShare,
     isSelected,
+    selectionMode = false,
     onClick,
     onContextMenu,
     onDrop,
@@ -97,8 +98,7 @@ export function FileCard({
                 onDrop(event, file.id);
             }}
         >
-            <motion.div
-                whileHover={{ y: -2 }}
+            <div
                 className={[
                     'tr-library-card group relative cursor-pointer overflow-hidden',
                     isSelected ? 'tr-library-card--selected' : '',
@@ -122,7 +122,7 @@ export function FileCard({
                         />
                     )}
 
-                    <button
+                    {(selectionMode || isSelected) && <button
                         type="button"
                         className={[
                             'tr-library-select',
@@ -135,7 +135,7 @@ export function FileCard({
                         aria-label={isSelected ? 'Deselect file' : 'Select file'}
                     >
                         {isSelected && <Check className="h-3 w-3" />}
-                    </button>
+                    </button>}
 
                     {!isFolder && (
                         <div className="tr-library-card__actions">
@@ -177,6 +177,20 @@ export function FileCard({
                                     aria-label="Share"
                                 >
                                     <Link />
+                                </button>
+                            )}
+                            {onContextMenu && (
+                                <button
+                                    type="button"
+                                    className="tr-library-card__action"
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        onContextMenu(event);
+                                    }}
+                                    title="More actions"
+                                    aria-label="More actions"
+                                >
+                                    <MoreVertical />
                                 </button>
                             )}
                             <button
@@ -222,7 +236,7 @@ export function FileCard({
                         ))}
                     </div>
                 </div>
-            </motion.div>
+            </div>
         </div>
     );
 }

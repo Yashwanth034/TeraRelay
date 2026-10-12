@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText, Link, Copy, ArrowRightLeft, Layers3, Plus, Info } from 'lucide-react';
+import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText, Link, Copy, ArrowRightLeft, Layers3, Plus, Info, CheckCircle2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { TelegramFile, TelegramFolder } from '../../../types';
 import { isMediaFile, isPdfFile } from '../../../utils';
@@ -15,6 +15,8 @@ interface ContextMenuProps {
     onDelete?: () => void;
     onPreview: () => void;
     onDetails?: () => void;
+    onSelect?: () => void;
+    selected?: boolean;
     onShare?: () => void;
     onRename?: () => void;
     onMove?: () => void;
@@ -24,7 +26,7 @@ interface ContextMenuProps {
     activeFolderId?: number | null;
 }
 
-export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onDetails, onShare, onRename, onMove, onAddVersion, onManageVersions, folders, activeFolderId }: ContextMenuProps) {
+export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onDetails, onSelect, selected = false, onShare, onRename, onMove, onAddVersion, onManageVersions, folders, activeFolderId }: ContextMenuProps) {
     const [adjustedPos, setAdjustedPos] = useState({ x, y });
     const menuRef = useRef<HTMLDivElement>(null);
     const { t } = useTranslation();
@@ -82,6 +84,19 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
             <div className="tr-popover-title px-2 py-2 truncate max-w-[200px] mb-1">
                 {file.stack_id ? getPremiumFileTitle(file) : file.name}
             </div>
+
+            {onSelect && (
+                <button
+                    onClick={() => {
+                        onSelect();
+                        onClose();
+                    }}
+                    className="tr-menu-item"
+                >
+                    <CheckCircle2 className="w-4 h-4 text-telegram-primary" />
+                    {selected ? 'Deselect' : 'Select'}
+                </button>
+            )}
 
             {file.type !== 'folder' && (
                 <button onClick={onPreview} className="tr-menu-item">

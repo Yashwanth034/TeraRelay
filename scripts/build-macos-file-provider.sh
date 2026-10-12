@@ -60,7 +60,7 @@ else
   rm -f "$build_root/TeraRelayMain.provisionprofile"
 fi
 
-if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+if [[ -n "${APPLE_SIGNING_IDENTITY:-}" && "${APPLE_SIGNING_IDENTITY}" != "-" ]]; then
   if [[ ! -f "$appex_root/Contents/embedded.provisionprofile" ]]; then
     echo "Production File Provider signing requires TERARELAY_FILE_PROVIDER_PROFILE_PATH" >&2
     exit 1
@@ -73,6 +73,12 @@ if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
     --entitlements "$provider_root/TeraRelayFileProvider.entitlements" \
     --sign "$APPLE_SIGNING_IDENTITY" \
     "$appex_root"
+  codesign --verify --strict --verbose=2 "$appex_root"
+elif [[ "${APPLE_SIGNING_IDENTITY:-}" == "-" ]]; then
+  # Ad-hoc development/CI bundles have no Developer ID provisioning profiles.
+  # Production identities above still require both profiles and timestamping.
+  codesign --force --entitlements "$provider_root/TeraRelayFileProvider.entitlements" \
+    --sign - "$appex_root"
   codesign --verify --strict --verbose=2 "$appex_root"
 fi
 

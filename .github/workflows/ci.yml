@@ -59,6 +59,10 @@ jobs:
         working-directory: .
         run: bash scripts/check-source.sh
 
+      - name: File Provider packaging regression tests
+        working-directory: .
+        run: python3 scripts/test-macos-file-provider-build.py
+
       - name: Frontend build
         run: npm run build
 
@@ -147,10 +151,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Configure CI bundles without release updater artifacts
+        shell: bash
+        run: |
+          node -e "require('fs').writeFileSync('src-tauri/tauri.ci.conf.json', JSON.stringify({bundle:{createUpdaterArtifacts:false}}))"
+
       - name: Build distributable desktop bundles
         env:
           APPLE_SIGNING_IDENTITY: "-"
-        run: npm run tauri -- build --ci ${{ matrix.args }}
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.name == 'macOS Intel' && 'x86_64-apple-macosx12.0' || 'arm64-apple-macosx12.0' }}
+        run: npm run tauri -- build --ci --config src-tauri/tauri.ci.conf.json ${{ matrix.args }}
 
       - name: Upload desktop bundles
         uses: actions/upload-artifact@v7

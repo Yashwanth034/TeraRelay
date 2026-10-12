@@ -285,9 +285,9 @@ mod desktop {
     use std::os::windows::fs::{FileExt as WindowsFileExt, OpenOptionsExt};
     #[cfg(target_os = "linux")]
     use std::process::Command;
-    use std::time::Duration;
     #[cfg(target_os = "linux")]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[cfg(target_os = "linux")]
     const ROOT_INODE: u64 = 1;
@@ -771,6 +771,7 @@ mod desktop {
             drive_snapshot(&conn)
         }
 
+        #[cfg(target_os = "linux")]
         fn node_for_inode(&self, ino: u64) -> Result<Option<Node>, String> {
             if ino == ROOT_INODE {
                 return Ok(Some(Node::Root));
@@ -801,6 +802,7 @@ mod desktop {
             Ok(None)
         }
 
+        #[cfg(target_os = "linux")]
         fn directory_id_for_inode(&self, ino: u64) -> Result<Option<Option<String>>, String> {
             match self.node_for_inode(ino)? {
                 Some(Node::Root) => Ok(Some(None)),
@@ -810,6 +812,7 @@ mod desktop {
             }
         }
 
+        #[cfg(target_os = "linux")]
         fn parent_inode(&self, node: &Node, snapshot: &DriveSnapshot) -> u64 {
             let parent_id = match node {
                 Node::Directory(dir) => dir.parent_id.as_deref(),
@@ -828,6 +831,7 @@ mod desktop {
                 .unwrap_or(ROOT_INODE)
         }
 
+        #[cfg(target_os = "linux")]
         fn lookup_child(&self, parent: u64, name: &OsStr) -> Result<Option<Node>, String> {
             let Some(name) = name.to_str() else {
                 return Ok(None);
@@ -1427,6 +1431,7 @@ mod desktop {
             Ok(!drive_pending_chunks(&conn, &pending.id)?.is_empty())
         }
 
+        #[cfg(target_os = "linux")]
         fn pending_for_inode(&self, ino: u64) -> Result<Option<DrivePendingRecord>, String> {
             let snapshot = self.snapshot()?;
             for pending in snapshot.pending {
@@ -2177,6 +2182,7 @@ mod desktop {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn errno_for_core(error: &DriveFsError) -> i32 {
         match error {
             DriveFsError::NotFound => ENOENT,
@@ -2776,11 +2782,13 @@ mod desktop {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct LinuxFuseAdapter {
         core: DriveFsCore,
         backend: Arc<TeraRelayFs>,
     }
 
+    #[cfg(target_os = "linux")]
     impl std::ops::Deref for LinuxFuseAdapter {
         type Target = TeraRelayFs;
 
@@ -2789,6 +2797,7 @@ mod desktop {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Filesystem for LinuxFuseAdapter {
         fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
             match self.lookup_child(parent, name) {
@@ -3667,6 +3676,7 @@ mod desktop {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(target_os = "linux")]
     enum ExistingMountDisposition {
         Ready,
         Healthy,
@@ -3674,6 +3684,7 @@ mod desktop {
         InspectionError(i32),
     }
 
+    #[cfg(target_os = "linux")]
     fn classify_existing_mount(
         is_active: bool,
         metadata_errno: Option<i32>,
@@ -3688,6 +3699,7 @@ mod desktop {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn normalize_mount_path_lexically(path: &Path) -> PathBuf {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
@@ -3711,6 +3723,7 @@ mod desktop {
         normalized
     }
 
+    #[cfg(target_os = "linux")]
     fn encode_mountinfo_path(path: &Path) -> String {
         normalize_mount_path_lexically(path)
             .to_string_lossy()
@@ -3720,6 +3733,7 @@ mod desktop {
             .replace('\n', "\\012")
     }
 
+    #[cfg(target_os = "linux")]
     fn mountpoint_is_active(path: &Path) -> bool {
         let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
             return false;
@@ -3733,6 +3747,7 @@ mod desktop {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn prepare_mount_point(path: &Path) -> Result<(), String> {
         let active = mountpoint_is_active(path);
         let metadata = if active {
@@ -3799,6 +3814,7 @@ mod desktop {
             .map_err(|e| format!("Failed to create TeraRelay Drive mount point: {e}"))
     }
 
+    #[cfg(target_os = "linux")]
     fn default_mount_point(app: &AppHandle) -> Result<PathBuf, String> {
         // Explicit override is primarily for isolated QA and packaging tests,
         // but is also useful for advanced Linux deployments. It must win over
@@ -3820,6 +3836,7 @@ mod desktop {
         Ok(home.join("TeraRelay Drive"))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn mount_impl(
         app_handle: AppHandle,
         state: State<'_, DriveMountState>,
@@ -3896,6 +3913,7 @@ mod desktop {
         Err("TeraRelay Drive did not mount within the startup timeout".to_string())
     }
 
+    #[cfg(target_os = "linux")]
     pub fn recover_pending_impl(
         app_handle: AppHandle,
         state: State<'_, DriveMountState>,
@@ -3981,6 +3999,7 @@ mod desktop {
         })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn unmount_impl(state: State<'_, DriveMountState>) -> Result<DriveMountStatus, String> {
         let mount_point = state
             .inner
@@ -4006,10 +4025,12 @@ mod desktop {
         Ok(state.status())
     }
 
+    #[cfg(target_os = "linux")]
     fn should_lazy_detach_after_unmount(normal_succeeded: bool, still_active: bool) -> bool {
         !normal_succeeded && still_active
     }
 
+    #[cfg(target_os = "linux")]
     pub fn unmount_best_effort(state: &DriveMountState) {
         let path = {
             let Ok(slot) = state.inner.mount_point.lock() else {
@@ -4055,7 +4076,7 @@ mod desktop {
         state.inner.mounted.store(false, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     mod staging_budget_tests {
         use super::{
             classify_existing_mount, encode_mountinfo_path, ensure_private_staging_directory,

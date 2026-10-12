@@ -34,8 +34,10 @@ if module:
         assets = module.assets_for_target(target)
         names = {asset.name for asset in assets}
         check(required <= names, f"{target} has all core Remote Import helpers")
-        if target != "macos-x64":
+        if target in {"linux-x64", "windows-x64"}:
             check("aria2c" in names, f"{target} bundles aria2 acceleration")
+        else:
+            check("aria2c" not in names, f"{target} uses the built-in downloader fallback instead of a brittle aria2 sidecar")
         for asset in assets:
             check(bool(re.fullmatch(r"[0-9a-f]{64}", asset.sha256)), f"{target}/{asset.name} has pinned sha256")
             check(asset.url.startswith("https://github.com/"), f"{target}/{asset.name} uses HTTPS GitHub release asset")
@@ -109,7 +111,7 @@ if module:
             good.write_text("#!/bin/sh\nexit 0\n")
             good.chmod(0o755)
             try:
-                module._probe_prepared_asset(asset, good)
+                module._probe_prepared_asset(asset, good, "linux-x64")
                 good_probe = True
             except Exception:
                 good_probe = False
@@ -119,11 +121,22 @@ if module:
             bad.write_text("#!/bin/sh\nexit 23\n")
             bad.chmod(0o755)
             try:
-                module._probe_prepared_asset(asset, bad)
+                module._probe_prepared_asset(asset, bad, "linux-x64")
                 bad_probe_rejected = False
             except RuntimeError:
                 bad_probe_rejected = True
             check(bad_probe_rejected, "runtime probe rejects a helper that exits nonzero")
+
+        check(hasattr(module, "_runtime_probe_supported"), "helper probing knows when the runner CPU cannot execute the target architecture")
+        if hasattr(module, "_runtime_probe_supported"):
+            check(
+                not module._runtime_probe_supported("macos-x64", "arm64"),
+                "macOS Intel helpers are not executed on Apple Silicon release runners",
+            )
+            check(
+                module._runtime_probe_supported("macos-arm64", "arm64"),
+                "macOS Apple Silicon helpers remain runtime-probed on matching runners",
+            )
 
 config = json.loads((ROOT / "app/src-tauri/tauri.conf.json").read_text())
 resources = config.get("bundle", {}).get("resources", [])

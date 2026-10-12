@@ -13,6 +13,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import platform
 import pathlib
 import shutil
 import stat
@@ -111,7 +112,6 @@ def assets_for_target(target: str) -> list[Asset]:
             _asset("deno", "deno", "denoland/deno", DENO_TAG, "deno-aarch64-apple-darwin.zip", "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c", "deno"),
             _asset("ffmpeg", "ffmpeg", "shaka-project/static-ffmpeg-binaries", FFMPEG_TAG, "ffmpeg-osx-arm64", "e7b9fcd97f95f333512d6e8b8ac24d9dbc08f189f36047695499bd7b57214b22"),
             _asset("ffprobe", "ffprobe", "shaka-project/static-ffmpeg-binaries", FFMPEG_TAG, "ffprobe-osx-arm64", "ded4c698b8ff38d0bc1fd30fcc5e768dc46f58bc15a8dfd61f98615ba49cde5c"),
-            _asset("aria2c", "aria2c", "Kenshin9977/aria2", ARIA_TAG, "aria2c-macos-arm64", "baaaa52ee2539f664b595bd106311b792ded255fef5ab142cec1352db4c28d3a"),
             _asset("gallery-dl", "gallery-dl", "gdl-org/builds", GALLERY_TAG, "gallery-dl_macos", "8559943db808ac6fd84db2fd656845519930784f4e78bab9818d63a90695b23b"),
         ]
     if target == "macos-x64":
@@ -248,9 +248,24 @@ _PROBE_ARGS = {
 }
 
 
-def _probe_prepared_asset(asset: Asset, destination: pathlib.Path) -> None:
-    """Fail closed if a prepared helper cannot launch on its target runner."""
+def _runtime_probe_supported(target: str, host_machine: str | None = None) -> bool:
+    machine = (host_machine or platform.machine()).lower()
+    if target == "macos-x64" and machine in {"arm64", "aarch64"}:
+        return False
+    if target == "macos-arm64" and machine in {"x86_64", "amd64"}:
+        return False
+    return True
+
+
+def _probe_prepared_asset(asset: Asset, destination: pathlib.Path, target: str) -> None:
+    """Fail closed when a helper can run natively; checksum-only verify cross-arch helpers."""
     if not asset.executable:
+        return
+    if not _runtime_probe_supported(target):
+        print(
+            f"Skipping runtime probe for {asset.name}: target {target} cannot be executed "
+            f"natively on host {platform.machine()}"
+        )
         return
     args = _PROBE_ARGS.get(asset.name)
     if args is None:
@@ -300,7 +315,7 @@ def prepare(target: str) -> None:
             _download(asset, downloaded)
             destination = OUTPUT_DIR / asset.destination
             _prepare_asset(asset, downloaded, destination)
-            _probe_prepared_asset(asset, destination)
+            _probe_prepared_asset(asset, destination, target)
             manifest["assets"].append({
                 "name": asset.name,
                 "destination": asset.destination,
@@ -337,8 +352,8 @@ def main() -> int:
     if args.dry_run:
         for asset in assets:
             print(f"{asset.name:12} -> {asset.destination:16} {asset.source} sha256={asset.sha256}")
-        if args.target == "macos-x64":
-            print("aria2c      -> built-in downloader fallback (no pinned trusted macOS x64 sidecar)")
+        if args.target in {"macos-arm64", "macos-x64"}:
+            print("aria2c      -> built-in downloader fallback (no reliable pinned macOS sidecar)")
         return 0
     if args.verify_downloads:
         verify_downloads(args.target)

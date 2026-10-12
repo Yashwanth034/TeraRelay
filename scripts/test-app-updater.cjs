@@ -165,6 +165,19 @@ test('Android updater backend and generated native wiring are present', () => {
   assert.ok(config.build.beforeBuildCommand.includes('configure-android-updater'), 'Android updater configurator not wired into builds');
 });
 
+test('iOS excludes the unsupported librqbit socket stack', () => {
+  const cargo = read('app/src-tauri/Cargo.toml');
+  const backend = read('app/src-tauri/src/commands/remote_import.rs');
+  assert.ok(
+    cargo.includes(`[target.'cfg(not(target_os = \"ios\"))'.dependencies]`),
+    'librqbit must be target-gated away from iOS',
+  );
+  assert.ok(
+    backend.includes('Torrent Remote Import is unavailable on iOS'),
+    'iOS needs an explicit torrent fallback instead of compiling librqbit',
+  );
+});
+
 test('release workflow publishes signed desktop updater assets and verified Android manifest', () => {
   const workflow = read('.github/workflows/release.yml');
   assert.ok(workflow.includes('TAURI_SIGNING_PRIVATE_KEY'), 'desktop updater signing private key is not supplied to CI');

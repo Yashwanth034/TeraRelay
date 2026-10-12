@@ -76,6 +76,8 @@ rustls = "0.23"
 webpki-roots = "0.26"
 mime_guess = "2"
 unicode-normalization = "0.1"
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls", "http-api-client"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]

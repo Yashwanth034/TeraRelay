@@ -960,6 +960,28 @@ pub async fn cmd_remote_import_update_engines(
     }])
 }
 
+#[cfg(not(target_os = "ios"))]
+fn torrent_engine_status() -> RemoteImportEngineStatus {
+    RemoteImportEngineStatus {
+        name: "librqbit".to_string(),
+        available: true,
+        version: Some(librqbit::version().to_string()),
+        required: false,
+        purpose: "magnet and torrent acquisition".to_string(),
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn torrent_engine_status() -> RemoteImportEngineStatus {
+    RemoteImportEngineStatus {
+        name: "librqbit".to_string(),
+        available: false,
+        version: None,
+        required: false,
+        purpose: "magnet and torrent acquisition (unavailable on iOS)".to_string(),
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_remote_import_engine_status(
     app_handle: tauri::AppHandle,
@@ -983,13 +1005,7 @@ pub async fn cmd_remote_import_engine_status(
             purpose: purpose.to_string(),
         });
     }
-    statuses.push(RemoteImportEngineStatus {
-        name: "librqbit".to_string(),
-        available: true,
-        version: Some(librqbit::version().to_string()),
-        required: false,
-        purpose: "magnet and torrent acquisition".to_string(),
-    });
+    statuses.push(torrent_engine_status());
     Ok(statuses)
 }
 
@@ -1853,6 +1869,18 @@ pub async fn cmd_remote_import_acquire(
     })
 }
 
+#[cfg(target_os = "ios")]
+async fn acquire_torrent(
+    _source: &str,
+    _selections: &[RemoteImportSelection],
+    _job_dir: &Path,
+    _app_handle: &tauri::AppHandle,
+    _job_id: &str,
+    _cancel_rx: watch::Receiver<bool>,
+) -> Result<Vec<RemoteImportOutput>, String> {
+    Err("Torrent Remote Import is unavailable on iOS".to_string())
+}
+
 #[tauri::command]
 pub async fn cmd_remote_import_cancel(job_id: String) -> Result<bool, String> {
     validate_job_id(&job_id)?;
@@ -1926,6 +1954,7 @@ pub fn torrent_selection_indices(
     Ok(indices)
 }
 
+#[cfg(not(target_os = "ios"))]
 pub fn torrent_download_options(
     selected: Vec<usize>,
     output_folder: &Path,
@@ -1942,6 +1971,7 @@ pub fn torrent_download_options(
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 fn torrent_items_from_info(
     info: &librqbit::ValidatedTorrentMetaV1Info<librqbit::ByteBufOwned>,
 ) -> Vec<RemoteImportItem> {
@@ -1963,6 +1993,7 @@ fn torrent_items_from_info(
         .collect()
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn torrent_session(
     root: PathBuf,
     persistence: bool,
@@ -1986,6 +2017,7 @@ async fn torrent_session(
         .map_err(|error| format!("Could not initialize BitTorrent engine: {error}"))
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn torrent_add_source(source: &str) -> Result<librqbit::AddTorrent<'static>, String> {
     if let Ok(url) = reqwest::Url::parse(source) {
         if url.scheme() == "file" {
@@ -2012,6 +2044,7 @@ async fn torrent_add_source(source: &str) -> Result<librqbit::AddTorrent<'static
     Ok(librqbit::AddTorrent::from_url(source.to_string()))
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn list_torrent_add(
     session: &Arc<librqbit::Session>,
     add: librqbit::AddTorrent<'_>,
@@ -2035,6 +2068,7 @@ async fn list_torrent_add(
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn analyze_torrent_source(
     source: &str,
     root: PathBuf,
@@ -2063,7 +2097,15 @@ async fn analyze_torrent_source(
     })
 }
 
-#[cfg(test)]
+#[cfg(target_os = "ios")]
+async fn analyze_torrent_source(
+    _source: &str,
+    _root: PathBuf,
+) -> Result<RemoteImportAnalysis, String> {
+    Err("Torrent Remote Import is unavailable on iOS".to_string())
+}
+
+#[cfg(all(test, not(target_os = "ios")))]
 async fn torrent_items_from_bytes_for_test(
     bytes: Vec<u8>,
     root: &Path,
@@ -2081,6 +2123,7 @@ async fn torrent_items_from_bytes_for_test(
     Ok(items)
 }
 
+#[cfg(not(target_os = "ios"))]
 fn torrent_file_layout(
     handle: &Arc<librqbit::ManagedTorrent>,
 ) -> Result<Vec<(usize, PathBuf, u64)>, String> {
@@ -2102,6 +2145,7 @@ fn torrent_file_layout(
         .map_err(|error| format!("Torrent metadata is unavailable: {error}"))
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn acquire_torrent(
     source: &str,
     selections: &[RemoteImportSelection],
@@ -2518,7 +2562,7 @@ mod acquisition_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "ios")))]
 mod torrent_tests {
     use super::*;
 

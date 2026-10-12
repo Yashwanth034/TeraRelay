@@ -28,6 +28,9 @@ assert.match(workflow, /needs:\s*desktop/, 'Android publishing must wait for all
 assert.match(workflow, /mobile-latest\.json/);
 assert.match(workflow, /tauri signer sign[^\n]*mobile-latest\.json|mobile-latest\.json[^\n]*signer sign/s, 'mobile manifest is not cryptographically signed');
 assert.match(workflow, /mobile-latest\.json\.sig/, 'mobile manifest signature is not uploaded');
+const desktopBundleStep = workflow.split('      - name: Build and attach desktop bundles')[1].split('      - name:')[0];
+assert.doesNotMatch(desktopBundleStep, /APPLE_(ID|PASSWORD|TEAM_ID):/, 'unsigned desktop action must omit notarization credentials entirely');
+assert.match(workflow, /Build and attach notarized macOS bundles/, 'signed macOS bundle path is missing');
 assert.match(workflow, /IOS_UPDATE_URL/, 'iOS store/TestFlight update URL is not plumbed into the mobile manifest');
 assert.match(workflow, /TeraRelay-\$version-android-arm64\.apk/);
 assert.match(workflow, /aapt[^\n]*dump badging|dump badging[^\n]*aapt/s, 'Android APK package/version metadata is not verified');

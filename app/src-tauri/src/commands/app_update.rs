@@ -9,7 +9,7 @@ const MOBILE_UPDATE_ENDPOINT: &str =
     "https://github.com/Yashwanth034/TeraRelay/releases/latest/download/mobile-latest.json";
 const MOBILE_UPDATE_SIGNATURE_ENDPOINT: &str =
     "https://github.com/Yashwanth034/TeraRelay/releases/latest/download/mobile-latest.json.sig";
-const MOBILE_UPDATE_PUBLIC_KEY: &str = "untrusted comment: minisign public key: AD9037B636C870B0\nRWSwcMg2tjeQrSH51pQIvcw4ZNbFlsPEMpxWGihFAqz7dWh/fBseR6wV\n";
+const MOBILE_UPDATE_PUBLIC_KEY: &str = "untrusted comment: minisign public key: 215AC0FC9502738F\nRWSPcwKV/MBaIXAXayPsxtn+8RNB+dyXmDikiU1WasjY6qvBWEoR74hT\n";
 const UPDATE_USER_AGENT: &str = "TeraRelay-Updater";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +230,19 @@ fn verify_minisign_payload(
 ) -> Result<(), String> {
     let public_key = minisign_verify::PublicKey::decode(public_key)
         .map_err(|error| format!("Mobile update public key is invalid: {error}"))?;
+    // Tauri signer wraps the complete minisign text in base64. Also accept
+    // raw minisign text for compatibility with existing signed manifests.
+    let signature = signature.trim();
+    let decoded;
+    let signature = if signature.starts_with("untrusted comment:") {
+        signature
+    } else {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature)
+            .map_err(|error| format!("Mobile update signature is invalid: {error}"))?;
+        decoded = String::from_utf8(bytes)
+            .map_err(|error| format!("Mobile update signature is invalid: {error}"))?;
+        decoded.as_str()
+    };
     let signature = minisign_verify::Signature::decode(signature)
         .map_err(|error| format!("Mobile update signature is invalid: {error}"))?;
     public_key
@@ -852,11 +865,25 @@ mod tests {
     }
 
     #[test]
+    fn mobile_signing_key_matches_desktop_release_configuration() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let encoded = config["plugins"]["updater"]["pubkey"].as_str().unwrap();
+        let desktop_key =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+        assert_eq!(MOBILE_UPDATE_PUBLIC_KEY.as_bytes(), desktop_key.as_slice());
+    }
+
+    #[test]
     fn mobile_manifest_signature_verification_rejects_tampering() {
         let public_key = "untrusted comment: minisign public key: 9DE7890F0642E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n";
         let signature = "untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1633700835\tfile:test\tprehashed\nwLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==\n";
         assert!(verify_minisign_payload(b"test", signature, public_key).is_ok());
         assert!(verify_minisign_payload(b"tampered", signature, public_key).is_err());
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature);
+        assert!(verify_minisign_payload(b"test", &encoded, public_key).is_ok());
+        assert!(verify_minisign_payload(b"tampered", &encoded, public_key).is_err());
+        assert!(verify_minisign_payload(b"test", "invalid signature", public_key).is_err());
     }
 
     #[tokio::test]

@@ -349,6 +349,27 @@ jobs:
         run: python3 scripts/prepare-remote-import-engines.py --target "${{ matrix.helper_target }}"
 
       - name: Build and attach desktop bundles
+        if: "!startsWith(matrix.platform, 'macos') || needs.release-capabilities.outputs.macos_ready != 'true'"
+        uses: tauri-apps/tauri-action@action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TERARELAY_MACOS_SWIFT_TRIPLE: ${{ matrix.swift_triple }}
+        with:
+          projectPath: app
+          tagName: v__VERSION__
+          releaseName: "TeraRelay v__VERSION__"
+          releaseBody: "TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          args: ${{ matrix.args }}
+
+      - name: Build and attach notarized macOS bundles
+        if: startsWith(matrix.platform, 'macos') && needs.release-capabilities.outputs.macos_ready == 'true'
         uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -613,6 +634,24 @@ jobs:
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
           npx --no-install tauri signer sign "$release_dir/mobile-latest.json"
           test -s "$release_dir/mobile-latest.json.sig"
+
+          # Verify with the public key shipped in the app before publishing.
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          python3 - "$release_dir" <<'PY'
+          import base64, json, pathlib, subprocess, sys
+          release_dir = pathlib.Path(sys.argv[1])
+          config = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())
+          public_key = base64.b64decode(config['plugins']['updater']['pubkey'], validate=True)
+          signature = base64.b64decode((release_dir / 'mobile-latest.json.sig').read_text().strip(), validate=True)
+          public_path = release_dir / 'updater.pub'
+          signature_path = release_dir / 'mobile-latest.minisig'
+          public_path.write_bytes(public_key)
+          signature_path.write_bytes(signature)
+          subprocess.run(['minisign', '-Vm', str(release_dir / 'mobile-latest.json'),
+                          '-p', str(public_path), '-x', str(signature_path)], check=True)
+          print('MOBILE-UPDATE-SIGNATURE-PASS')
+          PY
 
           echo "ANDROID_RELEASE_DIR=$release_dir" >> "$GITHUB_ENV"
           echo "ANDROID_RELEASE_VERSION=$version" >> "$GITHUB_ENV"

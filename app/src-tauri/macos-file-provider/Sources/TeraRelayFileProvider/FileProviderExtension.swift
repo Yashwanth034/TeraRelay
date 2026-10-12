@@ -56,7 +56,7 @@ final class TeraRelayFileProviderExtension: NSObject, NSFileProviderReplicatedEx
                 let wire = try bridge.metadata(itemIdentifier)
                 let item = TeraRelayFileProviderItem(wire: wire, bridge: bridge)
                 if let requestedVersion, requestedVersion != item.itemVersion {
-                    throw NSFileProviderError(.versionOutOfDate)
+                    throw NSFileProviderError(.versionNoLongerAvailable)
                 }
                 guard wire.kind == "file" else {
                     throw NSFileProviderError(.noSuchItem)
@@ -186,7 +186,7 @@ final class TeraRelayFileProviderExtension: NSObject, NSFileProviderReplicatedEx
                 let currentWire = try bridge.metadata(item.itemIdentifier)
                 let currentItem = TeraRelayFileProviderItem(wire: currentWire, bridge: bridge)
                 guard currentItem.itemVersion == version else {
-                    throw NSFileProviderError(.versionOutOfDate)
+                    throw NSFileProviderError(.versionNoLongerAvailable)
                 }
                 var identifier = item.itemIdentifier
                 let hasContentChanges = changedFields.contains(.contents)
@@ -254,7 +254,7 @@ final class TeraRelayFileProviderExtension: NSObject, NSFileProviderReplicatedEx
                 let currentWire = try bridge.metadata(identifier)
                 let currentItem = TeraRelayFileProviderItem(wire: currentWire, bridge: bridge)
                 guard currentItem.itemVersion == version else {
-                    throw NSFileProviderError(.versionOutOfDate)
+                    throw NSFileProviderError(.versionNoLongerAvailable)
                 }
                 if options.contains(.recursive) && currentWire.kind == "directory" {
                     try bridge.removeRecursively(identifier)

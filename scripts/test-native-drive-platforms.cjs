@@ -279,7 +279,8 @@ const swiftExtension = read('app/src-tauri/macos-file-provider/Sources/TeraRelay
 requireText(swiftExtension, 'NSFileProviderReplicatedExtension', 'macOS must use replicated File Provider');
 requireText(swiftExtension, 'NSFileProviderEnumerating', 'macOS File Provider must enumerate items/changes');
 requireText(swiftExtension, '.mayAlreadyExist', 'macOS File Provider must make replayed creates idempotent');
-requireText(swiftExtension, '.versionOutOfDate', 'macOS File Provider must reject stale mutation base versions');
+rejectText(swiftExtension, '.versionOutOfDate', 'macOS File Provider must not use an unavailable Apple SDK error case');
+requireText(swiftExtension, '.versionNoLongerAvailable', 'macOS File Provider must reject stale requested and mutation base versions using the supported SDK error');
 requireText(swiftExtension, 'BridgeClient.maxContentChunkBytes', 'macOS File Provider transfers must remain bounded');
 requireText(swiftExtension, 'NSFileProviderManager(for:', 'File Provider downloads must resolve the active domain manager');
 requireText(swiftExtension, 'temporaryDirectoryURL()', 'File Provider downloads must use the system same-volume temporary directory');

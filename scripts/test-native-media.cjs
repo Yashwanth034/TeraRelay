@@ -203,6 +203,11 @@ async function runBrowser(url) {
   // WebKitGTK's short-duration failure on moov-at-end HTTP responses.
   execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',single,'-c','copy','-movflags','+faststart',faststart]);
   execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',source,'-map','0:v:0','-map','0:2','-c','copy','-movflags','frag_keyframe+empty_moov+default_base_moof+global_sidx','-frag_duration','2000000','-f','mp4',remux]);
+  // Model the completed-file handoff with a finalized seekable MP4 while
+  // retaining fragmented output for immediate playback during generation.
+  const finalized = path.join(tmp, 'finalized.mp4');
+  execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y',
+    '-i',remux,'-map','0','-c','copy','-movflags','+faststart',finalized]);
   await appRequire('esbuild').build({
     stdin: { contents: entry, resolveDir: path.join(root, 'app'), sourcefile: 'native-qa.tsx', loader: 'tsx' },
     bundle: true, outfile: path.join(tmp, 'player.js'), nodePaths: [path.join(root, 'app/node_modules')],
@@ -272,7 +277,7 @@ async function runBrowser(url) {
       const timer = setInterval(() => {
         const end = Math.min(bytes.length, offset + 65536);
         res.write(bytes.subarray(offset,end)); offset = end;
-        if (offset === bytes.length) { clearInterval(timer); liveFinished = true; assets['/fmp4/live/output.mp4'] = bytes; res.end(); }
+        if (offset === bytes.length) { clearInterval(timer); liveFinished = true; assets['/fmp4/live/output.mp4'] = fs.readFileSync(finalized); res.end(); }
       }, 25);
       res.once('close', () => clearInterval(timer));
       return;

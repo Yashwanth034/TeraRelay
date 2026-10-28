@@ -786,6 +786,7 @@ pub async fn cmd_prepare_fmp4_stream(
     let output_dir = root.join(&file_key);
     let output_path = output_dir.join("output.mp4");
     let partial_path = output_dir.join("output.mp4.part");
+    let ready_path = output_dir.join("output.mp4.ready");
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
     remux_state
         .install_job(&source_key, generation, &file_key, Some(cancel_tx))
@@ -808,8 +809,43 @@ pub async fn cmd_prepare_fmp4_stream(
             if !has_playable_fragment(&partial_path) {
                 return Err("Remux output contains no complete video fragment".to_string());
             }
-            std::fs::rename(&partial_path, &output_path)
-                .map_err(|error| format!("Failed to finish video remux: {error}"))?;
+            // Publish a normal seekable MP4 only after the growing fMP4 ends.
+            // WebKit/GStreamer intermittently reads a completed fragmented
+            // HTTP MP4 as a millisecond-long clip even after decoder reloads.
+            // Repack locally with stream copy: no re-encode or remote fetch.
+            // The original partial remains available to existing streamers.
+            let mut finalize = tokio::process::Command::new(&ffmpeg_path)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(&partial_path)
+                .args(["-map", "0", "-c", "copy", "-movflags", "+faststart", "-f", "mp4"])
+                .arg(&ready_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| format!("Failed to start MP4 finalization: {error}"))?;
+            let status = tokio::select! {
+                result = finalize.wait() =>
+                    result.map_err(|error| format!("Failed to wait for MP4 finalization: {error}"))?,
+                _ = &mut cancel_rx => {
+                    let _ = finalize.kill().await;
+                    let _ = finalize.wait().await;
+                    return Err("Cancelled".to_string());
+                }
+            };
+            if !status.success() {
+                return Err("Could not finalize the seekable MP4".to_string());
+            }
+            if !std::fs::metadata(&ready_path).is_ok_and(|metadata| metadata.len() > 0) {
+                return Err("Finalized MP4 is missing or empty".to_string());
+            }
+            std::fs::rename(&ready_path, &output_path)
+                .map_err(|error| format!("Failed to publish finalized MP4: {error}"))?;
+            // The old fMP4 descriptor may still be serving a reader on Windows.
+            // Never remove the final file on a failed best-effort old-partial
+            // cleanup; cache pruning owns the remaining disposable file.
+            let _ = std::fs::remove_file(&partial_path);
             Ok(())
         }
         .await;
@@ -819,6 +855,7 @@ pub async fn cmd_prepare_fmp4_stream(
                 jobs.remove(&job_key);
             }
             Err(error) => {
+                let _ = std::fs::remove_file(&ready_path);
                 let _ = std::fs::remove_file(&partial_path);
                 jobs.insert(job_key, Some(error));
             }

@@ -8,19 +8,29 @@ import subprocess
 import tempfile
 root=Path(__file__).resolve().parent.parent
 source=(root/"app/src-tauri/src/drive_mount.rs").read_text()
-a=source.index("    fn reject_symlink_file(")
-b=source.index("    fn create_private_file(",a)
-helpers=source[a:b]
+# Extract only the production helpers the V2 reader calls. Including the
+# entire 500-line span also pulls in unrelated #[cfg(test)] modules and
+# their app-wide dependencies, which are not part of this isolated fixture.
+segments = [
+    ("    fn reject_symlink_file(", "    fn open_private_read("),
+    ("    fn open_private_read(", "    // A single native read"),
+    ("    fn read_cached_block(", "    /// Concurrent remote FUSE"),
+    ("    fn write_cached_block_atomic(", "    #[cfg(test)]\n    mod concurrent_cache_publish_tests"),
+    ("    fn read_range_response(", "    fn create_private_file("),
+]
+helpers = "\n".join(source[source.index(start):source.index(end, source.index(start))]
+                    for start, end in segments)
 a=source.index("        fn fetch_v2_plain_crypto_chunk(")
 b=source.index("        fn fetch_remote_block(",a)
 method=source[a:b]
 deps=root/"app/src-tauri/target/debug/deps"
 externs=[]
-for name in ["reqwest","urlencoding","sha2","libc"]:
+for name in ["reqwest","urlencoding","sha2","libc","rand"]:
     paths=sorted(deps.glob("lib"+name+"-*.rlib"),key=lambda p:p.stat().st_mtime,reverse=True)
     assert paths,"Compile development Rust tests first"
     externs+=["--extern",name+"="+str(paths[0])]
-rust=r'''
+rust = ('#[path = "' + str(root / 'app/src-tauri/src/cache_directory.rs')
+        + '"] mod cache_directory;\n') + r'''
 use std::path::{Path,PathBuf};
 use std::fs::{File,OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt,FileExt as UnixFileExt};

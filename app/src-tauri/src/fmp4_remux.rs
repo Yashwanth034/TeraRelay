@@ -341,7 +341,30 @@ async fn run_fmp4_remux_at(
             _ = &mut *cancel_rx => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = std::fs::remove_file(output_path);
+                // Windows can briefly retain FFmpeg's output handle after
+                // process exit. Never report cancellation while leaving a
+                // partial file: retry only transient sharing violations.
+                let mut cleanup_error = None;
+                for attempt in 0..80 {
+                    match std::fs::remove_file(output_path) {
+                        Ok(()) => { cleanup_error = None; break; }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            cleanup_error = None;
+                            break;
+                        }
+                        Err(e) if cfg!(windows) && attempt < 79
+                            && (e.kind() == std::io::ErrorKind::PermissionDenied
+                                || matches!(e.raw_os_error(), Some(32 | 33))) =>
+                        {
+                            cleanup_error = Some(e.to_string());
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(e) => { cleanup_error = Some(e.to_string()); break; }
+                    }
+                }
+                if let Some(error) = cleanup_error {
+                    break Err(format!("Cancelled; could not remove incomplete output: {error}"));
+                }
                 break Err("Cancelled".to_string());
             }
             line_result = lines.next_line() => {

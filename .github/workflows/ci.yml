@@ -118,7 +118,9 @@ jobs:
         run: python3 scripts/test-rustsec-reachability.py
 
       - name: Rust tests
-        timeout-minutes: 10
+        # Fresh Linux CI runners may spend most of the initial budget compiling
+        # the large native test harness before the 900+ tests even start.
+        timeout-minutes: 25
         working-directory: app/src-tauri
         run: cargo test --locked
 

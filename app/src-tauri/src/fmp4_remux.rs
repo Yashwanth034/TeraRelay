@@ -341,23 +341,24 @@ async fn run_fmp4_remux_at(
             _ = &mut *cancel_rx => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                // Windows can briefly retain FFmpeg's output handle after
-                // process exit. Never report cancellation while leaving a
-                // partial file: retry only transient sharing violations.
+                // Windows can retain FFmpeg's output handle during delayed
+                // handle teardown or antivirus scanning even after child.wait.
+                // Allow bounded sharing-violation retries, but never claim
+                // cancellation succeeded while an incomplete file remains.
                 let mut cleanup_error = None;
-                for attempt in 0..80 {
+                for attempt in 0..300 {
                     match std::fs::remove_file(output_path) {
                         Ok(()) => { cleanup_error = None; break; }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             cleanup_error = None;
                             break;
                         }
-                        Err(e) if cfg!(windows) && attempt < 79
+                        Err(e) if cfg!(windows) && attempt < 299
                             && (e.kind() == std::io::ErrorKind::PermissionDenied
                                 || matches!(e.raw_os_error(), Some(32 | 33))) =>
                         {
                             cleanup_error = Some(e.to_string());
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                         Err(e) => { cleanup_error = Some(e.to_string()); break; }
                     }

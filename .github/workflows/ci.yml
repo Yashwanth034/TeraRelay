@@ -184,7 +184,10 @@ jobs:
             gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav
+            gstreamer1.0-libav \
+            gstreamer1.0-pulseaudio \
+            pulseaudio \
+            pulseaudio-utils
 
       - uses: actions/setup-node@v7
         with:
@@ -200,7 +203,15 @@ jobs:
 
       - name: Run actual WebKitGTK playback and seek E2E without bypassing sandbox
         timeout-minutes: 10
-        run: node scripts/test-native-media.cjs
+        run: |
+          # WebKit's GStreamer autoaudiosink requires a working audio device.
+          # A headless runner has no speakers, so provide a real PulseAudio
+          # null sink rather than skipping the playback/seek assertions.
+          pulseaudio --check || pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=terarelay_ci
+          pactl set-default-sink terarelay_ci
+          pactl info
+          node scripts/test-native-media.cjs
 
   linux-native-drive-e2e:
     name: Real Linux FUSE, accessibility, recovery, cache and project E2E (synthetic QA)

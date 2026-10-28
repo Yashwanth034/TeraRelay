@@ -118,8 +118,13 @@ def wait_for(description, predicate, seconds=20):
     raise AssertionError(description)
 
 def window_for(pid):
-    rows = subprocess.check_output(["wmctrl", "-lp"], text=True).splitlines()
-    for row in rows:
+    # A just-destroyed X11 window can make wmctrl fail with BadWindow while
+    # the desktop restarts. Retry through wait_for rather than aborting the
+    # restart test; a missing replacement window still fails at the deadline.
+    result = subprocess.run(["wmctrl", "-lp"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    for row in result.stdout.splitlines():
         fields = row.split(None, 4)
         if len(fields) >= 5 and fields[2] == str(pid) and "TeraRelay" in fields[4]:
             return fields[0]

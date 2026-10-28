@@ -1705,7 +1705,9 @@ fn decode_manifest_block_hashes(object: &DriveObjectRecord) -> Result<Vec<String
         return Err("Drive V2 compact block hash count is invalid".to_string());
     }
     Ok(raw
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .map(|hash| hash.iter().map(|byte| format!("{byte:02x}")).collect())
         .collect())
 }

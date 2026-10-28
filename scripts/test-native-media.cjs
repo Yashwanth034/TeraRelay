@@ -33,7 +33,7 @@ new MutationObserver(() => {
     if (video.dataset.qaObserved) continue;
     video.dataset.qaObserved = '1';
     for (const type of ['error','playing','pause','waiting','loadedmetadata','stalled']) {
-      video.addEventListener(type, () => events.push({ type, src: video.src, time: video.currentTime, paused: video.paused, error: video.error?.message, code: video.error?.code }));
+      video.addEventListener(type, () => events.push({ type, src: video.src, time: video.currentTime, duration: video.duration, paused: video.paused, error: video.error?.message, code: video.error?.code }));
     }
   }
 }).observe(document.getElementById('root'), { childList: true, subtree: true });
@@ -129,7 +129,17 @@ const wait = async (predicate, label) => {
     if (ipc.filter(x => x === 'cmd_prepare_fmp4_stream').length !== preparesAfterAudioSwitch)
       throw Error('Completed remux seek unexpectedly triggered another conversion');
   } else {
-    if (ipc.includes('cmd_prepare_fmp4_stream') && !events.some(e => e.type === 'error')) throw Error('Playable MP4 triggered unnecessary remux');
+    // WebKit can treat a valid HTTP MP4 as a 21ms clip without emitting an
+    // error. Its bounded fMP4 recovery is justified only if the original
+    // decoder visibly reported a truncated duration (or an actual error).
+    const originalTruncated = events.some(e => (e.type === 'loadedmetadata' || e.type === 'playing')
+      && e.src.includes(source) && Number.isFinite(e.duration)
+      && e.duration > 0 && e.duration < 2);
+    if (ipc.includes('cmd_prepare_fmp4_stream')
+        && !events.some(e => e.type === 'error') && !originalTruncated)
+      throw Error('Playable MP4 triggered unnecessary remux');
+    if (ipc.filter(x => x === 'cmd_prepare_fmp4_stream').length > 1)
+      throw Error('Native MP4 recovery launched duplicate remux jobs');
     const before = video.currentTime;
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     // Decoder-only recovery changes the underlying <video> element. Observe

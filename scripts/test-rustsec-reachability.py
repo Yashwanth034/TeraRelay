@@ -118,10 +118,14 @@ def verify_metadata(metadata: dict) -> list[str]:
 
 
 def main() -> None:
+    # CI runners may have Linux build dependencies cached while still missing
+    # target-only package sources for Windows/macOS/iOS. Keep the lockfile
+    # immutable, but allow Cargo to fetch those exact locked packages so this
+    # target-inclusive security check runs on a fresh runner.
     result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", "--offline",
+        ["cargo", "metadata", "--format-version", "1", "--locked",
          "--manifest-path", str(MANIFEST)],
-        text=True, capture_output=True, check=True, timeout=90,
+        text=True, capture_output=True, check=True, timeout=120,
     )
     metadata = json.loads(result.stdout)
     findings = verify_metadata(metadata)

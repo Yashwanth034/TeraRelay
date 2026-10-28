@@ -115,8 +115,12 @@ objc2-file-provider = { version = "0.3.2", default-features = false, features = 
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
 jni = "0.21"
 ndk-context = "0.1.1"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "0.2"
 [package.metadata.tauri.bundle.windows]
 # Embed the WebView2 bootstrapper so the app works on Windows systems
 # where the WebView2 runtime is not pre-installed (fresh installs, servers, etc.)

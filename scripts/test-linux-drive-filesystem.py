@@ -92,6 +92,13 @@ try:
     nested.rename(moved_dir)
     moved = moved_dir / renamed.name
     check("nonempty directory rename preserves descendants", moved.read_bytes() == expected and not nested.exists())
+    # This second staged file was created above and is also moved with the
+    # directory. Verify it survives the rename, then remove it before the
+    # intentionally empty-directory rmdir test.
+    remaining_staged = moved_dir / "replace-pending.bin"
+    check("renamed directory retains independently staged descendants",
+          remaining_staged.read_bytes() == b"new")
+    remaining_staged.unlink()
     destination = case / "destination.bin"
     destination.write_bytes(b"old")
     os.replace(moved, destination)

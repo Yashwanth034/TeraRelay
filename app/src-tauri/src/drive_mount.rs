@@ -9932,6 +9932,7 @@ mod desktop {
 
     /// Selected IDs are for the background rate-limited worker; None keeps
     /// the existing user-initiated full recovery behavior.
+    #[cfg(target_os = "linux")]
     pub(super) fn recover_pending_selected_impl(
         app_handle: AppHandle,
         state: State<'_, DriveMountState>,

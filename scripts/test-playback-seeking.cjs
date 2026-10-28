@@ -678,7 +678,7 @@ test('ordinary native MP4 recovers one truncated-duration decoder and preserves 
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const check = vm.runInNewContext(js, {});
-  let retries = 0, errors = [], timer, unloaded = 0;
+  let retries = 0, errors = [], timer, unloaded = 0, remuxes = 0;
   const retry = { current: 0 };
   const makeVideo = () => ({
     currentTime: 0.021, duration: 0.021,
@@ -691,7 +691,8 @@ test('ordinary native MP4 recovers one truncated-duration decoder and preserves 
     remuxGenerationRef: { current: 3 }, remuxWindowRef: { current: { key: null } },
     fallbackVideoRef: videoRef, sourceDurationRef: { current: 16 },
     nativeOriginalRetryRef: retry, pendingSeekRef: { current: { time: 9, play: false } },
-    nativeUserPauseRef: { current: true },
+    nativeUserPauseRef: { current: true }, transcodeCapsRef: { current: { available: true } },
+    memoryMediaUrl: null, handleProgressiveDetected() { remuxes++; },
     setNativeAutoPlay(play) { assert.equal(play, false); },
     setNativeError(s) { errors.push(s); }, setNativePhase() {},
     setNativeDecoderRevision(update) { retries = update(retries); },
@@ -708,7 +709,8 @@ test('ordinary native MP4 recovers one truncated-duration decoder and preserves 
   videoRef.current = makeVideo();
   evaluate(); timer();
   assert.equal(retries, 1, 'Ordinary native player retried an unbounded number of times');
-  assert.equal(errors.length, 1, 'Repeated decoder truncation did not surface a user-visible error');
+  assert.equal(remuxes, 1, 'Repeated truncation must use one existing streaming remux recovery');
+  assert.equal(errors.length, 0, 'Supported streaming recovery must not show a terminal error');
   assert.match(source,
     /shouldRemuxAfterNativeDecoderFailure\(preferRemux, nativeOriginalRetryRef\.current\)/,
     'Native fallback must distinguish ordinary MP4 from explicitly requested remux');

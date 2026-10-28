@@ -701,6 +701,8 @@ export function AdaptiveMediaPlayer({
     // duration even after fetching the fully completed, independently ranged
     // fMP4. One bounded *decoder* retry is safer than silently freezing or
     // triggering another expensive/duplicate Telegram remux.
+    // The completed stream increments restartNonce without changing its URL,
+    // so the retry guard must re-arm when that new player is mounted.
     useEffect(() => {
         if (!fmp4StreamUrl || !useFallback || playbackMode !== 'original'
             || !remuxWindowRef.current.complete) return;
@@ -733,7 +735,7 @@ export function AdaptiveMediaPlayer({
             setNativeDecoderRevision(n => n + 1);
         }, 2500);
         return () => clearTimeout(timer);
-    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision]);
+    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision, restartNonce]);
 
     useEffect(() => {
         const audio = mediaTracks.audio_tracks.find(track => track.index === selectedAudioStream)

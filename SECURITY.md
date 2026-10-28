@@ -35,13 +35,23 @@ cargo audit
 
 Known upstream advisories that cannot be resolved without breaking required functionality must be documented rather than hidden.
 
+### v0.2.1 dependency remediation (2026-10-28)
+
+This checkpoint supersedes the historical unresolved-Hickory/ringbuf snapshots below. The locked graph now uses `hickory-proto`, `hickory-net` and `hickory-resolver 0.26.3`, and `ringbuf 0.5.3`. A fresh non-waived `cargo audit --file Cargo.lock` completed successfully against the current RustSec database; no advisory ignores were added.
+
+The narrow vendored Grammers transport patch retains version 0.8.1 and the original `d07f96f` Grammers session/auth/TL family, rather than migrating stored sessions to a new client family. SOCKS support is retained. The vendored uTP 0.7.0 library retains its production API and transport features while moving to the patched ringbuf line. Both source directories include licenses and patch provenance.
+
+The dependency regression crates share the application's workspace and lockfile. Upstream demonstration targets and external-reference-library comparison tests are excluded because their development-only dependencies reintroduced ringbuf 0.4; the native uTP buffer and loopback transport tests remain. This does not disable torrent or proxy functionality in TeraRelay.
+
+Cargo audit still prints its default non-fatal upstream warnings, including unmaintained packages, GLib/Tokio unsoundness advisories and a yanked clipboard-win version. They remain visible; a successful mandatory vulnerability gate is not a claim that every dependency or platform is risk-free. Actual release/CI evidence must still be checked before publishing.
+
 ### JavaScript build dependencies
 
 The `source-map-js` fix introduced in v0.1.1 remains in the locked graph. On 2026-10-12, `npm audit --json` for v0.2.0 reported zero vulnerabilities at every severity. Continue checking the locked dependency graph before every release.
 
 **2026-10-21 frontend security recheck:** A fresh `npm audit --audit-level=high --json` identified **one high-severity Vite vulnerability** in the locked `vite 7.3.6` (Windows `launch-editor` argument/command handling, advisories `GHSA-698v-4r3x-3vcv`, `GHSA-r825-w8mm-5pxw`, and `GHSA-587h-7wmj-h5pm`). A **lockfile-only** `npm update vite --package-lock-only --ignore-scripts --no-audit --no-fund` moved the single `node_modules/vite` lock entry to **7.3.7**, preserving `package.json` (range `^7.0.4`) and installed `node_modules` byte-for-byte. The new lock entry includes npm's resolved tarball integrity. A second real `npm audit --audit-level=high --json` **exited 0 with zero vulnerabilities at all severities**. `scripts/check-source.sh` also passed after moving the synthetic native CI Vite log to the ephemeral GitHub runner's `RUNNER_TEMP` rather than embedding a private QA path in tracked workflow source. This is an **audited lockfile repair**, not a local runtime check of the newly locked Vite binary; no new npm packages were installed. CI already contains `npm ci` and `npm audit --audit-level=high` and must perform actual runtime verification when authorized to run remotely. The unrelated three nonwaived **RustSec advisories remain**.
 
-### Current upstream Rust advisories
+### Historical upstream Rust advisories (before v0.2.1)
 
 The current locked graph contains `hickory-proto 0.25.2` through Grammers' optional proxy DNS resolver and is reported by RustSec for `RUSTSEC-2026-0118` and `RUSTSEC-2026-0119`.
 
@@ -49,7 +59,7 @@ The current locked graph contains `hickory-proto 0.25.2` through Grammers' optio
 - `RUSTSEC-2026-0119` remains present transitively. Hickory fixes it in the 0.26 line, but the current Grammers proxy dependency still pins `hickory-resolver 0.25.2`; forcing an incompatible transitive upgrade is not treated as a safe release fix.
 - Proxy support is retained rather than silently removed. Re-check this dependency on every release and upgrade as soon as Grammers supports the fixed Hickory line.
 
-### Torrent ring buffer advisory
+### Historical torrent ring buffer advisory
 
 The locked graph contains `ringbuf 0.4.8` through `librqbit-utp 0.7.0` and `librqbit 9.0.1` on non-iOS targets. [RUSTSEC-2026-0293](https://rustsec.org/advisories/RUSTSEC-2026-0293.html) reports a double free/use-after-free when an element's destructor panics inside `Consumer::skip` or `Consumer::clear`; the patched release is `ringbuf 0.5.2` or later.
 

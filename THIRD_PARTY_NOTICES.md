@@ -23,9 +23,18 @@ This document is a release-maintenance summary. The exact resolved versions are 
 | Framer Motion | UI animation | MIT |
 | SQLite Rust bindings | local application database | MIT / Apache-2.0 |
 | sevenz-rust2 | archive handling | Apache-2.0 |
-| zip / rar crates | archive handling | permissive open-source licenses |
+| zip | archive handling | MIT |
+| librqbit / librqbit-utp | torrent acquisition and uTP transport | Apache-2.0 |
+| ringbuf | uTP byte buffering | MIT / Apache-2.0 |
+| Hickory | proxy endpoint DNS resolution | MIT / Apache-2.0 |
 
 The resolved JavaScript dependency graph also contains packages under permissive licenses including MIT, Apache-2.0, ISC, BSD, 0BSD and CC-BY-4.0, plus MPL-2.0 components. The resolved Rust dependency graph contains MIT/Apache/BSD/ISC/MPL/BSL/CDLA/Unicode and other permissive-or-weak-copyleft license expressions.
+
+## Vendored security compatibility patches
+
+`app/src-tauri/vendor/grammers-mtsender` retains the Grammers `d07f96f` session-compatible transport API and updates its Hickory resolver dependency. Its MIT and Apache-2.0 license texts and provenance are included in that directory.
+
+`app/src-tauri/vendor/librqbit-utp` retains the published 0.7.0 transport API and uses patched ringbuf 0.5.2 or later. Its Apache-2.0 license, source archive hash, upstream revision and local changes are documented alongside the source.
 
 ## Runtime-downloaded Linux components
 

@@ -4,11 +4,14 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-28
+
 - Preserve saved Telegram account sessions across normal launches, Linux background startup, and transient connection failures. Show recoverable connection status rather than incorrectly requesting phone sign-in; never create an empty session during automatic restoration.
 - Improve desktop navigation, virtualized channel scrolling, transfer recovery, playback, accessibility, and local-first Drive operations.
 - Add Drive organization, copy/mirror, backup, recovery, search, auditing, and diagnostic tools with focused unit and UI regression coverage.
 - Strengthen Linux background startup and safe shutdown, and extend Windows/macOS native Drive platform validation.
-- Security: retain the strict release RustSec gate. Three upstream dependency advisories remain unresolved and must be fixed before publishing a new tagged release; see SECURITY.md.
+- Security: patch the session-compatible Grammers transport to use Hickory 0.26.3 and uTP to use ringbuf 0.5.3, retaining SOCKS proxy and torrent support. Keep the strict, non-waived RustSec/npm release gates and add locked SOCKS and buffer regressions to CI.
+- Run native-media unit fixtures serially and bound invalid-input HTTP test cleanup so a failed FFmpeg startup cannot hide the original error behind an indefinite test hang.
 
 ## [0.2.0] - 2026-10-11
 

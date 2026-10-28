@@ -1,6 +1,6 @@
 [package]
 name = "terarelay"
-version = "0.2.0"
+version = "0.2.1"
 description = "TeraRelay private Telegram-backed file storage client."
 authors = ["Yashwanth"]
 license-file = "../../LICENSE"
@@ -121,6 +121,20 @@ ndk-context = "0.1.1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 libc = "0.2"
+
+[workspace]
+members = ["vendor/grammers-mtsender", "vendor/librqbit-utp"]
+default-members = ["."]
+resolver = "2"
+
+[patch."https://github.com/Lonami/grammers"]
+# Retain the session-compatible Grammers family; only transport DNS is patched.
+grammers-mtsender = { path = "vendor/grammers-mtsender" }
+
+[patch.crates-io]
+# Preserve uTP APIs while using the fixed ringbuf line.
+librqbit-utp = { path = "vendor/librqbit-utp" }
+
 [package.metadata.tauri.bundle.windows]
 # Embed the WebView2 bootstrapper so the app works on Windows systems
 # where the WebView2 runtime is not pre-installed (fresh installs, servers, etc.)

@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download TeraRelay v0.2.0</strong></a>
+  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download the latest TeraRelay release</strong></a>
   ·
   <a href="SECURITY.md">Security</a>
   ·
@@ -108,6 +108,15 @@ There is no separate TeraRelay cloud-storage account or remote file-storage back
 - **Proxy support and localization**
 - **Linux acceleration** — optional TDLib/C++ fast-transfer path on Linux x86_64
 
+## What's new in v0.2.1
+
+- Keep saved Telegram authorization across restarts and temporary connection failures, with automatic reconnection and recoverable status.
+- Improve Drive organization, backup/recovery, transfers, playback, navigation and accessibility.
+- Upgrade vulnerable Hickory and ringbuf dependencies through narrow compatibility patches while preserving the Telegram session format, SOCKS proxies and torrent support.
+- Extend cross-platform CI with locked proxy/buffer regressions and bounded, serial media fixtures.
+
+See the [v0.2.1 changelog](CHANGELOG.md#021---2026-10-28). Published packages and signing details are listed on [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/latest).
+
 ## What's new in v0.2.0
 
 Version 2 expands TeraRelay from file storage into version management, remote acquisition, and Drive workflows.
@@ -127,16 +136,16 @@ See the [v0.2.0 changelog](CHANGELOG.md#020---2026-10-11) for the detailed chang
 
 ## Downloads
 
-The current public release is **v0.2.0**.
+Use [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/latest) for the current published version, actual assets and signing details. The release workflow supports these targets:
 
-| Platform | Release status | Packages |
+| Platform | Packaging | Packages |
 | --- | --- | --- |
-| Linux x86_64 | ✅ Packaged and release-validated | DEB, RPM, AppImage |
-| Windows x64 | ✅ Packaged and release-validated; unsigned for Authenticode | EXE, MSI |
-| macOS Apple Silicon | ✅ Packaged and release-validated; ad-hoc signed, not notarized | DMG, app archive |
-| macOS Intel | ✅ Packaged and release-validated; ad-hoc signed, not notarized | DMG, app archive |
-| Android ARM64 | ✅ Signed and release-validated | APK, AAB |
-| iOS | ⚠️ Simulator build validated only | No signed device IPA in v0.2.0 |
+| Linux x86_64 | Desktop release | DEB, RPM, AppImage |
+| Windows x64 | Desktop release; Authenticode when configured | EXE, MSI |
+| macOS Apple Silicon | Desktop release; Apple signing/notarization when configured | DMG, app archive |
+| macOS Intel | Desktop release; Apple signing/notarization when configured | DMG, app archive |
+| Android ARM64 | Production signing required | APK, AAB |
+| iOS | Simulator CI; App Store distribution requires configured Apple credentials | See release notes |
 
 **Download:** [GitHub Releases →](https://github.com/Yashwanth034/TeraRelay/releases/latest)
 
@@ -270,14 +279,14 @@ Cross-platform CI also validates Linux, Windows, macOS, Android ARM64, and the i
 
 ## Project status
 
-**[v0.2.0](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.0)** is the current stable release. **v0.1.0** was the first public release.
+The latest published stable version is listed on [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/latest). **v0.1.0** was the first public release.
 
 All seven CI jobs and all required release jobs passed for v0.2.0. The iOS App Store Connect release job was skipped because production Apple credentials were unavailable; iOS simulator validation passed.
 
-Current v0.2.0 limitations:
+Current limitations:
 
 - Telegram cloud storage is not end-to-end encrypted.
-- Android 32-bit ABIs are not part of the v0.2.0 release.
+- Android 32-bit ABIs are not included.
 - iOS physical-device/App Store distribution is not published.
 - Worldwide public file sharing is not implemented.
 - Cross-platform build/package validation is not the same as exhaustive device/runtime testing.

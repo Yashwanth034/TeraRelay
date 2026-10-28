@@ -117,12 +117,25 @@ jobs:
         working-directory: .
         run: python3 scripts/test-rustsec-reachability.py
 
+      - name: Patched SOCKS and uTP dependency regressions
+        timeout-minutes: 10
+        working-directory: app/src-tauri
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test --locked -p grammers-mtsender --lib --features proxy net::tcp::tests -- --test-threads=1
+          cargo test --locked -p librqbit-utp --lib ringbuf_compat_tests -- --test-threads=1
+          RUST_LOG=warn cargo test --locked -p librqbit-utp --lib e2e_tests::e2e_test_librqbit_utp_client_librqbit_utp_server -- --exact --test-threads=1
+
       - name: Rust tests
-        # Fresh Linux CI runners may spend most of the initial budget compiling
-        # the large native test harness before the 900+ tests even start.
+        # Real FFmpeg/HTTP fixtures launch processes and local servers. Run
+        # them serially, matching native-host CI and the verified local suite,
+        # to keep their process and HTTP fixture lifetimes from overlapping.
         timeout-minutes: 25
         working-directory: app/src-tauri
-        run: cargo test --locked
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --locked -- --test-threads=1
 
       - name: Strict Rust Clippy (all targets, warnings denied)
         timeout-minutes: 10
@@ -324,10 +337,27 @@ jobs:
       - name: Build frontend assets for Tauri test compilation
         run: npm run build
 
+      - name: Diagnose native filesystem contracts before the full test suite
+        working-directory: app/src-tauri
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: "2"
+          # macOS defaults TMPDIR to /var/folders, where /var itself is a
+          # symlink. Safety tests intentionally refuse symlinked ancestors.
+          # The runner's isolated, symlink-free temp root is suitable for QA.
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          if [[ "${{ matrix.name }}" == "Windows x64" ]]; then
+            cargo test --locked --lib download_output::tests::resumable_rechecks_saved_bytes_and_keeps_other_source_separate -- --exact --nocapture --test-threads=1
+          else
+            cargo test --locked --lib cache_cleanup::tests::prune_below_budget_does_not_sort_or_evict_unchanged_entries -- --exact --nocapture --test-threads=1
+          fi
+
       - name: Test native Rust backend on the actual host operating system
         working-directory: app/src-tauri
         env:
           CARGO_BUILD_JOBS: "2"
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked -- --test-threads=1
 
   desktop:

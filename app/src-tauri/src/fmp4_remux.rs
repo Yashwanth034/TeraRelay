@@ -1461,17 +1461,28 @@ mod audio_compatibility_tests {
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nnot a video file").await.unwrap();
         });
         let (_cancel, mut cancel_rx) = tokio::sync::oneshot::channel();
-        let error = run_fmp4_remux(
-            Path::new("ffmpeg"),
-            Path::new(&url),
-            &output,
-            None,
-            &mut cancel_rx,
-            |_| {},
+        // A CI FFmpeg startup failure must not leave the synthetic HTTP
+        // listener waiting forever and hide the original decoder failure.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(40),
+            run_fmp4_remux(
+                Path::new("ffmpeg"),
+                Path::new(&url),
+                &output,
+                None,
+                &mut cancel_rx,
+                |_| {},
+            ),
         )
         .await
+        .expect("Invalid-input FFmpeg probe timed out")
         .unwrap_err();
-        server.await.unwrap();
+        // The spawned server may never receive a request when FFmpeg exits
+        // before opening the input. Bound the join rather than hanging CI.
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("FFmpeg never connected to the isolated HTTP fixture")
+            .expect("Isolated HTTP fixture task panicked");
         std::fs::remove_dir_all(root).unwrap();
         assert!(
             error.contains("Invalid data"),

@@ -459,7 +459,7 @@ mod tests {
     }
     #[test]
     fn export_failure_does_not_leave_partial_destination() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_temp_dir().join(format!(
             "terarelay-manifest-atomic-{}",
             rand::random::<u128>()
         ));
@@ -491,7 +491,7 @@ mod tests {
     }
     #[test]
     fn create_only_export_and_import_preserve_original_bytes() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_temp_dir().join(format!(
             "terarelay-manifest-test-{}",
             rand::random::<u128>()
         ));
@@ -517,7 +517,7 @@ mod tests {
         assert!(checked_path("relative.json").is_err());
         assert!(checked_path("/tmp/../escape.json").is_err());
         assert!(checked_path("/tmp/escape.zip").is_err());
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_temp_dir().join(format!(
             "terarelay-manifest-symlink-{}",
             rand::random::<u128>()
         ));

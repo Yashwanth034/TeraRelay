@@ -570,7 +570,7 @@ mod tests {
 
     fn fixture() -> std::path::PathBuf {
         let p =
-            std::env::temp_dir().join(format!("tr-cache-policy-{:016x}", rand::random::<u64>()));
+            crate::test_temp_dir().join(format!("tr-cache-policy-{:016x}", rand::random::<u64>()));
         fs::create_dir(&p).unwrap();
         p
     }

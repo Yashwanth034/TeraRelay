@@ -4,6 +4,23 @@ mod desktop_autostart;
 mod desktop_background;
 pub mod models;
 
+/// Test-only scratch root. macOS exposes its temporary directory through the
+/// system /var -> /private/var symlink; our deliberately no-follow filesystem
+/// operations must never traverse that alias. Resolve only the trusted OS
+/// temporary root for synthetic fixtures, not application/user paths.
+#[cfg(test)]
+pub(crate) fn test_temp_dir() -> std::path::PathBuf {
+    let path = std::env::temp_dir();
+    #[cfg(target_os = "macos")]
+    {
+        return path
+            .canonicalize()
+            .expect("Resolve macOS test temporary root");
+    }
+    #[cfg(not(target_os = "macos"))]
+    path
+}
+
 /// Initialize COM in Multi-Threaded Apartment mode on Windows worker threads.
 /// Tauri's main thread uses STA (required for WebView2/DragDrop), so any spawned
 /// background threads that touch COM APIs (e.g., Actix, Tokio, networking)

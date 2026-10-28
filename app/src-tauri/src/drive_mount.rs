@@ -2271,7 +2271,7 @@ mod desktop {
         #[test]
         fn cache_publication_creates_private_parents_and_refuses_symlink_ancestors() {
             use std::os::unix::fs::{symlink, PermissionsExt};
-            let root = std::env::temp_dir()
+            let root = crate::test_temp_dir()
                 .join(format!("tr-cache-parents-{:032x}", rand::random::<u128>()));
             std::fs::create_dir(&root).unwrap();
             let outside = root.join("outside");
@@ -2300,8 +2300,8 @@ mod desktop {
         #[test]
         fn cache_initialization_rejects_symlink_before_creating_children() {
             use std::os::unix::fs::symlink;
-            let root =
-                std::env::temp_dir().join(format!("tr-cache-init-{:032x}", rand::random::<u128>()));
+            let root = crate::test_temp_dir()
+                .join(format!("tr-cache-init-{:032x}", rand::random::<u128>()));
             std::fs::create_dir(&root).unwrap();
             let outside = root.join("outside");
             std::fs::create_dir(&outside).unwrap();
@@ -2321,7 +2321,7 @@ mod desktop {
         #[test]
         fn cached_blocks_are_private_even_with_permissive_process_umask() {
             use std::os::unix::fs::PermissionsExt;
-            let root = std::env::temp_dir()
+            let root = crate::test_temp_dir()
                 .join(format!("tr-private-cache-{:032x}", rand::random::<u128>()));
             let target = root.join("owned").join("encrypted.bin");
             assert!(write_cached_block_atomic(&target, &[10, 20, 30]));
@@ -2337,7 +2337,7 @@ mod desktop {
 
         #[test]
         fn concurrent_cache_writers_never_publish_mixed_or_partial_bytes() {
-            let root = std::env::temp_dir().join(format!(
+            let root = crate::test_temp_dir().join(format!(
                 "tr-cache-concurrent-{:032x}",
                 rand::random::<u128>()
             ));
@@ -3091,7 +3091,7 @@ mod desktop {
 
         #[test]
         fn native_pending_fsync_rejects_redirected_stage_and_symlinked_children() {
-            let cache = std::env::temp_dir().join(format!(
+            let cache = crate::test_temp_dir().join(format!(
                 "terarelay-fsync-{}",
                 crate::commands::drive_metadata::new_drive_id()
             ));

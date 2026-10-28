@@ -546,8 +546,8 @@ mod tests {
         assert!(checked_path("relative.json").is_err());
         assert!(checked_path("/fake/../receipt.json").is_err());
         assert!(checked_path("/fake/other.txt").is_err());
-        let directory =
-            std::env::temp_dir().join(format!("terarelay-receipt-test-{}", rand::random::<u128>()));
+        let directory = crate::test_temp_dir()
+            .join(format!("terarelay-receipt-test-{}", rand::random::<u128>()));
         fs::create_dir(&directory).unwrap();
         let dst = directory.join("recovery.json");
         let name = dst.to_string_lossy().to_string();

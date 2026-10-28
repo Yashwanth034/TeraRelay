@@ -191,6 +191,9 @@ def worker():
         with (root / "application.log").open("w") as log:
             if args.listener_audit:
                 foreign_listener = socket.socket()
+                # Match Actix's reuse semantics: TIME_WAIT from the prior QA
+                # run is not proof that a live listener occupies this port.
+                foreign_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     foreign_listener.bind(("127.0.0.1", 14201))
                 except OSError as error:

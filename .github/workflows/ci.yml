@@ -36,6 +36,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
+            ffmpeg \
             xdg-utils
 
       - uses: actions/setup-node@v7
@@ -330,6 +331,19 @@ jobs:
         with:
           workspaces: app/src-tauri -> target
           key: native-host-tests-${{ matrix.name }}
+
+      - name: Ensure FFmpeg and ffprobe for native media regressions
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              choco install ffmpeg --yes --no-progress
+            else
+              brew install ffmpeg
+            fi
+          fi
+          ffmpeg -version
+          ffprobe -version
 
       - name: Install frontend dependencies
         run: npm ci

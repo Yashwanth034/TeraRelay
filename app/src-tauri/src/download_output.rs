@@ -160,9 +160,12 @@ fn install_resume_database(
             .map_err(journal_error)?;
         initialize(&database)?;
         drop(database);
-        std::fs::File::open(&temp)
+        // Windows FlushFileBuffers requires a handle opened with write access.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
             .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Cannot sync download journal: {e}"))?;
         // hard_link publishes atomically and refuses to replace foreign state.
         std::fs::hard_link(&temp, journal_path)
             .map_err(|e| format!("Cannot publish download journal: {e}"))?;
@@ -567,7 +570,10 @@ impl DownloadOutput {
         if destination_stamp(&self.destination).await? != self.original {
             return Err("Destination changed during download. Choose another save location before retrying.".to_string());
         }
-        let file = tokio::fs::File::open(staging)
+        // Sync requires write access on Windows; opening must not truncate bytes.
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(staging)
             .await
             .map_err(|e| format!("Cannot open completed download output: {e}"))?;
         file.sync_all()

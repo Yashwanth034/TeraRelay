@@ -7,7 +7,7 @@
 // except according to those terms.
 
 // Modified for TeraRelay: adapt to hickory-resolver 0.26.1 without resolver panics,
-// and add local SOCKS5 regression tests. See ../../VENDOR.md.
+// use the OS resolver on iOS, and add local SOCKS5 regression tests. See ../../VENDOR.md.
 use log::info;
 use tokio::net::TcpStream;
 pub use tokio::net::tcp::{ReadHalf, WriteHalf};
@@ -50,6 +50,7 @@ impl NetStream {
             net::{IpAddr, SocketAddr},
         };
 
+        #[cfg(not(target_os = "ios"))]
         use hickory_resolver::Resolver;
         use url::Host;
 
@@ -68,16 +69,33 @@ impl NetStream {
         let password = proxy.password().unwrap_or("");
         let socks_addr = match host {
             Host::Domain(domain) => {
-                let resolver = Resolver::builder_tokio()
-                    .map_err(io::Error::other)?
-                    .build()
-                    .map_err(io::Error::other)?;
-                let response = resolver.lookup_ip(domain).await.map_err(io::Error::other)?;
-                let socks_ip_addr = response.iter().next().ok_or(io::Error::new(
-                    ErrorKind::NotFound,
-                    format!("proxy host did not return any ip address: {}", domain),
-                ))?;
-                SocketAddr::new(socks_ip_addr, port)
+                #[cfg(not(target_os = "ios"))]
+                {
+                    let resolver = Resolver::builder_tokio()
+                        .map_err(io::Error::other)?
+                        .build()
+                        .map_err(io::Error::other)?;
+                    let response = resolver.lookup_ip(domain).await.map_err(io::Error::other)?;
+                    let socks_ip_addr = response.iter().next().ok_or(io::Error::new(
+                        ErrorKind::NotFound,
+                        format!("proxy host did not return any ip address: {}", domain),
+                    ))?;
+                    SocketAddr::new(socks_ip_addr, port)
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    // Resolve only the proxy endpoint. The destination still travels
+                    // through SOCKS5; DNS failure must never trigger a direct route.
+                    tokio::net::lookup_host((domain, port))
+                        .await?
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                ErrorKind::NotFound,
+                                format!("proxy host did not return any ip address: {}", domain),
+                            )
+                        })?
+                }
             }
             Host::Ipv4(v4) => SocketAddr::new(IpAddr::from(v4), port),
             Host::Ipv6(v6) => SocketAddr::new(IpAddr::from(v6), port),
@@ -120,8 +138,17 @@ mod tests {
 
     // A local SOCKS peer checks the wire handshake, then echoes one payload.
     // No Telegram connection or external DNS is involved.
-    async fn loopback_proxy(password_auth: bool) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn loopback_proxy(password_auth: bool, hostname: bool) {
+        let bind_addr = if hostname {
+            tokio::net::lookup_host(("localhost", 0))
+                .await
+                .unwrap()
+                .next()
+                .unwrap()
+        } else {
+            "127.0.0.1:0".parse().unwrap()
+        };
+        let listener = TcpListener::bind(bind_addr).await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -158,10 +185,15 @@ mod tests {
             stream.write_all(&[byte]).await.unwrap();
         });
         let credentials = if password_auth { "user:pass@" } else { "" };
+        let proxy_host = if hostname {
+            format!("localhost:{}", proxy_addr.port())
+        } else {
+            proxy_addr.to_string()
+        };
         let target: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let mut stream = NetStream::connect_proxy_stream(
             &target,
-            &format!("socks5://{credentials}{proxy_addr}"),
+            &format!("socks5://{credentials}{proxy_host}"),
         )
         .await
         .unwrap();
@@ -173,16 +205,24 @@ mod tests {
 
     #[tokio::test]
     async fn socks5_loopback_without_authentication() {
-        tokio::time::timeout(Duration::from_secs(5), loopback_proxy(false))
+        tokio::time::timeout(Duration::from_secs(5), loopback_proxy(false, false))
             .await
             .expect("SOCKS handshake timed out");
     }
 
     #[tokio::test]
     async fn socks5_loopback_with_password_authentication() {
-        tokio::time::timeout(Duration::from_secs(5), loopback_proxy(true))
+        tokio::time::timeout(Duration::from_secs(5), loopback_proxy(true, false))
             .await
             .expect("SOCKS handshake timed out");
+    }
+
+    #[cfg(target_os = "ios")]
+    #[tokio::test]
+    async fn socks5_loopback_with_os_resolved_hostname() {
+        tokio::time::timeout(Duration::from_secs(5), loopback_proxy(true, true))
+            .await
+            .expect("hostname SOCKS handshake timed out");
     }
 
     #[tokio::test]

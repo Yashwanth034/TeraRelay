@@ -3115,7 +3115,12 @@ mod desktop {
                 created_at: 1,
                 updated_at: 1,
             };
-            assert!(sync_local_staging_for_pending(&root, &pending).is_ok());
+            let chunk_file = owned.join("0000000000000001.bin");
+            fs::write(&chunk_file, b"completed local chunk").unwrap();
+            sync_local_staging_for_pending(&root, &pending)
+                .expect("owned stage files must support durability sync on this platform");
+            assert_eq!(fs::read(&pending_file).unwrap(), b"unsent local bytes");
+            assert_eq!(fs::read(&chunk_file).unwrap(), b"completed local chunk");
             let outside = cache.join("unrelated.dat");
             fs::write(&outside, b"external data must survive").unwrap();
             #[cfg(unix)]
@@ -3440,7 +3445,37 @@ mod desktop {
             )
             .map_err(|e| format!("Cannot open private Drive staging file: {e}"))?;
             #[cfg(not(unix))]
-            let file = open_private_read(&entry.path())?;
+            let file = {
+                let path = entry.path();
+                reject_symlink_file(&path)?;
+                // Windows FlushFileBuffers requires write access. Never create
+                // or truncate a stage while opening it for durability sync.
+                let mut options = OpenOptions::new();
+                options.write(true);
+                #[cfg(windows)]
+                options.custom_flags(
+                    windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0,
+                );
+                let file = options
+                    .open(&path)
+                    .map_err(|e| format!("Cannot open private Drive staging file for sync: {e}"))?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    // Check the opened leaf as well as the earlier pathname:
+                    // a replaced link must not become a writable sync target.
+                    if file
+                        .metadata()
+                        .map_err(|e| e.to_string())?
+                        .file_attributes()
+                        & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                        != 0
+                    {
+                        return Err("Drive staging contains an unsafe reparse point".to_string());
+                    }
+                }
+                file
+            };
             if !file.metadata().map_err(|e| e.to_string())?.is_file() {
                 return Err("Drive staging contains an unsafe non-file entry".to_string());
             }

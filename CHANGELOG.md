@@ -12,7 +12,7 @@ All notable public changes to TeraRelay are documented here.
 - Strengthen Linux background startup and safe shutdown, and extend Windows/macOS native Drive platform validation.
 - Security: patch the session-compatible Grammers transport to use Hickory 0.26.3 and uTP to use ringbuf 0.5.3, retaining SOCKS proxy and torrent support. Keep the strict, non-waived RustSec/npm release gates and add locked SOCKS and buffer regressions to CI.
 - Run native-media unit fixtures serially, ensure FFmpeg/ffprobe are installed on test runners, and bound invalid-input HTTP cleanup so a failed startup cannot cause an indefinite test hang.
-- Fix Windows journal and completed-download flushing to use writable handles without truncating saved bytes.
+- Fix Windows journal, completed-download, and pending Drive staging flushes to use writable handles without truncating saved bytes; explicitly enable NTFS sparse staging for large logical downloads.
 - Keep iOS SOCKS proxy hostname resolution on the native OS resolver, avoiding macOS-only SystemConfiguration APIs.
 - Make the native stream-port collision fixture distinguish a live listener from TCP TIME_WAIT left by a prior QA run.
 

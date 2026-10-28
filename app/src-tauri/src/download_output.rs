@@ -112,6 +112,40 @@ fn regular_private_file(path: &Path) -> Result<bool, String> {
     }
 }
 
+#[cfg(windows)]
+fn prepare_sparse_staging(file: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE};
+    use windows::Win32::System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl};
+
+    let mut returned = 0_u32;
+    // NTFS otherwise allocates every byte between EOF and an out-of-order region.
+    // The borrowed synchronous handle remains open for this bufferless call.
+    let result = unsafe {
+        DeviceIoControl(
+            HANDLE(file.as_raw_handle()),
+            FSCTL_SET_SPARSE,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+    };
+    match result {
+        Ok(()) => Ok(()),
+        // Filesystems without sparse support still permit ordinary downloads.
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_FUNCTION.0)
+                || error.code() == windows::core::HRESULT::from_win32(ERROR_NOT_SUPPORTED.0) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("Cannot prepare sparse download output: {error}")),
+    }
+}
+
 fn region_bounds(offset: u64, len: u64) -> Result<(i64, i64), String> {
     let end = offset
         .checked_add(len)
@@ -259,7 +293,13 @@ fn open_resume_journal(
             .execute("DELETE FROM regions")
             .map_err(journal_error)?;
     }
-    let mut file = std::fs::File::open(staging).map_err(|e| e.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    let mut file = options.open(staging).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    prepare_sparse_staging(&file)?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut previous_start = -1_i64;
     let mut previous_end = 0_i64;
@@ -367,6 +407,14 @@ impl DownloadOutput {
                 .await
             {
                 Ok(file) => {
+                    #[cfg(windows)]
+                    let file = file.into_std().await;
+                    #[cfg(windows)]
+                    if let Err(error) = prepare_sparse_staging(&file) {
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&staging).await;
+                        return Err(error);
+                    }
                     drop(file);
                     let path_text = staging.to_string_lossy().into_owned();
                     return Ok(Self {
@@ -962,6 +1010,17 @@ mod tests {
         )
         .await
         .unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+            assert_ne!(
+                std::fs::metadata(output.path()).unwrap().file_attributes()
+                    & FILE_ATTRIBUTE_SPARSE_FILE.0,
+                0,
+                "Out-of-order Windows output must not allocate the entire gap"
+            );
+        }
         let offset = 10_000_000_000_000_u64 - 4;
         output.write_region(offset, b"done").await.unwrap();
         output.confirm_region(offset, 4).await.unwrap();

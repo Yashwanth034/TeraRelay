@@ -1,7 +1,4 @@
-use std::{
-    f64,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use crate::rtte::RttEstimator;
 

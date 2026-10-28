@@ -31,6 +31,10 @@ Local changes:
   transport functionality.
 - Use application workspace profiles rather than ignored standalone profiles.
 - Apply Rust formatting to the vendored sources.
+- Remove the legacy `std::f64` module import in `src/congestion/cubic.rs` so
+  `f64::INFINITY` resolves to the primitive type's associated constant. This
+  preserves the value while avoiding the deprecated module constant rejected
+  by current stable Rust's strict Clippy gate.
 
 The application integrates this directory with a `[patch.crates-io]` entry for
 `librqbit-utp`.

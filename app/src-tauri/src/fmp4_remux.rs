@@ -1862,7 +1862,18 @@ mod seek_playback_tests {
         let anchor = probe_seek_anchor(Path::new("ffprobe"), &source_url, requested)
             .await
             .unwrap();
-        let expected = if large { 5400.064 } else { 400.064 };
+        // FFmpeg builds differ in whether AAC priming shifts the container
+        // start below zero. Read that offset from the local fixture rather
+        // than assuming every encoder/muxer reports exactly -0.064 seconds.
+        let source_info = probe(source, &["-show_entries", "format=start_time"]).await;
+        let source_start = seek::finite_number(&source_info["format"]["start_time"])
+            .expect("Fixture must have a finite source start timestamp");
+        let expected_timestamp = if large { 5400.0 } else { 400.0 };
+        let expected = (expected_timestamp - source_start).max(0.0);
+        assert!(
+            (anchor.source_timestamp - expected_timestamp).abs() < 0.001,
+            "{anchor:?}"
+        );
         assert!((anchor.window_start - expected).abs() < 0.001, "{anchor:?}");
         eprintln!(
             "QA multipart source bytes={}, probe bytes={}",
@@ -1939,7 +1950,7 @@ mod seek_playback_tests {
             source,
             &[
                 "-read_intervals",
-                &format!("{}%+#1", requested - 0.064),
+                &format!("{}%+#1", requested + source_start),
                 "-select_streams",
                 "v:0",
                 "-show_packets",

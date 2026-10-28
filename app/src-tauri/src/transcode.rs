@@ -11,10 +11,10 @@
 //       720p/...
 //       1080p/...
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
@@ -146,18 +146,95 @@ pub enum JobPhase {
 pub struct TranscodeJob {
     pub key: TranscodeKey,
     pub phase: JobPhase,
+    /// True from preparation reservation through worker teardown. A
+    /// terminal/cancelled job must never restart while its old FFmpeg task
+    /// can still touch the same deterministic output path.
+    pub in_flight: bool,
     pub cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub last_access: Instant,
     pub source_height: Option<u32>,
 }
 
+/// Progress notifications may complete out of order after cancellation,
+/// an error or a successful FFmpeg exit. Ignore phase mismatches and
+/// nonmonotonic updates so terminal states cannot become stuck in caching.
+fn record_job_progress(job: &mut TranscodeJob, phase: JobPhase) {
+    if !job.in_flight {
+        return;
+    }
+    let allowed = match (&job.phase, &phase) {
+        (
+            JobPhase::CachingOriginal { progress: old },
+            JobPhase::CachingOriginal { progress: new },
+        )
+        | (JobPhase::Transcoding { progress: old }, JobPhase::Transcoding { progress: new }) => {
+            new.is_finite() && *new >= *old && *new <= 1.0
+        }
+        _ => false,
+    };
+    if allowed {
+        job.phase = phase;
+    }
+}
+
 // ── TranscodeManager ────────────────────────────────────────────────────
+
+/// A playlist can appear while FFmpeg is still writing HLS segments. Only a
+/// finished VOD playlist with an end marker and every referenced segment
+/// present is eligible for the persistent ready-cache fast path. This is
+/// especially important after cancellation or a crash during transcoding.
+fn finished_hls_variant(output_dir: &Path) -> bool {
+    let path = output_dir.join("index.m3u8");
+    if std::fs::metadata(&path).map_or(true, |meta| meta.len() > 4 * 1024 * 1024) {
+        return false;
+    }
+    let Ok(playlist) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if !playlist.lines().any(|line| line.trim() == "#EXT-X-ENDLIST")
+        || !playlist
+            .lines()
+            .any(|line| line.trim().starts_with("#EXTINF:"))
+    {
+        return false;
+    }
+    let mut segments = 0usize;
+    for segment in playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        // Reject absolute paths, traversal and external segment URLs.
+        if !segment.starts_with("segment_")
+            || !segment.ends_with(".ts")
+            || !segment
+                .strip_prefix("segment_")
+                .and_then(|name| name.strip_suffix(".ts"))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+        {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(output_dir.join(segment)) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            return false;
+        }
+        segments += 1;
+    }
+    segments > 0
+}
 
 #[derive(Clone)]
 pub struct TranscodeManager {
     pub cache_root: PathBuf,
     pub ffmpeg_path: Arc<Mutex<Option<PathBuf>>>,
     jobs: Arc<Mutex<HashMap<String, Arc<Mutex<TranscodeJob>>>>>,
+    // Different HLS qualities share the same original MP4 on disk. Allow
+    // only one cache download per file while other qualities await it.
+    original_download_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     max_cache_bytes: Arc<Mutex<u64>>,
 }
 
@@ -174,6 +251,7 @@ impl TranscodeManager {
             cache_root,
             ffmpeg_path: Arc::new(Mutex::new(None)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            original_download_locks: Arc::new(Mutex::new(HashMap::new())),
             max_cache_bytes: Arc::new(Mutex::new(MAX_CACHE_BYTES)),
         }
     }
@@ -183,22 +261,30 @@ impl TranscodeManager {
         let hls_root = cache_root.join(HLS_DIR);
         if let Ok(entries) = std::fs::read_dir(&hls_root) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check if index.m3u8 exists in any quality subfolder
-                    let mut has_playlist = false;
-                    if let Ok(q_dirs) = std::fs::read_dir(&path) {
-                        for q_entry in q_dirs.flatten() {
-                            if q_entry.path().join("index.m3u8").exists() {
-                                has_playlist = true;
-                                break;
-                            }
+                let file_dir = entry.path();
+                if !file_dir.is_dir() {
+                    continue;
+                }
+                // An old FFmpeg run may have produced an index.m3u8 before
+                // exiting. Validate *each* quality independently, preserving
+                // finished siblings while removing only interrupted variants.
+                if let Ok(variants) = std::fs::read_dir(&file_dir) {
+                    for variant in variants.flatten() {
+                        let quality_dir = variant.path();
+                        if quality_dir.is_dir() && !finished_hls_variant(&quality_dir) {
+                            log::info!(
+                                "Transcode: Cleaning up incomplete HLS variant: {:?}",
+                                quality_dir
+                            );
+                            let _ = std::fs::remove_dir_all(&quality_dir);
                         }
                     }
-                    if !has_playlist {
-                        log::info!("Transcode: Cleaning up partial output: {:?}", path);
-                        let _ = std::fs::remove_dir_all(&path);
-                    }
+                }
+                if std::fs::read_dir(&file_dir)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_dir(&file_dir);
                 }
             }
         }
@@ -225,32 +311,71 @@ impl TranscodeManager {
         }
     }
 
+    /// Returns the single serializing gate shared across quality variants
+    /// of the same Telegram media. Weak entries avoid retaining one mutex
+    /// per movie for the entire application lifetime.
+    async fn original_download_lock(&self, file_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.original_download_locks.lock().await;
+        if let Some(gate) = locks.get(file_key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        if locks.len() >= 128 {
+            locks.retain(|_, weak| weak.strong_count() > 0);
+        }
+        let gate = Arc::new(Mutex::new(()));
+        locks.insert(file_key.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
     /// Get or create a job entry. Returns (job_arc, is_new).
     pub async fn get_or_create_job(&self, key: &TranscodeKey) -> (Arc<Mutex<TranscodeJob>>, bool) {
         let mut jobs = self.jobs.lock().await;
         let job_id = key.job_id();
         if let Some(job) = jobs.get(&job_id) {
-            let mut j = job.lock().await;
-            j.last_access = Instant::now();
-            drop(j);
-            (job.clone(), false)
-        } else {
-            let job = Arc::new(Mutex::new(TranscodeJob {
-                key: key.clone(),
-                phase: JobPhase::NotStarted,
-                cancel_tx: None,
-                last_access: Instant::now(),
-                source_height: None,
-            }));
-            jobs.insert(job_id, job.clone());
-            (job, true)
+            let mut existing = job.lock().await;
+            let missing_ready_output = matches!(existing.phase, JobPhase::Ready)
+                && !finished_hls_variant(&self.hls_output_dir(&key.file_key(), &key.quality));
+            let can_restart = !existing.in_flight
+                && (matches!(existing.phase, JobPhase::Cancelled | JobPhase::Error(_))
+                    || missing_ready_output);
+            if !can_restart {
+                existing.last_access = Instant::now();
+                drop(existing);
+                return (job.clone(), false);
+            }
+            // Allocate a separate job object after the old worker has
+            // finished. Late progress callbacks still holding the retired
+            // Arc cannot mutate the new attempt's phase.
+            drop(existing);
         }
+        let job = Arc::new(Mutex::new(TranscodeJob {
+            key: key.clone(),
+            phase: JobPhase::NotStarted,
+            in_flight: true,
+            cancel_tx: None,
+            last_access: Instant::now(),
+            source_height: None,
+        }));
+        jobs.insert(job_id, job.clone());
+        (job, true)
     }
 
     /// Remove a job from the map.
     pub async fn remove_job(&self, job_id: &str) {
         let mut jobs = self.jobs.lock().await;
         jobs.remove(job_id);
+    }
+
+    /// Snapshot a job's current phase without pinning the global HLS job map
+    /// while waiting for that job's mutex or inspecting its output files.
+    /// This lets unrelated video qualities register/poll independently.
+    async fn get_job_phase_snapshot(&self, job_id: &str) -> Option<(TranscodeKey, JobPhase)> {
+        let job_arc = {
+            let jobs = self.jobs.lock().await;
+            jobs.get(job_id).cloned()
+        }?;
+        let job = job_arc.lock().await;
+        Some((job.key.clone(), job.phase.clone()))
     }
 
     /// Get a clone of the jobs map for status queries.
@@ -272,12 +397,10 @@ impl TranscodeManager {
     pub fn total_cache_size(&self) -> u64 {
         let mut total: u64 = 0;
         let walker = walkdir::WalkDir::new(&self.cache_root).min_depth(1);
-        for entry_result in walker {
-            if let Ok(entry) = entry_result {
-                if entry.file_type().is_file() {
-                    if let Ok(meta) = entry.metadata() {
-                        total += meta.len();
-                    }
+        for entry in walker.into_iter().flatten() {
+            if entry.file_type().is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
                 }
             }
         }
@@ -293,19 +416,34 @@ impl TranscodeManager {
             return;
         }
 
+        // Eviction may run when a different transcode finishes. Never delete
+        // the original input or HLS output from *any* still-active job,
+        // including a worker that is cancelling but has not exited.
+        // Hold the registry lock through eviction: a new job cannot reserve
+        // a just-deleted original or variant between our active-job snapshot
+        // and the filesystem removal.
+        let jobs_guard = self.jobs.lock().await;
+        let mut active_originals = HashSet::new();
+        let mut active_variants = Vec::new();
+        for job_arc in jobs_guard.values() {
+            let job = job_arc.lock().await;
+            if job.in_flight {
+                active_originals.insert(self.original_path(&job.key.file_key()));
+                active_variants.push(self.hls_output_dir(&job.key.file_key(), &job.key.quality));
+            }
+        }
+
         // Collect all files with their modification times
         let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
         let walker = walkdir::WalkDir::new(&self.cache_root).min_depth(1);
-        for entry_result in walker {
-            if let Ok(entry) = entry_result {
-                if entry.file_type().is_file() {
-                    if let Ok(meta) = entry.metadata() {
-                        files.push((
-                            entry.path().to_path_buf(),
-                            meta.len(),
-                            meta.modified().unwrap_or(UNIX_EPOCH),
-                        ));
-                    }
+        for entry in walker.into_iter().flatten() {
+            if entry.file_type().is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    files.push((
+                        entry.path().to_path_buf(),
+                        meta.len(),
+                        meta.modified().unwrap_or(UNIX_EPOCH),
+                    ));
                 }
             }
         }
@@ -319,6 +457,13 @@ impl TranscodeManager {
         for (path, size, _) in &files {
             if freed >= target {
                 break;
+            }
+            if active_originals.contains(path)
+                || active_variants
+                    .iter()
+                    .any(|folder| path.starts_with(folder))
+            {
+                continue;
             }
 
             if let Err(e) = std::fs::remove_file(path) {
@@ -616,6 +761,13 @@ pub async fn run_transcode(
         .arg("veryfast")
         .arg("-crf")
         .arg("23")
+        // HLS segment boundaries require IDR frames. Without forcing them
+        // at the requested interval, a short video can become one giant
+        // segment despite -hls_time, defeating responsive HLS seeking.
+        .arg("-force_key_frames")
+        .arg(format!("expr:gte(t,n_forced*{})", HLS_SEGMENT_TIME))
+        .arg("-sc_threshold")
+        .arg("0")
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
@@ -674,7 +826,7 @@ pub async fn run_transcode(
                             let secs = parse_time_to_secs(time_str);
                             if let Some(dur) = duration_secs {
                                 if dur > 0.0 {
-                                    let pct = (secs / dur as f64) as f32;
+                                    let pct = (secs / dur) as f32;
                                     if (pct - last_progress).abs() > 0.01 {
                                         last_progress = pct.clamp(0.0, 0.99);
                                         progress_callback(last_progress);
@@ -716,39 +868,13 @@ pub async fn run_transcode(
         ));
     }
 
-    // Verify the playlist was created
-    if !playlist_path.exists() {
-        return Err("FFmpeg completed but no playlist was produced".to_string());
-    }
-
-    // ── Validate HLS output before marking ready ────────────────────
-    let playlist_content = std::fs::read_to_string(&playlist_path)
-        .map_err(|e| format!("Failed to read playlist: {}", e))?;
-
-    // Check for at least one #EXTINF tag
-    let has_extinf = playlist_content
-        .lines()
-        .any(|l| l.trim().starts_with("#EXTINF:"));
-    if !has_extinf {
+    // Only mark the output ready when FFmpeg has exited and every referenced
+    // segment is durable, bounded and seekable via the finished VOD playlist.
+    // The same validation is shared by cache reuse, startup cleanup and
+    // transcoding status, preventing partial output from appearing as ready.
+    if !finished_hls_variant(output_dir) {
         let _ = std::fs::remove_dir_all(output_dir);
-        return Err("HLS playlist has no segments (no #EXTINF tags)".to_string());
-    }
-
-    // Check at least one .ts segment exists and is non-empty
-    let has_valid_segment = playlist_content
-        .lines()
-        .filter(|l| l.trim().ends_with(".ts"))
-        .any(|l| {
-            let seg_path = output_dir.join(l.trim());
-            seg_path.exists()
-                && std::fs::metadata(&seg_path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-        });
-
-    if !has_valid_segment {
-        let _ = std::fs::remove_dir_all(output_dir);
-        return Err("HLS playlist references no valid segment files".to_string());
+        return Err("FFmpeg exited without a complete HLS VOD playlist and segments".to_string());
     }
 
     log::info!("Transcode: Generated HLS variant at {:?}", output_dir);
@@ -767,11 +893,17 @@ fn parse_time_to_secs(time: &str) -> f64 {
     }
 }
 
-/// Detect video resolution from a cached original MP4 file.
+/// Detect resolution from a bounded MP4 header; never read the entire
+/// multi-gigabyte original into memory just to inspect tkhd dimensions.
 pub fn get_source_height(cached_path: &std::path::Path) -> Option<u32> {
-    let data = std::fs::read(cached_path).ok()?;
-    let buffer = &data[..std::cmp::min(2 * 1024 * 1024, data.len())];
-    mp4_utils::scan_video_tkhd_dimensions(buffer).1
+    use std::io::Read;
+    let mut file = std::fs::File::open(cached_path).ok()?;
+    let mut header = Vec::new();
+    file.by_ref()
+        .take(2 * 1024 * 1024)
+        .read_to_end(&mut header)
+        .ok()?;
+    mp4_utils::scan_video_tkhd_dimensions(&header).1
 }
 
 // ── Execute Full Transcode Pipeline ─────────────────────────────────────
@@ -813,6 +945,21 @@ pub async fn execute_transcode_pipeline(
     let output_dir = manager.hls_output_dir(&file_key, &key.quality);
 
     // ── Step 1: Cache original if needed ────────────────────────────
+    // Serialize the shared original across *different quality* HLS jobs.
+    // A concurrent quality must not truncate the first worker's .mp4.part
+    // file. Waiting remains cancellable and never locks the global job map.
+    let original_gate = manager.original_download_lock(&file_key).await;
+    let original_guard = tokio::select! {
+        guard = original_gate.lock_owned() => guard,
+        _ = &mut cancel_rx => {
+            job_arc.lock().await.phase = JobPhase::Cancelled;
+            return;
+        }
+    };
+    if cancel_rx.try_recv().is_ok() {
+        job_arc.lock().await.phase = JobPhase::Cancelled;
+        return;
+    }
     if !original_path.exists() {
         {
             let mut job = job_arc.lock().await;
@@ -829,7 +976,7 @@ pub async fn execute_transcode_pipeline(
                 let job_arc = job_arc_clone.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut job = job_arc.lock().await;
-                    job.phase = JobPhase::CachingOriginal { progress };
+                    record_job_progress(&mut job, JobPhase::CachingOriginal { progress });
                 });
             },
         )
@@ -843,24 +990,19 @@ pub async fn execute_transcode_pipeline(
             }
             Err(e) => {
                 let mut job = job_arc.lock().await;
-                job.phase = JobPhase::Error(format!("Cache failed: {}", e));
+                if !matches!(job.phase, JobPhase::Cancelled) {
+                    job.phase = JobPhase::Error(format!("Cache failed: {}", e));
+                }
                 return;
             }
         }
     }
 
+    // The atomically completed original is now safe for other qualities.
+    drop(original_guard);
+
     // ── Step 2: Detect source resolution ────────────────────────────
-    let source_height = {
-        let data = std::fs::read(&original_path).unwrap_or_default();
-        if data.len() > 1024 {
-            mp4_utils::scan_video_tkhd_dimensions(
-                &data[..std::cmp::min(2 * 1024 * 1024, data.len())],
-            )
-            .1
-        } else {
-            None
-        }
-    };
+    let source_height = get_source_height(&original_path);
 
     {
         let mut job = job_arc.lock().await;
@@ -882,6 +1024,9 @@ pub async fn execute_transcode_pipeline(
     // ── Step 3: Transcode ───────────────────────────────────────────
     {
         let mut job = job_arc.lock().await;
+        if matches!(job.phase, JobPhase::Cancelled) {
+            return;
+        }
         job.phase = JobPhase::Transcoding { progress: 0.0 };
     }
 
@@ -897,20 +1042,22 @@ pub async fn execute_transcode_pipeline(
             let job_arc = job_arc_clone.clone();
             tauri::async_runtime::spawn(async move {
                 let mut job = job_arc.lock().await;
-                job.phase = JobPhase::Transcoding { progress };
+                record_job_progress(&mut job, JobPhase::Transcoding { progress });
             });
         },
     )
     .await;
 
+    let mut job = job_arc.lock().await;
+    if matches!(job.phase, JobPhase::Cancelled) {
+        return;
+    }
     match result {
         Ok(()) => {
-            let mut job = job_arc.lock().await;
             job.phase = JobPhase::Ready;
             log::info!("Transcode: Job {} completed successfully", key.job_id());
         }
         Err(e) => {
-            let mut job = job_arc.lock().await;
             job.phase = JobPhase::Error(e);
         }
     }
@@ -983,9 +1130,22 @@ pub async fn cmd_prepare_transcoded_stream(
         .find(|p| p.label == quality)
         .ok_or_else(|| format!("Unknown quality: {}", quality))?;
 
-    // Check if already ready
+    // An in-progress FFmpeg worker publishes index.m3u8 before it is done.
+    // A disk-only existence check can announce partial output as ready.
+    // Honor a known job's phase; only reuse persisted output if every segment
+    // is present and the VOD end marker confirms completion.
     let output_dir = manager.hls_output_dir(&key.file_key(), &quality);
-    if output_dir.join("index.m3u8").exists() {
+    let existing_job = {
+        let jobs = manager.jobs.lock().await;
+        jobs.get(&key.job_id()).cloned()
+    };
+    let known_ready = if let Some(job) = existing_job.as_ref() {
+        let job = job.lock().await;
+        matches!(job.phase, JobPhase::Ready) || !job.in_flight
+    } else {
+        true
+    };
+    if known_ready && finished_hls_variant(&output_dir) {
         return Ok(TranscodePrepareResult {
             job_id: key.job_id(),
             status: "ready".to_string(),
@@ -1043,43 +1203,64 @@ pub async fn cmd_prepare_transcoded_stream(
         };
     }
 
-    // New job — start the pipeline
-    let client = { state.client.lock().await.clone() };
-    let client = client.ok_or_else(|| "Not connected to Telegram".to_string())?;
+    // Reserve the job *before* Telegram network preparation. A retry or
+    // cancel during this phase cannot start a concurrent task for the same
+    // deterministic HLS output directory.
+    let prepared = async {
+        let client = { state.client.lock().await.clone() };
+        let client = client.ok_or_else(|| "Not connected to Telegram".to_string())?;
 
-    let peer = crate::commands::utils::resolve_peer(
-        &client,
-        if folder_id == 0 {
-            None
-        } else {
-            Some(folder_id)
-        },
-        &state.peer_cache,
-    )
-    .await?;
+        let peer = crate::commands::utils::resolve_peer(
+            &client,
+            if folder_id == 0 {
+                None
+            } else {
+                Some(folder_id)
+            },
+            &state.peer_cache,
+        )
+        .await?;
 
-    let messages = client
-        .get_messages_by_id(&peer, &[message_id])
-        .await
-        .map_err(|e| e.to_string())?;
+        let messages = client
+            .get_messages_by_id(&peer, &[message_id])
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let msg = messages
-        .into_iter()
-        .flatten()
-        .next()
-        .ok_or_else(|| format!("Message {} not found", message_id))?;
+        let msg = messages
+            .into_iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| format!("Message {} not found", message_id))?;
 
-    let media = msg.media().ok_or_else(|| "No media".to_string())?;
+        let media = msg.media().ok_or_else(|| "No media".to_string())?;
 
-    // Get duration from mp4parse (quick moov chunk)
-    let duration_secs = get_duration_from_media(&client, message_id, folder_id, &state)
-        .await
-        .ok();
+        // Get duration from mp4parse (quick moov chunk).
+        let duration_secs = get_duration_from_media(&client, message_id, folder_id, &state)
+            .await
+            .ok();
+        Ok::<_, String>((client, media, duration_secs))
+    }
+    .await;
+
+    let (client, media, duration_secs) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut job = job_arc.lock().await;
+            if !matches!(job.phase, JobPhase::Cancelled) {
+                job.phase = JobPhase::Error(error.clone());
+            }
+            job.in_flight = false;
+            return Err(error);
+        }
+    };
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-
     {
         let mut job = job_arc.lock().await;
+        if matches!(job.phase, JobPhase::Cancelled) {
+            job.in_flight = false;
+            return Err("Transcode cancelled during preparation".to_string());
+        }
         job.cancel_tx = Some(cancel_tx);
     }
 
@@ -1099,6 +1280,14 @@ pub async fn cmd_prepare_transcoded_stream(
             cancel_rx,
         )
         .await;
+
+        // Only now can another attempt reuse the deterministic file/quality
+        // key. The old FFmpeg process and cache worker have stopped.
+        {
+            let mut job = job_arc.lock().await;
+            job.cancel_tx = None;
+            job.in_flight = false;
+        }
 
         // LRU eviction after job completes
         manager_clone.evict_lru().await;
@@ -1188,25 +1377,34 @@ pub async fn cmd_get_transcode_status(
     job_id: String,
     manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<TranscodeStatusResult, String> {
-    let jobs = manager.jobs.lock().await;
-    let job_arc = jobs
-        .get(&job_id)
+    let (key, phase) = manager
+        .get_job_phase_snapshot(&job_id)
+        .await
         .ok_or_else(|| format!("Job {} not found", job_id))?;
 
-    let job = job_arc.lock().await;
-    let (status_str, progress, error, playlist_url) = match &job.phase {
+    let (status_str, progress, error, playlist_url) = match &phase {
         JobPhase::NotStarted => ("pending".to_string(), 0.0, None, None),
         JobPhase::CachingOriginal { progress } => ("caching".to_string(), *progress, None, None),
         JobPhase::Transcoding { progress } => ("transcoding".to_string(), *progress, None, None),
+        JobPhase::Ready
+            if finished_hls_variant(&manager.hls_output_dir(&key.file_key(), &key.quality)) =>
+        {
+            (
+                "ready".to_string(),
+                1.0,
+                None,
+                Some(format!(
+                    "/hls/{}/{}/index.m3u8",
+                    key.file_key(),
+                    key.quality
+                )),
+            )
+        }
         JobPhase::Ready => (
-            "ready".to_string(),
-            1.0,
+            "error".to_string(),
+            0.0,
+            Some("The cached HLS playlist is incomplete or was evicted. Select Retry.".to_string()),
             None,
-            Some(format!(
-                "/hls/{}/{}/index.m3u8",
-                job.key.file_key(),
-                job.key.quality
-            )),
         ),
         JobPhase::Error(e) => ("error".to_string(), 0.0, Some(e.clone()), None),
         JobPhase::Cancelled => ("cancelled".to_string(), 0.0, None, None),
@@ -1250,7 +1448,7 @@ pub struct TranscodeCacheInfo {
 }
 #[tauri::command]
 pub async fn cmd_get_transcode_cache_info(
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<TranscodeCacheInfo, String> {
     let current = manager.total_cache_size();
     let max = manager.get_max_cache_bytes().await;
@@ -1264,9 +1462,9 @@ pub async fn cmd_get_transcode_cache_info(
 #[tauri::command]
 pub async fn cmd_set_transcode_cache_limit(
     max_gb: u32,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<(), String> {
-    let gb = std::cmp::max(1, std::cmp::min(50, max_gb));
+    let gb = max_gb.clamp(1, 50);
     let max_bytes = (gb as u64) * 1024 * 1024 * 1024;
     manager.set_max_cache_bytes(max_bytes).await;
     log::info!(
@@ -1300,7 +1498,7 @@ pub async fn cmd_get_cached_variants(
             let output_dir = manager.hls_output_dir(&file_key, p.label);
             CachedVariantInfo {
                 quality: p.label.to_string(),
-                available: output_dir.join("index.m3u8").exists(),
+                available: finished_hls_variant(&output_dir),
             }
         })
         .collect();
@@ -1327,7 +1525,7 @@ pub struct DetailedCacheInfo {
 
 #[tauri::command]
 pub async fn cmd_get_detailed_transcode_cache(
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<DetailedCacheInfo, String> {
     let mut entries: Vec<CacheEntry> = Vec::new();
     let hls_root = manager.cache_root.join(HLS_DIR);
@@ -1409,12 +1607,61 @@ pub async fn cmd_get_detailed_transcode_cache(
 
 // ── Clear transcode cache (all, per-file, or per-variant) ──────────
 
+/// Cache deletion accepts only canonical remote file IDs and supported
+/// preset labels. User-provided paths must never reach remove_dir_all.
+fn validate_cache_clear_selection(
+    file_key: Option<&str>,
+    quality: Option<&str>,
+) -> Result<(), String> {
+    if let Some(key) = file_key {
+        let (folder, message) = key
+            .rsplit_once('_')
+            .ok_or_else(|| "Invalid transcode cache file ID".to_string())?;
+        let folder = folder
+            .parse::<i64>()
+            .map_err(|_| "Invalid transcode cache folder ID".to_string())?;
+        let message = message
+            .parse::<i32>()
+            .map_err(|_| "Invalid transcode cache message ID".to_string())?;
+        if format!("{folder}_{message}") != key {
+            return Err("Noncanonical transcode cache file ID".to_string());
+        }
+    } else if quality.is_some() {
+        return Err("Cannot clear quality without specifying file_key".to_string());
+    }
+    if let Some(quality) = quality {
+        if !QUALITY_PRESETS.iter().any(|preset| preset.label == quality) {
+            return Err("Unknown transcode cache quality".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// A cache clear is blocked while a worker still uses the selected source
+/// or variant. This check deliberately blocks variant clears for any active
+/// quality of that source, because clearing the final variant can also delete
+/// the original input shared by the other quality workers.
+fn cache_clear_conflicts_with_job(file_key: Option<&str>, job: &TranscodeJob) -> bool {
+    job.in_flight && file_key.is_none_or(|key| key == job.key.file_key())
+}
+
 #[tauri::command]
 pub async fn cmd_clear_transcode_cache(
     file_key: Option<String>,
     quality: Option<String>,
-    manager: tauri::State<'_, TranscodeManager>,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<String, String> {
+    validate_cache_clear_selection(file_key.as_deref(), quality.as_deref())?;
+    // Keep the registry locked for the entire filesystem deletion, so a
+    // concurrent prepare cannot reserve this source just after the safety
+    // check and then lose its output or original file.
+    let jobs_guard = manager.jobs.lock().await;
+    for job in jobs_guard.values() {
+        let job_guard = job.lock().await;
+        if cache_clear_conflicts_with_job(file_key.as_deref(), &job_guard) {
+            return Err("Cannot clear media cache while a transcode is running".to_string());
+        }
+    }
     match (file_key, quality) {
         // Clear everything
         (None, None) => {
@@ -1507,9 +1754,8 @@ pub async fn cmd_get_master_playlist_info(
 
     for preset in QUALITY_PRESETS {
         let output_dir = manager.hls_output_dir(&file_key, preset.label);
-        let playlist_path = output_dir.join("index.m3u8");
 
-        if playlist_path.exists() {
+        if finished_hls_variant(&output_dir) {
             // Try to read the playlist to get bandwidth info
             let bandwidth =
                 estimate_bandwidth(&output_dir).unwrap_or(preset.video_bitrate_k * 1000);
@@ -1593,6 +1839,37 @@ struct HlsQuery {
     token: Option<String>,
 }
 
+/// Add the already-validated loopback stream token to each relative TS segment.
+/// Native HLS clients do not run hls.js's xhrSetup on child media requests.
+/// Refuse unexpected segment references instead of passing external or
+/// traversing URLs through a manifest that contains authenticated media.
+fn authenticated_hls_media_playlist(playlist: &str, token: &str) -> Option<String> {
+    let token = urlencoding::encode(token);
+    let mut body = String::with_capacity(playlist.len() + token.len() * 8);
+    for line in playlist.lines() {
+        let item = line.trim();
+        if item.is_empty() || item.starts_with('#') {
+            // This pipeline produces unencrypted MPEG-TS HLS. If an output is
+            // unexpectedly switched to keys or mapped media, do not publish
+            // URIs without authentication and containment checks.
+            if item.starts_with("#EXT-X-KEY:") || item.starts_with("#EXT-X-MAP:") {
+                return None;
+            }
+            body.push_str(line);
+        } else {
+            let numeric = item.strip_prefix("segment_")?.strip_suffix(".ts")?;
+            if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            body.push_str(item);
+            body.push_str("?token=");
+            body.push_str(&token);
+        }
+        body.push('\n');
+    }
+    Some(body)
+}
+
 /// Serve an HLS playlist (.m3u8) or segment (.ts).
 async fn serve_hls_file(
     _req: HttpRequest,
@@ -1628,31 +1905,58 @@ async fn serve_hls_file(
         "application/octet-stream"
     };
 
-    match std::fs::read(&file_path) {
-        Ok(data) => {
-            let mut resp = HttpResponse::Ok()
-                .content_type(mime)
-                .insert_header(("Accept-Ranges", "bytes"))
-                .body(data);
+    // FFmpeg-generated media playlists are small. Rewrite only their
+    // relative TS references so native HLS clients inherit authentication
+    // even without JavaScript request interceptors. Do not buffer TS media.
+    if mime == "application/vnd.apple.mpegurl" {
+        const MAX_PLAYLIST_BYTES: u64 = 4 * 1024 * 1024;
+        let Ok(metadata) = tokio::fs::metadata(&file_path).await else {
+            return HttpResponse::NotFound().body("Playlist not found");
+        };
+        if !metadata.is_file() || metadata.len() > MAX_PLAYLIST_BYTES {
+            return HttpResponse::BadRequest().body("Invalid HLS playlist");
+        }
+        let Ok(playlist) = tokio::fs::read_to_string(&file_path).await else {
+            return HttpResponse::NotFound().body("Playlist unreadable");
+        };
+        let Some(authorized) = authenticated_hls_media_playlist(&playlist, &token_data.token)
+        else {
+            return HttpResponse::BadRequest().body("Invalid HLS playlist references");
+        };
+        return HttpResponse::Ok()
+            .content_type("application/vnd.apple.mpegurl")
+            .insert_header(("Cache-Control", "private, max-age=10"))
+            .body(authorized);
+    }
 
-            // Cache headers: segments can be cached longer, playlists shorter
-            if mime == "video/mp2t" {
-                resp.headers_mut().insert(
-                    actix_web::http::header::CACHE_CONTROL,
-                    actix_web::http::header::HeaderValue::from_static("public, max-age=3600"),
-                );
+    // Never read an entire encoded segment into memory. NamedFile streams
+    // bounded chunks from the owned HLS cache and implements HTTP Range,
+    // Content-Range and conditional request semantics for media seeking.
+    match actix_files::NamedFile::open_async(&file_path).await {
+        Ok(file) => {
+            let mut resp = file
+                .set_content_type(mime.parse().expect("static HLS MIME is valid"))
+                .into_response(&_req);
+            // Cache headers: successful segments can be cached longer,
+            // playlists shorter; error responses must not be cached as media.
+            let cache = if !resp.status().is_success() {
+                "no-store"
+            } else if mime == "video/mp2t" {
+                // The URL contains a session token; keep browser caching,
+                // but never authorize shared intermediary caches to retain it.
+                "private, max-age=3600"
             } else {
-                resp.headers_mut().insert(
-                    actix_web::http::header::CACHE_CONTROL,
-                    actix_web::http::header::HeaderValue::from_static("private, max-age=10"),
-                );
-            }
-
+                "private, max-age=10"
+            };
+            resp.headers_mut().insert(
+                actix_web::http::header::CACHE_CONTROL,
+                actix_web::http::header::HeaderValue::from_static(cache),
+            );
             resp
         }
         Err(e) => {
-            log::error!("Transcode: Failed to read HLS file {:?}: {}", file_path, e);
-            HttpResponse::InternalServerError().body("Failed to read file")
+            log::error!("Transcode: Failed to open HLS file {:?}: {}", file_path, e);
+            HttpResponse::InternalServerError().body("Failed to open file")
         }
     }
 }
@@ -1678,15 +1982,32 @@ async fn hls_master_playlist(
     let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
 
     for preset in QUALITY_PRESETS {
-        let hls_dir = manager.hls_output_dir(&file_key, preset.label);
-        if hls_dir.join("index.m3u8").exists() {
-            let bandwidth = estimate_bandwidth(&hls_dir).unwrap_or(preset.video_bitrate_k * 1000);
-            let width = preset.height * 16 / 9;
-            playlist.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{}\n{}/index.m3u8\n",
-                bandwidth, width, preset.height, preset.label
-            ));
+        // The master playlist is also a filesystem reader. Resolve each
+        // variant through the same canonical HLS-root containment check used
+        // for playlists and segments, rather than joining an untrusted key
+        // directly onto the cache root.
+        let Some(playlist_path) = manager.validate_hls_path(&file_key, preset.label, None) else {
+            continue;
+        };
+        let Some(hls_dir) = playlist_path.parent() else {
+            continue;
+        };
+        // FFmpeg creates the playlist before writing its final segments and
+        // VOD end marker. Do not advertise a partial/evicted variant through
+        // the master playlist just because index.m3u8 exists on disk.
+        if !finished_hls_variant(hls_dir) {
+            continue;
         }
+        let bandwidth = estimate_bandwidth(hls_dir).unwrap_or(preset.video_bitrate_k * 1000);
+        let width = preset.height * 16 / 9;
+        playlist.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{}\n{}/index.m3u8?token={}\n",
+            bandwidth,
+            width,
+            preset.height,
+            preset.label,
+            urlencoding::encode(&token_data.token),
+        ));
     }
 
     if playlist.lines().count() <= 2 {
@@ -1765,8 +2086,747 @@ mod playback_manager_tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_snapshot_does_not_hold_global_registry_while_job_is_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-status-registry-lock-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = Arc::new(TranscodeManager::new(root.clone()));
+        let key = TranscodeKey {
+            folder_id: 7,
+            message_id: 95,
+            quality: "360p".to_string(),
+        };
+        let (job, is_new) = manager.get_or_create_job(&key).await;
+        assert!(is_new);
+        let held_job = job.lock().await;
+        let query_manager = manager.clone();
+        let job_id = key.job_id();
+        let query =
+            tokio::spawn(async move { query_manager.get_job_phase_snapshot(&job_id).await });
+        // Give status polling an opportunity to reach the intentionally busy
+        // per-job lock, while other quality requests need the jobs registry.
+        tokio::task::yield_now().await;
+        let registry =
+            tokio::time::timeout(std::time::Duration::from_millis(300), manager.jobs.lock())
+                .await
+                .expect("status polling pinned the global HLS jobs map behind a busy job");
+        drop(registry);
+        drop(held_job);
+        let (reported_key, phase) = query
+            .await
+            .expect("snapshot task failed")
+            .expect("status lost an existing HLS job");
+        assert_eq!(reported_key.job_id(), key.job_id());
+        assert!(matches!(phase, JobPhase::NotStarted));
+        drop(manager);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_hls_job_restarts_only_after_old_worker_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-retry-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let key = TranscodeKey {
+            folder_id: 27,
+            message_id: 1234,
+            quality: "480p".to_string(),
+        };
+
+        let (first, new) = manager.get_or_create_job(&key).await;
+        assert!(new);
+        assert!(first.lock().await.in_flight);
+        let (same, new) = manager.get_or_create_job(&key).await;
+        assert!(!new, "a concurrent preparation spawned a second worker");
+        assert!(Arc::ptr_eq(&first, &same));
+
+        {
+            let mut job = first.lock().await;
+            job.phase = JobPhase::Cancelled;
+            // Cancellation is signalled, but the old worker hasn't finished.
+            assert!(job.in_flight);
+        }
+        let (still_same, new) = manager.get_or_create_job(&key).await;
+        assert!(!new, "cancelled worker must finish before replacement");
+        assert!(Arc::ptr_eq(&first, &still_same));
+
+        first.lock().await.in_flight = false;
+        let (retried, new) = manager.get_or_create_job(&key).await;
+        assert!(new, "terminal cancelled jobs must permit Retry");
+        assert!(!Arc::ptr_eq(&first, &retried));
+        assert!(matches!(retried.lock().await.phase, JobPhase::NotStarted));
+        assert!(retried.lock().await.in_flight);
+
+        // A late callback holding the old attempt cannot poison the retry.
+        first.lock().await.phase = JobPhase::Error("late error".to_string());
+        assert!(matches!(retried.lock().await.phase, JobPhase::NotStarted));
+        let (same_retry, new) = manager.get_or_create_job(&key).await;
+        assert!(!new);
+        assert!(Arc::ptr_eq(&retried, &same_retry));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_hls_job_can_retry_after_preparation_releases_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-failure-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let key = TranscodeKey {
+            folder_id: 0,
+            message_id: 4312,
+            quality: "360p".to_string(),
+        };
+        let (first, new) = manager.get_or_create_job(&key).await;
+        assert!(new);
+        {
+            let mut job = first.lock().await;
+            job.phase = JobPhase::Error("injected preparation failure".to_string());
+            job.in_flight = false;
+        }
+        let (retried, new) = manager.get_or_create_job(&key).await;
+        assert!(new, "a failed job must not permanently disable Retry");
+        assert!(!Arc::ptr_eq(&first, &retried));
+        assert!(retried.lock().await.in_flight);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn evicted_ready_hls_variant_is_recreated_only_after_worker_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-evicted-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let key = TranscodeKey {
+            folder_id: 18,
+            message_id: 5412,
+            quality: "720p".to_string(),
+        };
+        let (first, _) = manager.get_or_create_job(&key).await;
+        first.lock().await.phase = JobPhase::Ready;
+        let (during, new) = manager.get_or_create_job(&key).await;
+        assert!(
+            !new,
+            "do not recreate a ready job with its worker still active"
+        );
+        assert!(Arc::ptr_eq(&first, &during));
+
+        first.lock().await.in_flight = false;
+        let (retry, new) = manager.get_or_create_job(&key).await;
+        assert!(
+            new,
+            "an evicted playlist cannot leave a false-ready job forever"
+        );
+        assert!(!Arc::ptr_eq(&first, &retry));
+
+        let playlist = manager
+            .hls_output_dir(&key.file_key(), &key.quality)
+            .join("index.m3u8");
+        std::fs::create_dir_all(playlist.parent().unwrap()).unwrap();
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        std::fs::write(
+            playlist.parent().unwrap().join("segment_000.ts"),
+            b"valid-ts",
+        )
+        .unwrap();
+        retry.lock().await.phase = JobPhase::Ready;
+        retry.lock().await.in_flight = false;
+        let (cached, new) = manager.get_or_create_job(&key).await;
+        assert!(
+            !new,
+            "a valid cached playlist should never be transcoded again"
+        );
+        assert!(Arc::ptr_eq(&retry, &cached));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_async_progress_never_reopens_cancelled_or_completed_hls_jobs() {
+        let key = TranscodeKey {
+            folder_id: 0,
+            message_id: 415,
+            quality: "480p".into(),
+        };
+        let mut job = TranscodeJob {
+            key,
+            phase: JobPhase::CachingOriginal { progress: 0.1 },
+            in_flight: true,
+            cancel_tx: None,
+            last_access: Instant::now(),
+            source_height: None,
+        };
+        record_job_progress(&mut job, JobPhase::CachingOriginal { progress: 0.5 });
+        assert!(matches!(job.phase, JobPhase::CachingOriginal { progress } if progress == 0.5));
+        record_job_progress(&mut job, JobPhase::CachingOriginal { progress: 0.25 });
+        assert!(matches!(job.phase, JobPhase::CachingOriginal { progress } if progress == 0.5));
+        job.phase = JobPhase::Transcoding { progress: 0.0 };
+        record_job_progress(&mut job, JobPhase::CachingOriginal { progress: 0.9 });
+        assert!(matches!(job.phase, JobPhase::Transcoding { progress } if progress == 0.0));
+        record_job_progress(&mut job, JobPhase::Transcoding { progress: 0.8 });
+        assert!(matches!(job.phase, JobPhase::Transcoding { progress } if progress == 0.8));
+        job.phase = JobPhase::Cancelled;
+        record_job_progress(&mut job, JobPhase::Transcoding { progress: 0.99 });
+        assert!(matches!(job.phase, JobPhase::Cancelled));
+        job.phase = JobPhase::Ready;
+        record_job_progress(&mut job, JobPhase::Transcoding { progress: 1.0 });
+        assert!(matches!(job.phase, JobPhase::Ready));
+        job.phase = JobPhase::Error("interrupted".into());
+        record_job_progress(&mut job, JobPhase::CachingOriginal { progress: 0.7 });
+        assert!(matches!(job.phase, JobPhase::Error(_)));
+        job.phase = JobPhase::CachingOriginal { progress: 0.0 };
+        job.in_flight = false;
+        record_job_progress(&mut job, JobPhase::CachingOriginal { progress: 0.3 });
+        assert!(matches!(job.phase, JobPhase::CachingOriginal { progress } if progress == 0.0));
+    }
+
+    #[test]
+    fn startup_cleanup_preserves_finished_quality_and_prunes_crashed_sibling() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-startup-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let hls_root = root.join(HLS_DIR).join("7_12");
+        let good = hls_root.join("480p");
+        let partial = hls_root.join("720p");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(
+            good.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        std::fs::write(good.join("segment_000.ts"), b"ts").unwrap();
+        std::fs::write(
+            partial.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n",
+        )
+        .unwrap();
+        std::fs::write(partial.join("segment_000.ts"), b"interrupted").unwrap();
+
+        let _manager = TranscodeManager::new(root.clone());
+        assert!(
+            finished_hls_variant(&good),
+            "finished HLS was deleted on startup"
+        );
+        assert!(!partial.exists(), "interrupted quality survived startup");
+        assert!(good.join("segment_000.ts").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hls_quality_jobs_share_one_original_download_gate_without_serializing_encodes() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-shared-source-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let a = manager.original_download_lock("44_552").await;
+        let b = manager.original_download_lock("44_552").await;
+        let other = manager.original_download_lock("44_553").await;
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "different qualities race on the same .part input"
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &other),
+            "different media must download independently"
+        );
+
+        let first = a.lock_owned().await;
+        assert!(
+            b.try_lock().is_err(),
+            "concurrent HLS quality could truncate shared MP4"
+        );
+        assert!(
+            other.try_lock().is_ok(),
+            "independent movie downloads were serialized"
+        );
+        drop(first);
+        assert!(
+            b.try_lock().is_ok(),
+            "a finished download never released its gate"
+        );
+
+        drop(b);
+        let replacement = manager.original_download_lock("44_552").await;
+        assert!(replacement.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cache_eviction_preserves_ongoing_transcode_input_and_segments() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-eviction-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let key = TranscodeKey {
+            folder_id: 8,
+            message_id: 953,
+            quality: "480p".to_string(),
+        };
+        let (job, _) = manager.get_or_create_job(&key).await;
+        assert!(job.lock().await.in_flight);
+
+        let input = manager.original_path(&key.file_key());
+        let active_dir = manager.hls_output_dir(&key.file_key(), &key.quality);
+        let active_segment = active_dir.join("segment_000.ts");
+        let other = manager
+            .cache_root
+            .join(HLS_DIR)
+            .join("not-active")
+            .join("stale.ts");
+        std::fs::create_dir_all(input.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&input, vec![1_u8; 64]).unwrap();
+        std::fs::write(&active_segment, vec![2_u8; 64]).unwrap();
+        std::fs::write(&other, vec![3_u8; 64]).unwrap();
+        manager.set_max_cache_bytes(1).await;
+        manager.evict_lru().await;
+        assert!(input.is_file(), "eviction deleted an active FFmpeg input");
+        assert!(
+            active_segment.is_file(),
+            "eviction deleted an actively generated HLS segment"
+        );
+        assert!(!other.exists(), "inactive cache must remain evictable");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_hls_playlist_cannot_be_promoted_to_cached_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-partial-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let dir = root.join(HLS_DIR).join("12_15").join("480p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let playlist = dir.join("index.m3u8");
+        std::fs::write(&playlist, "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n").unwrap();
+        std::fs::write(dir.join("segment_000.ts"), b"ts").unwrap();
+        assert!(
+            !finished_hls_variant(&dir),
+            "unfinished output must not be ready"
+        );
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n#EXTINF:4.0,\nsegment_001.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert!(
+            !finished_hls_variant(&dir),
+            "missing referenced segments invalidate the entire output"
+        );
+        std::fs::write(dir.join("segment_001.ts"), b"ts").unwrap();
+        assert!(
+            finished_hls_variant(&dir),
+            "complete VOD playlist is reusable"
+        );
+        std::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n../../escape.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert!(!finished_hls_variant(&dir), "segment path escape rejected");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transcode_cache_commands_require_registered_arc_manager() {
+        fn assert_info<T: Send + Sync + 'static, F>(_: impl Fn(tauri::State<'static, T>) -> F) {
+            assert_eq!(TypeId::of::<T>(), TypeId::of::<Arc<TranscodeManager>>());
+        }
+        fn assert_limit<T: Send + Sync + 'static, F>(
+            _: impl Fn(u32, tauri::State<'static, T>) -> F,
+        ) {
+            assert_eq!(TypeId::of::<T>(), TypeId::of::<Arc<TranscodeManager>>());
+        }
+        fn assert_clear<T: Send + Sync + 'static, F>(
+            _: impl Fn(Option<String>, Option<String>, tauri::State<'static, T>) -> F,
+        ) {
+            assert_eq!(TypeId::of::<T>(), TypeId::of::<Arc<TranscodeManager>>());
+        }
+        assert_info(cmd_get_transcode_cache_info);
+        assert_info(cmd_get_detailed_transcode_cache);
+        assert_limit(cmd_set_transcode_cache_limit);
+        assert_clear(cmd_clear_transcode_cache);
+    }
+
+    #[tokio::test]
+    async fn cache_clear_rejects_path_traversal_and_active_transcodes() {
+        for invalid in [
+            "../other",
+            "/tmp/escape",
+            "0_1/../else",
+            "0_+1",
+            "01_1",
+            "0_2147483648",
+            "-5_0_2",
+        ] {
+            assert!(
+                validate_cache_clear_selection(Some(invalid), None).is_err(),
+                "dangerous or noncanonical cache file selection was accepted: {invalid}"
+            );
+        }
+        assert!(validate_cache_clear_selection(None, Some("480p")).is_err());
+        assert!(validate_cache_clear_selection(Some("0_1"), Some("../480p")).is_err());
+        assert!(validate_cache_clear_selection(Some("-42_15"), Some("360p")).is_ok());
+        assert!(validate_cache_clear_selection(None, None).is_ok());
+
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-clear-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let key = TranscodeKey {
+            folder_id: 14,
+            message_id: 83,
+            quality: "480p".to_string(),
+        };
+        let (job, _) = manager.get_or_create_job(&key).await;
+        {
+            let job = job.lock().await;
+            assert!(cache_clear_conflicts_with_job(None, &job));
+            assert!(cache_clear_conflicts_with_job(Some("14_83"), &job));
+            assert!(!cache_clear_conflicts_with_job(Some("14_84"), &job));
+        }
+        job.lock().await.in_flight = false;
+        {
+            let job_guard = job.lock().await;
+            assert!(!cache_clear_conflicts_with_job(None, &job_guard));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn ffmpeg_capability_command_uses_the_registered_shared_manager() {
         assert_capability_state(cmd_get_transcode_capabilities);
+    }
+
+    #[test]
+    fn hls_cache_file_responses_stream_instead_of_loading_entire_segments() {
+        let source = include_str!("transcode.rs");
+        let handler = source
+            .split_once("async fn serve_hls_file(")
+            .unwrap()
+            .1
+            .split_once("/// GET /hls/{file_key}/master.m3u8")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("NamedFile::open_async(")
+                && !handler.contains("std::fs::read(&file_path)"),
+            "large cached HLS segments must stream from disk without eager full-file allocation"
+        );
+    }
+
+    #[test]
+    fn master_hls_playlist_applies_the_existing_containment_check() {
+        let source = include_str!("transcode.rs");
+        let handler = source
+            .split_once("async fn hls_master_playlist(")
+            .unwrap()
+            .1
+            .split_once("async fn hls_playlist(")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("manager.validate_hls_path("),
+            "master playlist must validate candidate variants within its HLS cache root"
+        );
+    }
+
+    #[actix_web::test]
+    async fn media_playlist_authorizes_relative_segments_for_native_hls() {
+        // Native Safari/OS HLS does not have hls.js xhrSetup to append the
+        // loopback bearer token to a relative segment URL.
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-native-hls-auth-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = Arc::new(TranscodeManager::new(root.clone()));
+        let dir = root.join(HLS_DIR).join("qa-native").join("360p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nsegment_000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("segment_000.ts"), b"synthetic-segment").unwrap();
+        let token = "qa a&b+#?=";
+        let encoded = urlencoding::encode(token);
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(web::Data::new(manager))
+                .app_data(web::Data::new(StreamTokenData {
+                    token: token.into(),
+                }))
+                .service(hls_playlist)
+                .service(hls_segment),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/hls/qa-native/360p/index.m3u8?token={encoded}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let bytes = actix_web::test::read_body(response).await;
+        let playlist = std::str::from_utf8(&bytes).unwrap();
+        let segment_uri = playlist
+            .lines()
+            .find(|line| line.starts_with("segment_"))
+            .unwrap();
+        assert!(
+            segment_uri.starts_with("segment_000.ts?token="),
+            "native HLS playlist must authorize its child segment requests"
+        );
+        assert_eq!(
+            segment_uri.split_once("?token=").unwrap().1,
+            encoded.as_ref(),
+            "native HLS token must be percent-encoded without corruption"
+        );
+        let segment_path = format!("/hls/qa-native/360p/{segment_uri}");
+        let segment = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&segment_path)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(segment.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(
+            &actix_web::test::read_body(segment).await[..],
+            b"synthetic-segment"
+        );
+        let anonymous = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/hls/qa-native/360p/segment_000.ts")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(anonymous.status(), actix_web::http::StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_hls_manifest_rejects_uncontained_and_keyed_media_references() {
+        let token = "qa a&b+#?=";
+        assert!(authenticated_hls_media_playlist(
+            "#EXTM3U\n#EXTINF:4.0,\nhttps://example.invalid/segment_000.ts\n",
+            token,
+        )
+        .is_none());
+        assert!(authenticated_hls_media_playlist(
+            "#EXTM3U\n#EXTINF:4.0,\n../segment_000.ts\n",
+            token,
+        )
+        .is_none());
+        assert!(authenticated_hls_media_playlist(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=key.bin\n",
+            token,
+        )
+        .is_none());
+        let body = authenticated_hls_media_playlist(
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_001.ts\n#EXT-X-ENDLIST\n",
+            token,
+        )
+        .unwrap();
+        assert!(body.contains(&format!(
+            "segment_001.ts?token={}",
+            urlencoding::encode(token)
+        )));
+    }
+
+    #[actix_web::test]
+    async fn master_hls_playlist_never_advertises_an_incomplete_variant() {
+        // FFmpeg creates index.m3u8 while still writing the segment files.
+        // Exposing that index through the master playlist is false readiness.
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-incomplete-master-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = Arc::new(TranscodeManager::new(root.clone()));
+        let quality = root.join(HLS_DIR).join("qa-incomplete").join("360p");
+        std::fs::create_dir_all(&quality).unwrap();
+        std::fs::write(
+            quality.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n",
+        )
+        .unwrap();
+        std::fs::write(quality.join("segment_000.ts"), b"in-progress").unwrap();
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(web::Data::new(manager))
+                .app_data(web::Data::new(StreamTokenData {
+                    token: "qa-master-private-token".into(),
+                }))
+                .service(hls_master_playlist),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/hls/qa-incomplete/master.m3u8?token=qa-master-private-token")
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::NOT_FOUND,
+            "master HLS advertised an incomplete FFmpeg output as a playable quality"
+        );
+    }
+
+    #[actix_web::test]
+    async fn master_hls_playlist_still_lists_valid_contained_variants() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-master-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = Arc::new(TranscodeManager::new(root.clone()));
+        let quality_dir = root.join(HLS_DIR).join("qa-valid").join("360p");
+        std::fs::create_dir_all(&quality_dir).unwrap();
+        std::fs::write(
+            quality_dir.join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:4.0,\nsegment_000.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        std::fs::write(quality_dir.join("segment_000.ts"), b"completed-vod-segment").unwrap();
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(web::Data::new(manager))
+                .app_data(web::Data::new(StreamTokenData {
+                    token: "qa a&b+#?=".into(),
+                }))
+                .service(hls_master_playlist),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/hls/qa-valid/master.m3u8?token={}",
+                    urlencoding::encode("qa a&b+#?=")
+                ))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = actix_web::test::read_body(response).await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(status, actix_web::http::StatusCode::OK);
+        let manifest = String::from_utf8_lossy(&body);
+        assert!(
+            manifest.contains(&format!(
+                "360p/index.m3u8?token={}",
+                urlencoding::encode("qa a&b+#?=")
+            )),
+            "native master HLS playlist must authorize its child quality manifest"
+        );
+    }
+
+    #[actix_web::test]
+    async fn hls_segment_respects_byte_ranges_and_rejects_invalid_ranges() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-range-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        let manager = TranscodeManager::new(root.clone());
+        let file = root
+            .join(HLS_DIR)
+            .join("qa-segment")
+            .join("360p")
+            .join("chunk0.ts");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"abcdefghij").unwrap();
+        let query = HlsQuery {
+            token: Some("isolated-hls-test-token".into()),
+        };
+        let token_data = StreamTokenData {
+            token: "isolated-hls-test-token".into(),
+        };
+        let request = actix_web::test::TestRequest::default()
+            .insert_header(("Range", "bytes=2-5"))
+            .to_http_request();
+        let response = serve_hls_file(
+            request.clone(),
+            "qa-segment",
+            "360p",
+            Some("chunk0.ts"),
+            &query,
+            &manager,
+            &token_data,
+        )
+        .await
+        .respond_to(&request);
+        let status = response.status();
+        let cache_header = response
+            .headers()
+            .get("Cache-Control")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let range_header = response
+            .headers()
+            .get("Content-Range")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .ok()
+            .expect("HLS response body was unreadable");
+
+        let invalid_request = actix_web::test::TestRequest::default()
+            .insert_header(("Range", "bytes=30-"))
+            .to_http_request();
+        let invalid = serve_hls_file(
+            invalid_request.clone(),
+            "qa-segment",
+            "360p",
+            Some("chunk0.ts"),
+            &query,
+            &manager,
+            &token_data,
+        )
+        .await
+        .respond_to(&invalid_request);
+        let invalid_status = invalid.status();
+        let invalid_range = invalid
+            .headers()
+            .get("Content-Range")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(status, actix_web::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cache_header.as_deref(),
+            Some("private, max-age=3600"),
+            "token-protected HLS bytes may use a private client cache, not a shared public cache"
+        );
+        assert_eq!(range_header.as_deref(), Some("bytes 2-5/10"));
+        assert_eq!(body.as_ref(), b"cdef");
+        assert_eq!(
+            invalid_status,
+            actix_web::http::StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(invalid_range.as_deref(), Some("bytes */10"));
     }
 }

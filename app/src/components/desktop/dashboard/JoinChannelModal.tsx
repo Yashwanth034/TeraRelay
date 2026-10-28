@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link2, Loader2, X } from 'lucide-react';
 import { useEscapeToClose } from '../../../hooks/useEscapeToClose';
 
@@ -12,6 +12,36 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
     const [invite, setInvite] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const dialogRef = useRef<HTMLFormElement>(null);
+    const submitPendingRef = useRef(false);
+
+    const closeIfIdle = () => {
+        if (!submitPendingRef.current) onClose();
+    };
+
+    const trapJoinDialogTab = (event: React.KeyboardEvent<HTMLFormElement>) => {
+        if (event.key !== 'Tab') return;
+        const dialog = dialogRef.current;
+        if (!dialog) return;
+        const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        )).filter(element => element.getClientRects().length > 0);
+        if (focusable.length === 0) {
+            event.preventDefault();
+            dialog.focus();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !dialog.contains(active))) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
 
     useEffect(() => {
         if (!open) {
@@ -21,15 +51,16 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
         }
     }, [open]);
 
-    useEscapeToClose(open, onClose, busy);
+    useEscapeToClose(open, closeIfIdle, busy);
 
     if (!open) return null;
 
     const submit = async (event: React.FormEvent) => {
         event.preventDefault();
         const value = invite.trim();
-        if (!value || busy) return;
-
+        if (!value || submitPendingRef.current) return;
+        // Ref changes synchronously, before React's busy-state render.
+        submitPendingRef.current = true;
         setBusy(true);
         setError(null);
         try {
@@ -38,6 +69,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
         } catch (e) {
             setError(String(e).replace(/^Error:\s*/i, ''));
         } finally {
+            submitPendingRef.current = false;
             setBusy(false);
         }
     };
@@ -46,11 +78,18 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
         <div
             className="tr-modal-backdrop fixed inset-0 z-[240] flex items-center justify-center p-4"
             onMouseDown={(e) => {
-                if (e.target === e.currentTarget && !busy) onClose();
+                if (e.target === e.currentTarget) closeIfIdle();
             }}
         >
             <form
+                ref={dialogRef}
+                tabIndex={-1}
+                onKeyDown={trapJoinDialogTab}
                 onSubmit={submit}
+                aria-busy={busy}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="tr-join-channel-title"
                 className="tr-modal w-full max-w-[500px] overflow-hidden"
             >
                 <div className="tr-modal-header px-5 py-4 flex items-center justify-between">
@@ -59,7 +98,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                             <Link2 className="w-4 h-4 text-telegram-primary" />
                         </div>
                         <div className="min-w-0">
-                            <h2 className="text-sm font-semibold text-telegram-text">Join TeraRelay Channel</h2>
+                            <h2 id="tr-join-channel-title" className="text-sm font-semibold text-telegram-text">Join TeraRelay Channel</h2>
                             <p className="text-[11px] text-telegram-subtext mt-0.5">
                                 Paste the TeraRelay invite sent by the channel owner.
                             </p>
@@ -67,7 +106,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                     </div>
                     <button
                         type="button"
-                        onClick={onClose}
+                        onClick={closeIfIdle}
                         disabled={busy}
                         className="tr-modal-close disabled:opacity-40"
                         aria-label="Close"
@@ -78,11 +117,14 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
 
                 <div className="p-5 space-y-4">
                     <div>
-                        <label className="tr-modal-label">
+                        <label htmlFor="tr-channel-invite" className="tr-modal-label">
                             Channel invite
                         </label>
                         <textarea
+                            id="tr-channel-invite"
+                            aria-label="Channel invite"
                             autoFocus
+                            disabled={busy}
                             value={invite}
                             onChange={(e) => {
                                 setInvite(e.target.value);
@@ -100,7 +142,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                     </div>
 
                     {error && (
-                        <div className="tr-modal-note tr-modal-note--danger break-words">
+                        <div role="alert" className="tr-modal-note tr-modal-note--danger break-words">
                             {error}
                         </div>
                     )}
@@ -108,7 +150,7 @@ export function JoinChannelModal({ open, onClose, onJoin }: Props) {
                     <div className="flex justify-end gap-2">
                         <button
                             type="button"
-                            onClick={onClose}
+                            onClick={closeIfIdle}
                             disabled={busy}
                             className="tr-button tr-button--secondary tr-button--md disabled:opacity-40"
                         >

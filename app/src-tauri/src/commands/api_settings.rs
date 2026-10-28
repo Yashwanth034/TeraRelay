@@ -95,7 +95,8 @@ pub async fn cmd_update_api_settings(
     }
 
     // Prevent collision with streaming server
-    if port == crate::STREAM_PORT {
+    let stream_port = app.state::<crate::commands::streaming::StreamConfig>().port;
+    if port == stream_port {
         return Err(format!(
             "Port {} is used by the media streaming server",
             port

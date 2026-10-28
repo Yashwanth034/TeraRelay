@@ -148,6 +148,12 @@ fn http_headers_indicate_direct_resource(
     if mime.starts_with("video/") || mime.starts_with("audio/") || mime.starts_with("image/") {
         return true;
     }
+    if matches!(
+        mime.as_str(),
+        "text/plain" | "text/csv" | "text/tab-separated-values" | "text/vtt"
+    ) {
+        return true;
+    }
     if !mime.starts_with("application/") {
         return false;
     }
@@ -280,9 +286,7 @@ fn disk_capacity_error(known_total: u64, existing_bytes: u64, available: u64) ->
     if remaining == 0 {
         return None;
     }
-    let required = remaining
-        .checked_add(REMOTE_IMPORT_DISK_HEADROOM)
-        .unwrap_or(u64::MAX);
+    let required = remaining.saturating_add(REMOTE_IMPORT_DISK_HEADROOM);
     if available < required {
         Some(format!(
             "Insufficient disk space for Remote Import: {} bytes remain to acquire and {} bytes are available",
@@ -482,37 +486,70 @@ fn executable_name(name: &str) -> String {
 }
 
 async fn command_version(path: &Path) -> Option<String> {
+    match command_version_diagnostic(path).await {
+        Ok(version) => Some(version),
+        Err(error) => {
+            log::warn!("Remote Import helper readiness failed: {error}");
+            None
+        }
+    }
+}
+
+async fn command_version_diagnostic(path: &Path) -> Result<String, String> {
     let version_flag = match path.file_stem().and_then(|name| name.to_str()) {
         Some("ffmpeg" | "ffprobe") => "-version",
         _ => "--version",
     };
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::process::Command::new(path)
-            .arg(version_flag)
-            .kill_on_drop(true)
-            .output(),
-    )
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        #[cfg(target_os = "linux")]
+        let mut attempts = 0;
+        loop {
+            #[cfg(target_os = "linux")]
+            {
+                attempts += 1;
+            }
+            let result = tokio::process::Command::new(path)
+                .arg(version_flag)
+                .kill_on_drop(true)
+                .output()
+                .await;
+            #[cfg(target_os = "linux")]
+            if let Err(error) = &result {
+                // Linux can briefly retain a writer after engine preparation.
+                // Retry only ETXTBSY; permission and format errors stay visible.
+                if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            }
+            break result;
+        }
+    })
     .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        Some("available".to_string())
-    } else {
-        Some(
-            value
-                .lines()
-                .next()
-                .unwrap_or("available")
-                .chars()
-                .take(120)
-                .collect(),
+    .map_err(|_| {
+        format!(
+            "Helper {} version check timed out after 5 seconds",
+            path.display()
         )
+    })?
+    .map_err(|error| format!("Could not start helper {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Helper {} version check failed ({}): {}",
+            path.display(),
+            output.status,
+            sanitize_engine_error(&String::from_utf8_lossy(&output.stderr))
+        ));
     }
+    let value = String::from_utf8_lossy(&output.stdout);
+    Ok(value
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("available")
+        .chars()
+        .take(120)
+        .collect())
 }
 
 fn managed_engine_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -573,27 +610,56 @@ async fn locate_engine(
     app_handle: Option<&tauri::AppHandle>,
     name: &str,
 ) -> Option<(PathBuf, String)> {
+    locate_engine_diagnostic(app_handle, name).await.ok()
+}
+
+async fn locate_engine_diagnostic(
+    app_handle: Option<&tauri::AppHandle>,
+    name: &str,
+) -> Result<(PathBuf, String), String> {
     let executable = executable_name(name);
+    let mut candidates = Vec::new();
+    let mut failures = Vec::new();
     if let Some(app) = app_handle {
         if name == "yt-dlp" {
             if let Ok(managed_dir) = managed_engine_dir(app) {
                 let managed = managed_dir.join(&executable);
                 if managed.is_file() {
-                    if let Some(version) = command_version(&managed).await {
-                        return Some((managed, version));
-                    }
+                    candidates.push(managed);
                 }
             }
         }
         if let Some(candidate) = bundled_engine_path(app, name) {
-            if let Some(version) = command_version(&candidate).await {
-                return Some((candidate, version));
+            candidates.push(candidate);
+        } else {
+            failures.push(match app.path().resource_dir() {
+                Ok(resource_dir) => format!(
+                    "No bundled '{name}' executable found under {}",
+                    resource_dir.display()
+                ),
+                Err(error) => {
+                    format!("Could not resolve the bundled engine resource directory: {error}")
+                }
+            });
+        }
+    }
+    candidates.push(PathBuf::from(&executable));
+    for candidate in candidates {
+        match command_version_diagnostic(&candidate).await {
+            Ok(version) => return Ok((candidate, version)),
+            Err(error) => {
+                if candidate.is_file() {
+                    log::warn!("Remote Import engine '{name}' readiness failed: {error}");
+                }
+                failures.push(error);
             }
         }
     }
-
-    let path = PathBuf::from(&executable);
-    command_version(&path).await.map(|version| (path, version))
+    Err(format!(
+        "{} Readiness checks: {}",
+        missing_engine_message(name),
+        failures.join("; ")
+    ))
 }
 
 pub fn missing_engine_message(name: &str) -> String {
@@ -698,9 +764,7 @@ async fn verify_processed_media_file(
     if !media_path_requires_probe(path) {
         return Ok(());
     }
-    let (ffprobe, _) = locate_engine(Some(app_handle), "ffprobe")
-        .await
-        .ok_or_else(|| missing_engine_message("ffprobe"))?;
+    let (ffprobe, _) = locate_engine_diagnostic(Some(app_handle), "ffprobe").await?;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new(ffprobe)
@@ -820,6 +884,12 @@ pub fn analysis_from_yt_dlp(
     } else {
         Vec::new()
     };
+    if qualities.is_empty() && items.is_empty() {
+        return Err(
+            "The extractor found no downloadable items or video qualities. Try a direct file URL."
+                .to_string(),
+        );
+    }
     Ok(RemoteImportAnalysis {
         source_kind,
         title,
@@ -1028,7 +1098,7 @@ pub async fn cmd_remote_import_analyze(
     net_config: State<'_, Arc<crate::vpn_optimizer::NetworkConfig>>,
 ) -> Result<RemoteImportAnalysis, String> {
     let source = source.trim().to_string();
-    let proxy = net_config.effective_proxy_url();
+    let proxy = net_config.effective_proxy_url_checked()?;
     let (source_kind, http_metadata) = resolve_source_kind(&source, proxy.as_deref()).await?;
     match source_kind {
         RemoteImportSourceKind::DirectFile => direct_file_analysis(&source, http_metadata.as_ref()),
@@ -1339,8 +1409,123 @@ fn emit_import_progress(
     );
 }
 
+static IMPORT_PROCESS_CLOSING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static IMPORT_PROCESSES: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+
+fn import_processes() -> &'static Mutex<std::collections::HashSet<u32>> {
+    IMPORT_PROCESSES.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn stop_import_process(pid: u32) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Every owned desktop helper starts in its own process group.
+    // Stop its descendants too, before staging cleanup or application exit.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let system = sysinfo::System::new_all();
+        let root = sysinfo::Pid::from_u32(pid);
+        let mut descendants = vec![root];
+        let mut index = 0;
+        while index < descendants.len() {
+            let parent = descendants[index];
+            for (child, process) in system.processes() {
+                if process.parent() == Some(parent) && !descendants.contains(child) {
+                    descendants.push(*child);
+                }
+            }
+            index += 1;
+        }
+        for child in descendants.into_iter().rev() {
+            if let Some(process) = system.process(child) {
+                process.kill();
+            }
+        }
+    }
+}
+
+struct ImportProcessGuard {
+    pid: u32,
+}
+impl ImportProcessGuard {
+    fn finish(&self) {
+        if let Ok(mut processes) = import_processes().lock() {
+            processes.remove(&self.pid);
+        }
+    }
+    fn stop(&self) {
+        if let Ok(mut processes) = import_processes().lock() {
+            if processes.remove(&self.pid) {
+                stop_import_process(self.pid);
+            }
+        }
+    }
+}
+impl Drop for ImportProcessGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// Fields drop in declaration order: stop the helper tree before dropping its waiter.
+struct OwnedImportOutput {
+    ownership: ImportProcessGuard,
+    output: std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<std::process::Output>> + Send>,
+    >,
+}
+
+fn spawn_import_command(mut command: tokio::process::Command) -> Result<OwnedImportOutput, String> {
+    if IMPORT_PROCESS_CLOSING.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("The application is closing; import remains recoverable".to_string());
+    }
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Remote Import engine: {error}"))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| "Remote Import engine has no process id".to_string())?;
+    let mut processes = import_processes()
+        .lock()
+        .map_err(|_| "Import process state is unavailable".to_string())?;
+    if IMPORT_PROCESS_CLOSING.load(std::sync::atomic::Ordering::Acquire) {
+        stop_import_process(pid);
+        return Err("The application is closing; import remains recoverable".to_string());
+    }
+    processes.insert(pid);
+    drop(processes);
+    Ok(OwnedImportOutput {
+        ownership: ImportProcessGuard { pid },
+        output: Box::pin(child.wait_with_output()),
+    })
+}
+
+pub fn shutdown_import_processes() {
+    IMPORT_PROCESS_CLOSING.store(true, std::sync::atomic::Ordering::Release);
+    if let Ok(map) = cancellation_map().lock() {
+        for sender in map.values() {
+            let _ = sender.send(true);
+        }
+    }
+    if let Ok(mut processes) = import_processes().lock() {
+        for pid in processes.drain() {
+            stop_import_process(pid);
+        }
+    }
+}
+
 async fn run_owned_command(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     app_handle: &tauri::AppHandle,
     job_id: &str,
     selection_id: &str,
@@ -1348,18 +1533,21 @@ async fn run_owned_command(
     total_hint: u64,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<std::process::Output, String> {
-    command.kill_on_drop(true);
-    let mut future = Box::pin(command.output());
+    let mut owned = spawn_import_command(command)?;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut last_bytes = directory_size(output_dir);
     let mut last_time = std::time::Instant::now();
     loop {
         tokio::select! {
-            result = &mut future => {
-                return result.map_err(|error| format!("Could not start Remote Import engine: {error}"));
+            result = &mut owned.output => {
+                if result.is_ok() { owned.ownership.finish(); }
+                else { owned.ownership.stop(); }
+                return result.map_err(|error| format!("Remote Import engine failed: {error}"));
             }
             changed = cancel_rx.changed() => {
                 if changed.is_err() || *cancel_rx.borrow() {
+                    owned.ownership.stop();
+                    let _ = (&mut owned.output).await;
                     return Err("Remote import cancelled".to_string());
                 }
             }
@@ -1626,10 +1814,10 @@ async fn acquire_with_yt_dlp(
             .arg("--remote-components")
             .arg("ejs:github");
     }
-    if locate_engine(Some(app_handle), "aria2c").await.is_some() {
+    if let Some((aria2, _)) = locate_engine(Some(app_handle), "aria2c").await {
         command
             .arg("--downloader")
-            .arg("aria2c")
+            .arg(aria2)
             .arg("--downloader-args")
             .arg("aria2c:-x8 -s8 -k1M --continue=true --file-allocation=none");
     }
@@ -1781,7 +1969,7 @@ pub async fn cmd_remote_import_acquire(
 ) -> Result<RemoteImportAcquireResult, String> {
     validate_job_id(&req.job_id)?;
     let source = req.source.trim().to_string();
-    let proxy = net_config.effective_proxy_url();
+    let proxy = net_config.effective_proxy_url_checked()?;
     let (source_kind, http_metadata) = resolve_source_kind(&source, proxy.as_deref()).await?;
     let job_dir = job_staging_dir(&app_handle, &req.job_id)?;
     tokio::fs::create_dir_all(&job_dir)
@@ -2006,6 +2194,23 @@ fn torrent_items_from_info(
 }
 
 #[cfg(not(target_os = "ios"))]
+fn tcp_only_torrent_options(fastresume: bool) -> librqbit::SessionOptions {
+    // librqbit 9 currently defaults to TCP-only; make that an explicit
+    // application invariant. Its transitive uTP transport uses an affected
+    // ringbuf release (RUSTSEC-2026-0293). Merely enabling a new upstream
+    // default must not activate the vulnerable transport unexpectedly.
+    // This is risk reduction, NOT a RustSec remediation or dependency patch.
+    librqbit::SessionOptions {
+        fastresume,
+        listen: Some(librqbit::ListenerOptions {
+            mode: librqbit::ListenerMode::TcpOnly,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 async fn torrent_session(
     root: PathBuf,
     persistence: bool,
@@ -2013,8 +2218,7 @@ async fn torrent_session(
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|error| format!("Could not create torrent staging directory: {error}"))?;
-    let mut options = librqbit::SessionOptions::default();
-    options.fastresume = persistence;
+    let mut options = tcp_only_torrent_options(persistence);
     if persistence {
         let state_dir = root.join(".rqbit-state");
         tokio::fs::create_dir_all(&state_dir)
@@ -2122,7 +2326,7 @@ async fn torrent_items_from_bytes_for_test(
     bytes: Vec<u8>,
     root: &Path,
 ) -> Result<Vec<RemoteImportItem>, String> {
-    let mut options = librqbit::SessionOptions::default();
+    let mut options = tcp_only_torrent_options(false);
     options.dht = None;
     options.disable_trackers = true;
     options.disable_local_service_discovery = true;
@@ -2158,6 +2362,32 @@ fn torrent_file_layout(
 }
 
 #[cfg(not(target_os = "ios"))]
+fn torrent_progress_phase(downloaded: u64, previous: u64, finished: bool) -> &'static str {
+    if !finished && downloaded <= previous {
+        "waiting_for_peers"
+    } else {
+        "downloading"
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn wait_for_torrent_step<T>(
+    future: impl std::future::Future<Output = Result<T, String>>,
+    mut cancel_rx: watch::Receiver<bool>,
+    timeout: std::time::Duration,
+    stage: &str,
+) -> Result<T, String> {
+    if *cancel_rx.borrow() {
+        return Err("Remote import cancelled".to_string());
+    }
+    tokio::select! {
+        biased;
+        _ = cancel_rx.changed() => Err("Remote import cancelled".to_string()),
+        result = tokio::time::timeout(timeout, future) => result.map_err(|_| format!("{stage} timed out"))?,
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 async fn acquire_torrent(
     source: &str,
     selections: &[RemoteImportSelection],
@@ -2171,31 +2401,41 @@ async fn acquire_torrent(
     tokio::fs::create_dir_all(&data_root)
         .await
         .map_err(|error| error.to_string())?;
+    emit_import_progress(
+        app_handle,
+        job_id,
+        "connecting",
+        0,
+        known_selection_total(selections).unwrap_or(0),
+        0,
+        None,
+    );
     let session = torrent_session(torrent_root.clone(), true).await?;
+    let result = async {
     let selected = torrent_selection_indices(selections)?;
     let options = torrent_download_options(selected.clone(), &data_root);
-    let add = torrent_add_source(source).await?;
-    let mut add_future = Box::pin(session.add_torrent(add, Some(options)));
-    let response = tokio::select! {
-        result = &mut add_future => result.map_err(|error| format!("Could not start torrent: {error}"))?,
-        changed = cancel_rx.changed() => {
-            session.stop().await;
-            if changed.is_err() || *cancel_rx.borrow() { return Err("Remote import cancelled".to_string()); }
-            return Err("Torrent cancellation channel closed".to_string());
-        }
-    };
+    let response = wait_for_torrent_step(
+        async {
+            let add = torrent_add_source(source).await?;
+            session.add_torrent(add, Some(options)).await.map_err(|error| format!("Could not start torrent: {error}"))
+        },
+        cancel_rx.clone(),
+        std::time::Duration::from_secs(120),
+        "Torrent metadata discovery",
+    ).await?;
     let handle = response.into_handle().ok_or_else(|| {
         "Torrent engine returned metadata without starting the download".to_string()
     })?;
-    handle
-        .wait_until_initialized()
-        .await
-        .map_err(|error| format!("Torrent initialization failed: {error}"))?;
+    wait_for_torrent_step(
+        async { handle.wait_until_initialized().await.map_err(|error| format!("Torrent initialization failed: {error}")) },
+        cancel_rx.clone(),
+        std::time::Duration::from_secs(120),
+        "Torrent initialization",
+    ).await?;
     let layout = torrent_file_layout(&handle)?;
     let available: std::collections::HashSet<usize> =
         layout.iter().map(|(index, _, _)| *index).collect();
     if selected.iter().any(|index| !available.contains(index)) {
-        session.stop().await;
         return Err("Selected torrent file no longer exists in this torrent".to_string());
     }
 
@@ -2207,19 +2447,17 @@ async fn acquire_torrent(
         tokio::select! {
             result = &mut completion => { result.map_err(|error| format!("Torrent download failed: {error}"))?; break; }
             changed = cancel_rx.changed() => {
-                session.stop().await;
-                if changed.is_err() || *cancel_rx.borrow() { return Err("Remote import cancelled".to_string()); }
+                        if changed.is_err() || *cancel_rx.borrow() { return Err("Remote import cancelled".to_string()); }
             }
             _ = interval.tick() => {
                 let stats = handle.stats();
                 if let Some(error) = stats.error.as_deref() {
-                    session.stop().await;
-                    return Err(format!("Torrent download failed: {}", normalize_engine_error(error)));
+                                return Err(format!("Torrent download failed: {}", normalize_engine_error(error)));
                 }
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(last_time).as_secs_f64();
                 let speed = if elapsed > 0.0 { (stats.progress_bytes.saturating_sub(last_bytes) as f64 / elapsed) as u64 } else { 0 };
-                emit_import_progress(app_handle, job_id, "downloading", stats.progress_bytes, stats.total_bytes, speed, None);
+                emit_import_progress(app_handle, job_id, torrent_progress_phase(stats.progress_bytes, last_bytes, stats.finished), stats.progress_bytes, stats.total_bytes, speed, None);
                 last_bytes = stats.progress_bytes;
                 last_time = now;
             }
@@ -2249,11 +2487,15 @@ async fn acquire_torrent(
             None,
         )?);
     }
-    session.stop().await;
     if outputs.is_empty() {
         return Err("Torrent completed but no selected files were found".to_string());
     }
     Ok(outputs)
+    }.await;
+    // All acquisition futures have been dropped before shutting down the owned session.
+    // Keep staging and resume data for a later retry.
+    session.stop().await;
+    result
 }
 
 #[cfg(test)]
@@ -2261,9 +2503,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn torrent_sessions_explicitly_disable_utp_even_if_library_defaults_change() {
+        for fastresume in [false, true] {
+            let options = tcp_only_torrent_options(fastresume);
+            assert_eq!(options.fastresume, fastresume);
+            let listener = options
+                .listen
+                .as_ref()
+                .expect("torrent TCP listener required");
+            assert!(
+                listener.mode.tcp_enabled(),
+                "peer TCP must remain functional"
+            );
+            assert!(
+                !listener.mode.utp_enabled(),
+                "affected librqbit-utp/ringbuf transport must not run until fixed"
+            );
+            assert!(listener.utp_opts.is_none());
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ffmpeg_helpers_are_available_with_their_native_version_flag() {
+        let _ = env_logger::builder().is_test(true).try_init();
         use std::os::unix::fs::PermissionsExt;
         let root =
             std::env::temp_dir().join(format!("terarelay-version-probe-{}", rand::random::<u64>()));
@@ -2291,6 +2556,7 @@ printf '%s\n' 'FFmpeg helper version fixture'
     #[cfg(unix)]
     #[tokio::test]
     async fn other_engines_keep_their_double_dash_version_flag() {
+        let _ = env_logger::builder().is_test(true).try_init();
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "terarelay-other-version-probe-{}",
@@ -2313,6 +2579,260 @@ printf '%s\n' 'Other engine version fixture'
                 Some("Other engine version fixture")
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_helper_start_failure_reports_the_os_error() {
+        let root =
+            std::env::temp_dir().join(format!("terarelay-start-failure-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ffprobe");
+        std::fs::write(&path, b"not an executable").unwrap();
+        let error = command_version_diagnostic(&path).await.unwrap_err();
+        assert!(error.contains("Could not start"), "{error}");
+        assert!(error.contains("Permission denied"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helper_version_failure_reports_exit_status_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("terarelay-exit-failure-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ffprobe");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' 'helper is incompatible' >&2\nexit 42\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = command_version_diagnostic(&path).await.unwrap_err();
+        assert!(error.contains("42"), "{error}");
+        assert!(error.contains("helper is incompatible"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_readiness_recovers_from_transient_text_file_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("terarelay-busy-helper-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ffprobe");
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' 'busy helper fixture'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let release_writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            drop(writer);
+        });
+        let result = command_version_diagnostic(&path).await;
+        release_writer.await.unwrap();
+        assert_eq!(result.unwrap(), "busy helper fixture");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn torrent_progress_reports_waiting_until_bytes_advance() {
+        assert_eq!(torrent_progress_phase(0, 0, false), "waiting_for_peers");
+        assert_eq!(torrent_progress_phase(512, 0, false), "downloading");
+        assert_eq!(torrent_progress_phase(512, 512, false), "waiting_for_peers");
+        assert_eq!(torrent_progress_phase(512, 512, true), "downloading");
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[tokio::test]
+    async fn torrent_metadata_wait_observes_cancellation() {
+        let (sender, receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            wait_for_torrent_step(
+                std::future::pending::<Result<(), String>>(),
+                receiver,
+                std::time::Duration::from_secs(120),
+                "Torrent metadata discovery",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        sender.send(true).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), task)
+            .await
+            .expect("metadata wait must stop on cancellation")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "Remote import cancelled");
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[tokio::test]
+    async fn torrent_initialization_wait_has_a_bounded_timeout() {
+        let (_sender, receiver) = watch::channel(false);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_torrent_step(
+                std::future::pending::<Result<(), String>>(),
+                receiver,
+                std::time::Duration::from_millis(5),
+                "Torrent initialization",
+            ),
+        )
+        .await
+        .expect("initialization timeout must be enforced");
+        assert_eq!(result.unwrap_err(), "Torrent initialization timed out");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn import_shutdown_stops_descendant_writers_and_preserves_unrelated_processes() {
+        struct ResetClosing;
+        impl Drop for ResetClosing {
+            fn drop(&mut self) {
+                IMPORT_PROCESS_CLOSING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetClosing;
+        let root =
+            std::env::temp_dir().join(format!("terarelay-child-stop-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("descendant-writes.bin");
+        let script = r#"import subprocess,sys,time
+code="""import sys,time
+with open(sys.argv[1],"ab",buffering=0) as f:
+ while True:
+  f.write(b"x")
+  time.sleep(.01)
+"""
+subprocess.Popen([sys.executable,"-c",code,sys.argv[1]])
+while True: time.sleep(.1)
+"#;
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-c", script]).arg(&marker);
+        let mut owned = spawn_import_command(command).unwrap();
+        struct CleanupOnFailure(u32);
+        impl Drop for CleanupOnFailure {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    unsafe {
+                        libc::kill(-(self.0 as i32), libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _cleanup = CleanupOnFailure(owned.ownership.pid);
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("10")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if std::fs::metadata(&marker).is_ok_and(|value| value.len() > 2) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_import_processes();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), &mut owned.output)
+            .await
+            .expect("Owned child pipes must close")
+            .unwrap();
+        assert!(!result.status.success());
+        let length = std::fs::metadata(&marker).unwrap().len();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            std::fs::metadata(&marker).unwrap().len(),
+            length,
+            "An orphan helper kept writing after shutdown"
+        );
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "Shutdown killed an unrelated process"
+        );
+        unrelated.kill().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plain_text_and_csv_urls_are_files_without_a_filename_extension() {
+        assert!(http_headers_indicate_direct_resource(
+            Some("text/plain; charset=utf-8"),
+            None
+        ));
+        assert!(http_headers_indicate_direct_resource(
+            Some("text/csv"),
+            None
+        ));
+        assert!(!http_headers_indicate_direct_resource(
+            Some("text/html"),
+            None
+        ));
+        assert!(!http_headers_indicate_direct_resource(
+            Some("application/xhtml+xml"),
+            None
+        ));
+        let metadata =
+            serde_json::json!({"title": "Empty page", "extractor_key": "Generic", "formats": []});
+        assert!(
+            analysis_from_yt_dlp(RemoteImportSourceKind::WebMedia, &metadata).is_err(),
+            "Empty analysis must not look ready"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "Requires prepared packaged Remote Import binaries"]
+    async fn bundled_helpers_execute_and_verify_real_media() {
+        let engines = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/remote-import");
+        for name in ["ffmpeg", "ffprobe", "yt-dlp", "deno", "aria2c"] {
+            command_version_diagnostic(&engines.join(name))
+                .await
+                .unwrap();
+        }
+        let root =
+            std::env::temp_dir().join(format!("terarelay-real-media-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.wav");
+        let generated = tokio::process::Command::new(engines.join("ffmpeg"))
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.1",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let probed = tokio::process::Command::new(engines.join("ffprobe"))
+            .args(["-v", "error", "-show_streams", "-of", "json", "--"])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            probed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probed.stderr)
+        );
+        assert!(ffprobe_output_has_media_stream(
+            &serde_json::from_slice::<Value>(&probed.stdout).unwrap()
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2623,6 +3143,11 @@ mod acquisition_tests {
         let error = disk_capacity_error(100, 40, 59 + REMOTE_IMPORT_DISK_HEADROOM).unwrap();
         assert!(error.to_ascii_lowercase().contains("disk space"));
         assert!(disk_capacity_error(100, 100, REMOTE_IMPORT_DISK_HEADROOM).is_none());
+        // Saturating headroom arithmetic must never wrap into a false
+        // "enough space" result close to the u64 byte-count ceiling.
+        assert!(disk_capacity_error(u64::MAX, 0, u64::MAX - 1).is_some());
+        assert!(disk_capacity_error(u64::MAX, 0, u64::MAX).is_none());
+        assert!(disk_capacity_error(u64::MAX, u64::MAX, 0).is_none());
     }
 
     #[tokio::test]

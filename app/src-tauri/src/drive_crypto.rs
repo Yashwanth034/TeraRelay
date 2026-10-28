@@ -78,16 +78,21 @@ pub fn load_crypto_envelope(
     ) {
         return Ok(None);
     }
-    let raw = stmt
-        .read::<Option<String>, _>(0)
-        .ok()
-        .flatten()
-        .filter(|value| !value.trim().is_empty());
-    raw.map(|value| {
-        serde_json::from_str(&value)
-            .map_err(|e| format!("Invalid TeraRelay Drive encryption metadata: {e}"))
-    })
-    .transpose()
+    // Only SQL NULL represents an unconfigured Drive. An invalid storage
+    // type or empty metadata must never make an existing encryption setup
+    // look absent, especially while synchronizing remote manifests.
+    let raw = match stmt
+        .read::<sqlite::Value, _>(0)
+        .map_err(|e| format!("Invalid TeraRelay Drive encryption metadata: {e}"))?
+    {
+        sqlite::Value::Null => return Ok(None),
+        sqlite::Value::String(value) if !value.trim().is_empty() => value,
+        _ => return Err("Invalid TeraRelay Drive encryption metadata type or value".into()),
+    };
+    let envelope: DriveCryptoEnvelope = serde_json::from_str(&raw)
+        .map_err(|e| format!("Invalid TeraRelay Drive encryption metadata: {e}"))?;
+    validate_envelope_metadata(&envelope)?;
+    Ok(Some(envelope))
 }
 
 pub fn save_crypto_envelope(
@@ -228,7 +233,7 @@ pub fn load_verified_master_key(
     let Some(key) = load_master_key(app)? else {
         return Ok(None);
     };
-    if master_key_matches_envelope(&*key, envelope)? {
+    if master_key_matches_envelope(&key, envelope)? {
         Ok(Some(key))
     } else {
         Ok(None)
@@ -245,6 +250,54 @@ pub fn load_verified_master_key_for_db(
     load_verified_master_key(app, &envelope)
 }
 
+/// All released Drive writers use 64 MiB / three iterations / one lane.
+/// Accept a bounded range for migration, but never let a remote or corrupt
+/// envelope allocate arbitrary memory or consume unbounded CPU on unlock.
+pub(crate) fn validate_envelope_kdf_cost(envelope: &DriveCryptoEnvelope) -> Result<(), String> {
+    if !(8 * 1024..=128 * 1024).contains(&envelope.memory_kib)
+        || !(1..=8).contains(&envelope.iterations)
+        || !(1..=4).contains(&envelope.parallelism)
+    {
+        return Err("Drive encryption key derivation parameters exceed safe limits".to_string());
+    }
+    Ok(())
+}
+
+/// Decode and bound untrusted key-envelope fields before accepting remote
+/// metadata or a persisted local record. Legacy envelopes without the
+/// optional master-key verifier remain supported.
+pub(crate) fn validate_envelope_metadata(envelope: &DriveCryptoEnvelope) -> Result<(), String> {
+    if envelope.version != DRIVE_ENCRYPTION_VERSION || envelope.updated_at < 0 {
+        return Err("Unsupported or invalid Drive encryption metadata".into());
+    }
+    validate_envelope_kdf_cost(envelope)?;
+    for (label, encoded, expected_len) in [
+        ("salt", envelope.salt_b64.as_str(), 16usize),
+        ("nonce", envelope.nonce_b64.as_str(), 24),
+        (
+            "wrapped master key",
+            envelope.wrapped_master_key_b64.as_str(),
+            48,
+        ),
+    ] {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| format!("Invalid Drive encryption {label} encoding"))?;
+        if decoded.len() != expected_len {
+            return Err(format!("Invalid Drive encryption {label} length"));
+        }
+    }
+    if let Some(encoded) = envelope.key_check_b64.as_deref() {
+        let verifier = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "Invalid Drive encryption verifier encoding".to_string())?;
+        if verifier.len() != 32 {
+            return Err("Invalid Drive encryption verifier length".into());
+        }
+    }
+    Ok(())
+}
+
 fn derive_wrap_key(
     passphrase: &str,
     envelope: &DriveCryptoEnvelope,
@@ -252,6 +305,7 @@ fn derive_wrap_key(
     if passphrase.len() < 12 {
         return Err("Drive passphrase must contain at least 12 characters".to_string());
     }
+    validate_envelope_kdf_cost(envelope)?;
     let salt = base64::engine::general_purpose::STANDARD
         .decode(&envelope.salt_b64)
         .map_err(|e| format!("Drive encryption salt is invalid: {e}"))?;
@@ -541,7 +595,7 @@ pub fn cmd_drive_crypto_unlock(
             .ok_or_else(|| "TeraRelay Drive encryption is not configured".to_string())?
     };
     let master_key = unwrap_master_key(&passphrase, &envelope)?;
-    save_master_key(&app_handle, &*master_key)?;
+    save_master_key(&app_handle, &master_key)?;
     cmd_drive_crypto_status(app_handle, db_pool)
 }
 
@@ -564,8 +618,8 @@ pub async fn cmd_drive_crypto_change_passphrase(
             .ok_or_else(|| "TeraRelay Drive encryption is not configured".to_string())?
     };
     let master_key = unwrap_master_key(&current_passphrase, &envelope)?;
-    let new_envelope = new_envelope(&new_passphrase, &*master_key)?;
-    save_master_key(&app_handle, &*master_key)?;
+    let new_envelope = new_envelope(&new_passphrase, &master_key)?;
+    save_master_key(&app_handle, &master_key)?;
     {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         save_crypto_envelope(&conn, Some(&new_envelope))?;
@@ -598,6 +652,54 @@ pub fn cmd_drive_crypto_lock(
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    #[test]
+    fn malformed_persisted_envelope_must_not_look_like_unconfigured_encryption() {
+        let conn = sqlite::open(":memory:").unwrap();
+        init_crypto_schema(&conn).unwrap();
+        assert!(load_crypto_envelope(&conn).unwrap().is_none());
+
+        let envelope = DriveCryptoEnvelope {
+            version: DRIVE_ENCRYPTION_VERSION,
+            updated_at: 7,
+            salt_b64: base64::engine::general_purpose::STANDARD.encode([1u8; 16]),
+            nonce_b64: base64::engine::general_purpose::STANDARD.encode([2u8; 24]),
+            wrapped_master_key_b64: base64::engine::general_purpose::STANDARD.encode([3u8; 48]),
+            key_check_b64: None,
+            memory_kib: ARGON_MEMORY_KIB,
+            iterations: ARGON_ITERATIONS,
+            parallelism: ARGON_PARALLELISM,
+        };
+        save_crypto_envelope(&conn, Some(&envelope)).unwrap();
+        assert_eq!(load_crypto_envelope(&conn).unwrap(), Some(envelope.clone()));
+
+        for malformed in ["X'FF'", "123", "''", "'   '"] {
+            conn.execute(format!(
+                "UPDATE drive_crypto_state SET envelope_json={malformed} WHERE singleton=1"
+            ))
+            .unwrap();
+            assert!(
+                load_crypto_envelope(&conn).is_err(),
+                "malformed crypto envelope {malformed} cannot downgrade configured encryption"
+            );
+        }
+
+        save_crypto_envelope(&conn, Some(&envelope)).unwrap();
+        assert_eq!(load_crypto_envelope(&conn).unwrap(), Some(envelope.clone()));
+
+        let mut dangerous = envelope.clone();
+        dangerous.memory_kib = 1024 * 1024;
+        save_crypto_envelope(&conn, Some(&dangerous)).unwrap();
+        assert!(
+            load_crypto_envelope(&conn).is_err(),
+            "persisted key-derivation settings must not request unsafe memory"
+        );
+
+        save_crypto_envelope(&conn, Some(&envelope)).unwrap();
+        assert_eq!(load_crypto_envelope(&conn).unwrap(), Some(envelope));
+        save_crypto_envelope(&conn, None).unwrap();
+        assert!(load_crypto_envelope(&conn).unwrap().is_none());
+    }
 
     #[test]
     fn passphrase_wrap_round_trip_and_wrong_password_rejected() {

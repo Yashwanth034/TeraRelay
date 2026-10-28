@@ -191,12 +191,13 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
 
     return (
         <div className="fixed inset-0 z-[150] bg-black/90 flex items-center justify-center p-4 backdrop-blur-sm" onClick={onClose}>
-            <div className="relative max-w-5xl w-full max-h-screen flex flex-col items-center justify-center" onClick={e => e.stopPropagation()}>
+            <div className="relative max-w-5xl w-full max-h-screen flex flex-col items-center justify-center" role="dialog" aria-modal="true" aria-label={`Preview: ${file.name}`} onClick={e => e.stopPropagation()}>
                 <button
                     onClick={onPrev}
                     className="absolute left-2 top-1/2 -translate-y-1/2 p-2 bg-black/60 hover:bg-black/80 rounded-full transition-colors"
                     style={{ color: '#ffffff' }}
                     title="Previous (ArrowLeft / J)"
+                    aria-label="Previous file"
                 >
                     <ChevronLeft className="w-6 h-6" />
                 </button>
@@ -206,12 +207,14 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                     className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-black/60 hover:bg-black/80 rounded-full transition-colors"
                     style={{ color: '#ffffff' }}
                     title="Next (ArrowRight / L)"
+                    aria-label="Next file"
                 >
                     <ChevronRight className="w-6 h-6" />
                 </button>
 
                 <button
                     onClick={onClose}
+                    aria-label="Close preview"
                     className="absolute -top-12 right-0 p-2 bg-black/60 hover:bg-black/80 rounded-full transition-colors"
                     style={{ color: '#ffffff' }}
                 >

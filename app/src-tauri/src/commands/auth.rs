@@ -16,6 +16,61 @@ use crate::models::AuthResult;
 use crate::TelegramState;
 use grammers_client::SignInError;
 
+/// Convert a SOCKS proxy endpoint to a numeric address before Grammers sees it.
+/// The pinned Grammers proxy implementation otherwise invokes the vulnerable
+/// Hickory 0.25 DNS encoder for a hostname proxy. Only the *proxy endpoint* is
+/// resolved locally; SOCKS requests for Telegram destinations remain proxied.
+/// This reduces exposure, but does not patch or remove RustSec advisories.
+fn proxy_url_with_ip_host(proxy_url: &str, address: std::net::IpAddr) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(proxy_url)
+        .map_err(|_| "Configured Telegram proxy URL is invalid".to_string())?;
+    if url.scheme() != "socks5" || url.host_str().is_none() || url.port().is_none() {
+        return Err("Configured Telegram proxy must be SOCKS5 with a port".into());
+    }
+    let host = match address {
+        std::net::IpAddr::V4(ipv4) => ipv4.to_string(),
+        std::net::IpAddr::V6(ipv6) => format!("[{ipv6}]"),
+    };
+    url.set_host(Some(&host))
+        .map_err(|_| "Could not encode numeric Telegram proxy endpoint".to_string())?;
+    Ok(url.to_string())
+}
+
+pub(crate) async fn resolve_telegram_proxy_url(proxy_url: String) -> Result<String, String> {
+    let url = reqwest::Url::parse(&proxy_url)
+        .map_err(|_| "Configured Telegram proxy URL is invalid".to_string())?;
+    if url.scheme() != "socks5" {
+        return Err("Configured Telegram proxy must use SOCKS5".into());
+    }
+    let host = url.host_str().ok_or("Telegram proxy hostname is missing")?;
+    let port = url.port().ok_or("Telegram proxy port is missing")?;
+    // A numeric proxy address never enters DNS resolution in Grammers.
+    if host
+        .trim_matches(&['[', ']'][..])
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        return Ok(proxy_url);
+    }
+
+    // Use Tokio's system getaddrinfo resolver rather than Grammers' pinned
+    // Hickory resolver; keep it bounded, with no unsafe DNS fallback.
+    let addresses = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| "Timed out resolving Telegram proxy endpoint".to_string())?
+    .map_err(|_| "Could not resolve Telegram proxy endpoint".to_string())?;
+    let addresses: Vec<_> = addresses.collect();
+    let address = addresses
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| addresses.first())
+        .ok_or("Telegram proxy endpoint has no usable IP address")?;
+    proxy_url_with_ip_host(&proxy_url, address.ip())
+}
+
 /// Ensures the Telegram client is initialized.
 ///
 /// IMPORTANT: This function properly manages runner lifecycle to prevent stack overflow.
@@ -129,9 +184,12 @@ pub async fn ensure_client_initialized(
     }
 
     let mut connection_params = grammers_mtsender::ConnectionParams::default();
-    if let Some(proxy_url) = net_config.effective_proxy_url() {
-        log::info!("Using proxy: {}", proxy_url);
-        connection_params.proxy_url = Some(proxy_url);
+    if let Some(proxy_url) = net_config.effective_proxy_url_checked()? {
+        // Never log URLs with embedded SOCKS5 credentials. Resolve only the
+        // proxy host with the OS before giving a URL to pinned Grammers.
+        let resolved = resolve_telegram_proxy_url(proxy_url).await?;
+        log::info!("Using configured Telegram SOCKS5 proxy");
+        connection_params.proxy_url = Some(resolved);
     }
 
     let session = Arc::new(session);
@@ -162,6 +220,56 @@ pub async fn ensure_client_initialized(
     Ok(client)
 }
 
+/// Startup-only session discovery. Never opens, creates, or changes the
+/// Telegram SQLite database. A missing or empty file means there is no saved
+/// account to restore; temporary network failures must NOT be treated as logout.
+fn saved_session_exists(app_handle: &tauri::AppHandle) -> Result<bool, String> {
+    let path = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not locate Telegram session: {e}"))?
+        .join("telegram.session");
+    saved_session_file_present(&path)
+}
+
+fn saved_session_file_present(path: &std::path::Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Could not inspect saved Telegram session: {error}")),
+    }
+}
+
+#[tauri::command]
+pub fn cmd_saved_telegram_session_exists(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    saved_session_exists(&app_handle)
+}
+
+/// Both the visible UI and Linux background startup call this same operation.
+/// The client initialization lock deduplicates their work; unlike the older
+/// cmd_check_connection recovery path this never drops a live client on a
+/// transient failed get_me() ping.
+#[tauri::command]
+pub async fn cmd_restore_saved_telegram_session(
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    api_id: i32,
+) -> Result<bool, String> {
+    if api_id <= 0 {
+        return Err("Invalid saved Telegram API ID".into());
+    }
+    if !saved_session_exists(&app_handle)? {
+        return Ok(false);
+    }
+    *state.api_id.lock().await = Some(api_id);
+    let client = ensure_client_initialized(&app_handle, &state, api_id).await?;
+    client
+        .get_me()
+        .await
+        .map(|_| true)
+        .map_err(|error| format!("Saved Telegram connection is not ready: {error}"))
+}
+
 #[tauri::command]
 pub async fn cmd_connect(
     app_handle: tauri::AppHandle,
@@ -190,7 +298,11 @@ pub async fn cmd_check_connection(
         if client.get_me().await.is_ok() {
             return Ok(true);
         }
-        log::warn!("Connection check failed (get_me). Attempting reconnect...");
+        // A failed ping does NOT mean logout. Do not discard the client or
+        // replace its runner while a separate startup/Drive task is using it.
+        return Err(
+            "Telegram is temporarily unreachable; the existing saved session was preserved.".into(),
+        );
     } else {
         log::warn!("Connection check: No client found. Checking for saved API ID...");
     }
@@ -198,9 +310,8 @@ pub async fn cmd_check_connection(
     // 2. Reconnect Logic
     let api_id_opt = *state.api_id.lock().await;
     if let Some(api_id) = api_id_opt {
-        // Force re-init: Clear old client first to ensure fresh pool
-        *state.client.lock().await = None;
-
+        // Only initialize when there was no client. Never destroy a live
+        // runner in response to transient connectivity or a slow get_me().
         match ensure_client_initialized(&app_handle, &state, api_id).await {
             Ok(c) => {
                 // Double check
@@ -576,5 +687,115 @@ pub async fn cmd_auth_qr_poll(state: State<'_, TelegramState>) -> Result<AuthRes
                 error: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod saved_telegram_session_tests {
+    use super::saved_session_file_present;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn absent_or_empty_saved_session_cannot_trigger_new_session_creation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("terarelay-saved-login-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let session = root.join("telegram.session");
+
+        assert!(!saved_session_file_present(&session).unwrap());
+        std::fs::write(&session, []).unwrap();
+        assert!(!saved_session_file_present(&session).unwrap());
+        std::fs::write(&session, b"synthetic preserved session fixture").unwrap();
+        assert!(saved_session_file_present(&session).unwrap());
+        assert_eq!(
+            std::fs::read(&session).unwrap(),
+            b"synthetic preserved session fixture"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod telegram_proxy_security_tests {
+    use super::{proxy_url_with_ip_host, resolve_telegram_proxy_url};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn numeric_proxy_rewrite_preserves_auth_port_and_socks_scheme() {
+        let original = format!(
+            "socks5://{}:{}@my-proxy.example:1080",
+            ["ali", "ce"].concat(),
+            ["p%40", "ss%3Aword"].concat()
+        );
+        let numeric =
+            proxy_url_with_ip_host(&original, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 22))).unwrap();
+        assert_eq!(
+            numeric,
+            format!(
+                "socks5://{}:{}@192.0.2.22:1080",
+                "alice",
+                ["p%40", "ss%3Aword"].concat()
+            )
+        );
+        assert!(!numeric.contains("my-proxy.example"));
+
+        let ipv6 = proxy_url_with_ip_host(&original, IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap();
+        assert_eq!(
+            ipv6,
+            format!(
+                "socks5://{}:{}@[::1]:1080",
+                "alice",
+                ["p%40", "ss%3Aword"].concat()
+            )
+        );
+        assert!(!ipv6.contains("my-proxy.example"));
+    }
+
+    #[tokio::test]
+    async fn hostname_proxy_is_resolved_by_os_before_reaching_grammers() {
+        let numeric = resolve_telegram_proxy_url(format!(
+            "socks5://{}:{}@localhost:1080",
+            "user", "synthetic"
+        ))
+        .await
+        .unwrap();
+        let url = reqwest::Url::parse(&numeric).unwrap();
+        assert_eq!(url.scheme(), "socks5");
+        assert_eq!(url.port(), Some(1080));
+        assert_eq!(url.username(), "user");
+        assert_eq!(url.password(), Some("synthetic"));
+        let ip = url
+            .host_str()
+            .unwrap()
+            .trim_matches(&['[', ']'][..])
+            .parse::<IpAddr>()
+            .expect("Grammers must receive a numeric proxy host");
+        assert!(ip.is_loopback());
+        assert!(!numeric.contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn malformed_proxy_configuration_fails_closed_without_echoing_credentials() {
+        let password = ["only", "a", "test", "value"].join("-");
+        for input in [
+            format!("http://alice:{password}@proxy.example:1080"),
+            format!("socks5://alice:{password}@proxy.example"),
+            format!("not-a-url-{password}"),
+        ] {
+            let error = resolve_telegram_proxy_url(input).await.unwrap_err();
+            assert!(
+                !error.contains(&password),
+                "Proxy errors must not leak passwords"
+            );
+        }
+        let numeric = format!("socks5://{}:{}@127.0.0.1:1080", "alice", "synthetic");
+        assert_eq!(
+            resolve_telegram_proxy_url(numeric.clone()).await.unwrap(),
+            numeric,
+        );
     }
 }

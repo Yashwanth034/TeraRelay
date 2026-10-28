@@ -44,18 +44,18 @@ export function DownloadQueue({
                     )}
                 </div>
                 {(activeCount > 0 || pausedCount > 0) && (
-                    <button onClick={onCancelAll} className="tr-transfer-cancel-all">
+                    <button onClick={onCancelAll} className="tr-transfer-cancel-all" aria-label="Cancel all downloads">
                         Cancel All
                     </button>
                 )}
             </div>
 
-            <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2">
+            <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2" role="list" aria-label="Download transfer status">
                 {items.map(item => {
                     const showProgress = item.status === 'downloading' || item.status === 'pausing' || item.status === 'paused';
                     const active = item.status === 'downloading';
                     return (
-                        <div key={item.id} className="tr-transfer-item flex flex-col gap-1.5 p-2.5">
+                        <div key={item.id} role="listitem" aria-label={`Download ${item.filename || 'transfer'}, ${item.status}`} className="tr-transfer-item flex flex-col gap-1.5 p-2.5">
                             <div className="flex items-center gap-2.5 text-sm">
                                 <div className="flex-shrink-0">
                                     {item.status === 'pending' && <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center"><div className="w-2 h-2 bg-yellow-500 rounded-full" /></div>}
@@ -73,40 +73,40 @@ export function DownloadQueue({
 
                                 {item.status === 'downloading' && (
                                     <>
-                                        <button onClick={() => onPauseItem(item.id)} className="p-1 text-gray-400 hover:text-yellow-400 transition-colors" title="Pause">
+                                        <button onClick={() => onPauseItem(item.id)} className="p-1 text-gray-400 hover:text-yellow-400 transition-colors" title="Pause" aria-label={`Pause ${item.filename || 'transfer'}`}>
                                             <Pause className="w-3.5 h-3.5" />
                                         </button>
-                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel" aria-label={`Cancel ${item.filename || 'transfer'}`}>
                                             <X className="w-3.5 h-3.5" />
                                         </button>
                                     </>
                                 )}
 
                                 {item.status === 'pausing' && (
-                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel" aria-label={`Cancel ${item.filename || 'transfer'}`}>
                                         <X className="w-3.5 h-3.5" />
                                     </button>
                                 )}
 
                                 {item.status === 'paused' && (
                                     <>
-                                        <button onClick={() => onResumeItem(item.id)} className="p-1 text-gray-400 hover:text-green-400 transition-colors" title="Resume">
+                                        <button onClick={() => onResumeItem(item.id)} className="p-1 text-gray-400 hover:text-green-400 transition-colors" title="Resume" aria-label={`Resume ${item.filename || 'transfer'}`}>
                                             <Play className="w-3.5 h-3.5" />
                                         </button>
-                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                        <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel" aria-label={`Cancel ${item.filename || 'transfer'}`}>
                                             <X className="w-3.5 h-3.5" />
                                         </button>
                                     </>
                                 )}
 
                                 {item.status === 'pending' && (
-                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel">
+                                    <button onClick={() => onCancelItem(item.id)} className="p-1 text-gray-400 hover:text-red-400 transition-colors" title="Cancel" aria-label={`Cancel ${item.filename || 'transfer'}`}>
                                         <X className="w-3.5 h-3.5" />
                                     </button>
                                 )}
 
                                 {(item.status === 'error' || item.status === 'cancelled') && (
-                                    <button onClick={() => onRetryItem(item.id)} className="p-1 text-gray-400 hover:text-blue-400 transition-colors" title="Retry">
+                                    <button onClick={() => onRetryItem(item.id)} className="p-1 text-gray-400 hover:text-blue-400 transition-colors" title="Retry" aria-label={`Retry ${item.filename || 'transfer'}`}>
                                         <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
                                 )}
@@ -120,7 +120,16 @@ export function DownloadQueue({
 
                             {showProgress && (
                                 <>
-                                    <div className="tr-transfer-progress relative w-full h-1 overflow-hidden">
+                                    <div className="tr-transfer-progress relative w-full h-1 overflow-hidden"
+                                        role="progressbar"
+                                        aria-label={`Download progress for ${item.filename || 'transfer'}`}
+                                        aria-valuemin={0}
+                                        aria-valuemax={100}
+                                        aria-valuenow={item.totalBytes !== undefined && item.totalBytes > 0 && item.downloadedBytes !== undefined
+                                            ? Math.max(0, Math.min(100, Math.round(item.downloadedBytes / item.totalBytes * 100)))
+                                            : item.progress !== undefined ? Math.max(0, Math.min(100, Math.round(item.progress))) : undefined}
+                                        aria-valuetext={item.status === 'paused' ? 'Paused' : item.status === 'pausing' ? 'Pausing' : 'Downloading'}
+                                    >
                                         {(active && (item.downloadedBytes ?? 0) === 0) ? (
                                             <div className="bg-telegram-secondary h-full w-1/2 animate-progress-indeterminate" />
                                         ) : (
@@ -157,15 +166,15 @@ export function DownloadQueue({
                             )}
 
                             {item.status === 'success' && (
-                                <div className="text-[10px] text-green-400">Completed</div>
+                                <div role="status" className="text-[10px] text-green-400">Completed</div>
                             )}
                             {item.status === 'error' && item.error && (
-                                <div className="flex items-center gap-1 text-xs text-red-400">
+                                <div role="alert" className="flex items-center gap-1 text-xs text-red-400">
                                     <AlertCircle className="w-3 h-3 flex-shrink-0" />
                                     <span className="truncate">{item.error}</span>
                                 </div>
                             )}
-                            {item.status === 'cancelled' && <div className="text-xs text-gray-400">Cancelled</div>}
+                            {item.status === 'cancelled' && <div role="status" className="text-xs text-gray-400">Cancelled</div>}
                         </div>
                     );
                 })}

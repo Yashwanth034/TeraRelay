@@ -105,6 +105,9 @@ struct NativeWorker {
 impl Drop for NativeWorker {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // A timed-out storage optimizer must finish with this process before
+        // the worker lock is released and another transfer can start.
+        let _ = self.child.wait();
     }
 }
 
@@ -1266,16 +1269,25 @@ pub async fn upload_document(
     .map_err(|e| format!("TDLib upload task failed: {e}"))?
 }
 
+/// Progress counters shared with the caller during one native TDLib download.
+pub struct FastDownloadCounters {
+    pub acknowledged: Arc<AtomicU64>,
+    pub network: Arc<AtomicU64>,
+}
+
 pub async fn download_documents(
     state: &TdlibFastState,
     destination: FastDestination,
     path: String,
     chunks: Vec<FastDownloadChunk>,
-    bytes_counter: Arc<AtomicU64>,
-    network_counter: Arc<AtomicU64>,
+    counters: FastDownloadCounters,
     cancel_rx: watch::Receiver<bool>,
     force: bool,
 ) -> Result<FastDownloadOutcome, String> {
+    let FastDownloadCounters {
+        acknowledged: bytes_counter,
+        network: network_counter,
+    } = counters;
     let worker_arc = state.worker.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut guard = worker_arc
@@ -1399,6 +1411,113 @@ pub fn shutdown_worker(state: &TdlibFastState) {
         let _ = worker.request(json!({"action": "shutdown"}), |_| {}, |_| {}, None);
     }
     guard.take();
+}
+
+fn request_cache_cleanup(guard: &mut Option<NativeWorker>) -> Result<Value, String> {
+    let result = guard
+        .as_mut()
+        .ok_or("TDLib worker is unavailable")?
+        .request(json!({"action":"clean_file_cache"}), |_| {}, |_| {}, None);
+    if result.is_err() {
+        // Python's request deadline does not cancel TDLib's asynchronous GC.
+        // Stop and reap the native process before allowing another transfer.
+        guard.take();
+    }
+    result
+}
+
+/// Idle-only maintenance. Authorization files are never deleted or reset.
+/// A nonempty/unknown queue protects every cached part needed by resume.
+pub async fn clean_file_cache_if_idle(
+    app_handle: &tauri::AppHandle,
+    state: &TdlibFastState,
+    db: &crate::db::DbConnection,
+) -> Result<bool, String> {
+    let app_data = app_data_dir(app_handle)?;
+    let app_cache = app_handle
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?;
+    let runtime = runtime_info(&app_data);
+    let worker_arc = state.worker.clone();
+    let db = db.clone();
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Never wait behind an active transfer or a database operation.
+        let Ok(mut worker_guard) = worker_arc.try_lock() else {
+            return Ok(false);
+        };
+        {
+            let Ok(conn) = db.try_lock() else {
+                return Ok(false);
+            };
+            if crate::cache_cleanup::has_unfinished_transfers(&conn)? {
+                return Ok(false);
+            }
+        }
+        let removed = crate::cache_cleanup::prune_legacy_file_caches(&app_data)?;
+        let removed_blocks = crate::cache_cleanup::prune_drive_blocks(
+            &app_cache.join("drive/blocks"),
+            crate::cache_cleanup::DRIVE_CACHE_BYTES,
+        )?;
+        if removed > 0 || removed_blocks > 0 {
+            log::info!(
+                "Released obsolete/local cached bytes: legacy={}, Drive={}",
+                removed,
+                removed_blocks
+            );
+        }
+
+        let files = app_data.join(FILES_DIR_NAME);
+        // Avoid starting a client or querying Telegram merely to clear an empty cache.
+        if !crate::cache_cleanup::cache_contains_files(&files)? {
+            return Ok(true);
+        }
+        if !platform_supported() || !runtime.installed {
+            return Ok(false);
+        }
+
+        if worker_guard.is_none() {
+            // Only reopen configured saved authorization. Never create/relink
+            // an account solely for cleanup, or reset its database on errors.
+            if !app_data.join(KEY_FILE_NAME).is_file() || !app_data.join(SESSION_DIR_NAME).is_dir()
+            {
+                return Ok(false);
+            }
+            let credentials =
+                match crate::commands::secure_credentials::load_api_credentials(&app_handle) {
+                    Ok(credentials) => credentials,
+                    Err(_) => return Ok(false),
+                };
+            *worker_guard = Some(NativeWorker::spawn(
+                &runtime,
+                credentials.api_id,
+                credentials.api_hash,
+                &app_data,
+            )?);
+        }
+        let worker = worker_guard.as_mut().expect("worker initialized");
+        if !worker.ready {
+            let prepared = worker.request(
+                json!({"action":"prepare","timeout":5}),
+                |_| {},
+                |_| {},
+                None,
+            )?;
+            worker.update_auth_from_result(&prepared);
+            if !worker.ready {
+                return Ok(false);
+            }
+        }
+        let stats = request_cache_cleanup(&mut worker_guard)?;
+        log::debug!(
+            "Idle TDLib local-cache cleanup completed; removed size={}",
+            stats.get("size").unwrap_or(&Value::Null)
+        );
+        Ok::<bool, String>(true)
+    })
+    .await
+    .map_err(|e| format!("Cache maintenance task failed: {e}"))?
 }
 
 pub fn tdlib_is_ready(state: &TdlibFastState) -> bool {
@@ -1629,6 +1748,46 @@ for event in events:
             ),
         );
         assert!(blocked.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_cache_gc_stops_and_reaps_worker_before_another_transfer() {
+        let script = r#"import json,sys,time
+r=json.loads(sys.stdin.readline())
+print(json.dumps({"event":"result","id":r["id"],"ok":False,"error":"GC timed out"}),flush=True)
+time.sleep(60)
+"#;
+        let mut child = StdCommand::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let worker = NativeWorker {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+            auth_state: "ready".into(),
+            ready: true,
+            is_premium: None,
+        };
+        let mut guard = Some(worker);
+        assert!(request_cache_cleanup(&mut guard).is_err());
+        assert!(
+            guard.is_none(),
+            "Timed-out GC worker can overlap the next transfer"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "GC worker was not reaped"
+        );
     }
 
     #[test]

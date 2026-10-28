@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Globe, Layers3, Loader2, RotateCcw, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useEscapeToClose } from '../../../hooks/useEscapeToClose';
@@ -24,6 +24,8 @@ interface RemoteImportBatchController {
 
 interface RemoteUploadModalProps {
     isOpen: boolean;
+    initialBatchId?: string | null;
+    initialJobId?: string | null;
     onClose: () => void;
     activeFolderId: number | null;
     currentChannelName: string;
@@ -43,6 +45,8 @@ function sourceLines(value: string): string[] {
 }
 
 function phaseLabel(job: RemoteImportJob) {
+    if (job.phase === 'downloading' && job.progress?.phase === 'connecting') return 'Connecting to torrent peers…';
+    if (job.phase === 'downloading' && job.progress?.phase === 'waiting_for_peers') return 'Waiting for torrent data…';
     switch (job.phase) {
         case 'analyzing': return 'Analyzing…';
         case 'downloading': return 'Downloading…';
@@ -71,6 +75,8 @@ function memberKey(member: RemoteImportMemberRef): string {
 
 export function RemoteUploadModal({
     isOpen,
+    initialBatchId = null,
+    initialJobId = null,
     onClose,
     activeFolderId,
     currentChannelName,
@@ -92,23 +98,24 @@ export function RemoteUploadModal({
 
     useEscapeToClose(isOpen, onClose);
 
-    const latestActiveBatch = useMemo(() => [...remoteImportBatch.batches]
-        .filter(batch => batch.folderId === activeFolderId && !['success', 'cancelled'].includes(batch.phase))
-        .sort((left, right) => right.updatedAt - left.updatedAt)[0] ?? null,
-    [activeFolderId, remoteImportBatch.batches]);
-
+    const editorGeneration = useRef(0);
+    const jobsRef = useRef(jobs);
+    jobsRef.current = jobs;
+    // Progress updates must never reset an open link editor. Navigation is explicit.
     useEffect(() => {
+        editorGeneration.current += 1;
         if (!isOpen) return;
-        setUrl('');
-        setJobId(null);
-        setBatchId(latestActiveBatch?.id ?? null);
-        setSelectedIds([]);
+        const initialJob = initialJobId ? jobsRef.current.find(candidate => candidate.id === initialJobId) : null;
+        setUrl(initialJob?.source ?? '');
+        setJobId(initialJobId);
+        setBatchId(initialBatchId);
+        setSelectedIds([...(initialJob?.selectedIds ?? [])]);
         setBusy(false);
         setError(null);
         setGroupBuilderOpen(false);
         setGroupCandidates([]);
         setGroupPrimaryKey(null);
-    }, [isOpen, latestActiveBatch?.id]);
+    }, [isOpen, initialBatchId, initialJobId]);
 
     const lines = useMemo(() => sourceLines(url), [url]);
     const multiLinkMode = lines.length >= 2 || batchId !== null;
@@ -149,7 +156,7 @@ export function RemoteUploadModal({
         if (!entry.jobId) return false;
         return !!jobsById.get(entry.jobId)?.analysis;
     });
-    const selectionReady = analysisReady && !!batch && batch.entries.every(entry =>
+    const selectionReady = analysisReady && !!batch && batch.entries.some(entry => entry.phase !== 'skipped') && batch.entries.every(entry =>
         entry.phase === 'skipped' || entry.selectedIds.length > 0
     );
     const configurationLocked = batch?.startedAt !== undefined;
@@ -173,28 +180,31 @@ export function RemoteUploadModal({
             setError('Paste a URL or magnet link first');
             return;
         }
+        const generation = ++editorGeneration.current;
         setBusy(true);
         setError(null);
         try {
             if (lines.length >= 2) {
                 const next = await remoteImportBatch.analyzeBatch(url);
+                if (generation !== editorGeneration.current) return;
                 setBatchId(next.id);
                 setJobId(null);
                 setSelectedIds([]);
             } else {
                 const next = await onAnalyze(lines[0]);
+                if (generation !== editorGeneration.current) return;
                 setJobId(next.id);
                 setBatchId(null);
                 setSelectedIds(next.selectedIds);
             }
         } catch (cause) {
-            setError(errorMessage(cause));
+            if (generation === editorGeneration.current) setError(errorMessage(cause));
         } finally {
-            setBusy(false);
+            if (generation === editorGeneration.current) setBusy(false);
         }
     };
 
-    const handleSingleImport = async () => {
+    const handleSingleImport = () => {
         if (!job) return;
         const requiresSelection = (analysis?.qualities.length ?? 0) > 0 || (analysis?.items.length ?? 0) > 1;
         if (requiresSelection && selectedIds.length === 0) {
@@ -203,14 +213,10 @@ export function RemoteUploadModal({
         }
         setBusy(true);
         setError(null);
-        try {
-            await onImport(job.id, selectedIds);
-            onClose();
-        } catch (cause) {
-            setError(errorMessage(cause));
-        } finally {
-            setBusy(false);
-        }
+        void onImport(job.id, selectedIds)
+            .catch(cause => toast.error(`Link import needs attention: ${errorMessage(cause)}`))
+            .finally(() => { void onBatchSettled?.(); });
+        onClose();
     };
 
     const handleResumeBatchAnalysis = async () => {
@@ -301,28 +307,40 @@ export function RemoteUploadModal({
         <div className="tr-modal-backdrop fixed inset-0 z-[200] flex items-center justify-center p-4" onClick={onClose}>
             <form
                 onSubmit={handleAnalyze}
-                className="tr-modal w-full max-w-[620px] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="tr-remote-upload-title"
+                className="tr-modal w-full max-w-[860px] max-h-[calc(100dvh-2rem)] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
                 onClick={event => event.stopPropagation()}
             >
-                <div className="tr-modal-header p-4 flex items-center justify-between">
+                <div className="tr-modal-header shrink-0 p-5 flex items-center justify-between gap-3">
                     <div className="min-w-0">
-                        <h3 className="text-telegram-text font-medium flex items-center gap-2">
+                        <h3 id="tr-remote-upload-title" className="text-telegram-text font-medium flex items-center gap-2">
                             <Globe className="w-5 h-5 text-telegram-primary" />
                             Upload from Link
                         </h3>
-                        <p className="text-xs text-telegram-subtext mt-0.5 truncate">To {currentChannelName}</p>
+                        <p className="text-sm text-telegram-subtext mt-1">Import to {currentChannelName} · Paste one link per line</p>
                     </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                    {(batch || job) && <button type="button" className="tr-button tr-button--secondary tr-button--sm" onClick={() => {
+                        editorGeneration.current += 1;
+                        setBatchId(null); setJobId(null); setSelectedIds([]); setUrl(''); setError(null); setBusy(false); setGroupBuilderOpen(false);
+                    }}>Add new links</button>}
                     <button type="button" onClick={onClose} className="tr-modal-close" aria-label="Close">
                         <X className="w-5 h-5" />
                     </button>
+                    </div>
                 </div>
 
-                <div className="p-4 space-y-4 overflow-y-auto max-h-[72vh]">
+                <div className="min-h-0 p-5 space-y-4 overflow-y-auto flex-1">
+                    <p className="text-sm text-telegram-subtext">YouTube, video pages, direct files, and torrent or magnet links. Choose what to import; progress continues in the Link imports panel.</p>
                     {!batch && (
                         <div className="space-y-1.5">
-                            <label className="text-xs text-telegram-subtext font-medium">Link{lines.length >= 2 ? 's' : ''}</label>
+                            <label htmlFor="tr-remote-upload-links" className="text-xs text-telegram-subtext font-medium">Link{lines.length >= 2 ? 's' : ''}</label>
                             <div className="flex gap-2 items-start">
                                 <textarea
+                                    id="tr-remote-upload-links"
+                                    aria-label="Links to import"
                                     placeholder={'YouTube, Instagram, X, magnet, direct file…\nPaste one link per line for multiple imports'}
                                     value={url}
                                     onChange={event => {
@@ -330,8 +348,8 @@ export function RemoteUploadModal({
                                         if (jobId) { setJobId(null); setSelectedIds([]); }
                                         setError(null);
                                     }}
-                                    className="tr-modal-input flex-1 min-w-0 px-3 py-2 text-sm placeholder:text-telegram-subtext/60 resize-none min-h-[42px] max-h-32"
-                                    rows={lines.length >= 2 ? Math.min(5, Math.max(2, lines.length)) : 1}
+                                    className="tr-modal-input flex-1 min-w-0 px-4 py-3 text-sm placeholder:text-telegram-subtext/60 resize-y min-h-[112px] max-h-48"
+                                    rows={Math.min(7, Math.max(4, lines.length))}
                                     autoFocus
                                     disabled={busy || !!activePhase}
                                 />
@@ -414,7 +432,7 @@ export function RemoteUploadModal({
                                 )}
                             </div>
 
-                            {batch.entries.map(entry => {
+                            {batch.entries.filter(entry => entry.phase !== 'skipped').map(entry => {
                                 const entryJob = entry.jobId ? jobsById.get(entry.jobId) : undefined;
                                 const entryAnalysis = entryJob?.analysis;
                                 const entryQualities = [...(entryAnalysis?.qualities ?? [])].sort((a, b) => (a.height ?? 0) - (b.height ?? 0));
@@ -429,9 +447,10 @@ export function RemoteUploadModal({
                                                 <div className="text-[11px] text-telegram-subtext truncate">{entryAnalysis?.source_label ?? entry.source}</div>
                                             </div>
                                             <div className="text-[11px] text-telegram-subtext flex items-center gap-1">
-                                                {isActive ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                                                {entry.phase}
+                                                {isActive && entryJob && !['error', 'partial-error', 'cancelled', 'success'].includes(entryJob.phase) ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                                                {entryJob ? phaseLabel(entryJob) : entry.phase}
                                             </div>
+                                            {!configurationLocked && <button type="button" aria-label="Remove link" title="Remove link" className="p-1 text-telegram-subtext hover:text-red-400" disabled={busy} onClick={() => void handleSkipBatchEntry(entry.id)}><X className="w-4 h-4" /></button>}
                                         </div>
 
                                         {entryQualities.length > 0 && (
@@ -567,8 +586,8 @@ export function RemoteUploadModal({
                     )}
                 </div>
 
-                <div className="tr-modal-footer">
-                    <button type="button" onClick={onClose} className="tr-button tr-button--secondary tr-button--sm">Cancel</button>
+                <div className="tr-modal-footer shrink-0 flex-wrap">
+                    <button type="button" onClick={onClose} className="tr-button tr-button--secondary tr-button--sm">{activePhase || batch?.phase === 'importing' ? 'Continue in background' : 'Close'}</button>
                     {batch?.phase === 'importing' && (
                         <button
                             type="button"

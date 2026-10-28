@@ -7,7 +7,7 @@ import Hls from 'hls.js';
 import { TelegramFile, StreamingQuality, TranscodePrepareResult, TranscodeJobPhase, TranscodeCapabilities, MediaTrackInfo, MediaTrackProbe, QUALITY_LABELS, HLS_QUALITIES } from '../../../types';
 import { useAdaptiveStreaming } from '../../../hooks/useAdaptiveStreaming';
 import { QualitySelector } from '../../shared/QualitySelector';
-import { PlaybackTimeline, planPlaybackSeek, shiftSubtitleCues } from './playbackTimeline';
+import { PlaybackTimeline, authorizeHlsChildRequestUrl, buildAuthenticatedHlsUrl, buildAuthenticatedRemuxUrl, buildAuthenticatedSubtitleUrl, chooseCompatibilityQuality, eligibleNativeMemoryMp4, fetchBoundedNativeMp4, nativeRemuxRevisionUrl, nativeProgressiveRevisionUrl, planPlaybackSeek, restoreCompatibilityPlayback, shouldDeferCompletedRemuxSeek, shouldRemuxAfterNativeDecoderFailure, shouldResumeAfterRemuxFinish, shiftSubtitleCues } from './playbackTimeline';
 
 interface AdaptiveMediaPlayerProps {
     file: TelegramFile;
@@ -48,6 +48,25 @@ export function AdaptiveMediaPlayer({
     // ── Restart counter for MSE pipeline reinit ──────────────────────
     // Must be declared BEFORE restartStreamUrl useMemo
     const [restartNonce, setRestartNonce] = useState(0);
+    // A native decoder-only retry must not reinitialize the MSE/remux hook.
+    const [nativeDecoderRevision, setNativeDecoderRevision] = useState(0);
+    const [memoryMedia, setMemoryMedia] = useState<{ source: string; url: string } | null>(null);
+    // Source-identity gate prevents old private Blob bytes from being mounted
+    // under a newly selected file before its cleanup effect has executed.
+    const memoryMediaUrl = memoryMedia?.source === streamUrl ? memoryMedia.url : null;
+    const [memoryLoading, setMemoryLoading] = useState(false);
+    const memoryMediaUrlRef = useRef<string | null>(null);
+    const memoryFetchRef = useRef<AbortController | null>(null);
+    const memoryGenerationRef = useRef(0);
+    const clearMemoryMedia = useCallback(() => {
+        memoryGenerationRef.current += 1;
+        memoryFetchRef.current?.abort();
+        memoryFetchRef.current = null;
+        if (memoryMediaUrlRef.current) URL.revokeObjectURL(memoryMediaUrlRef.current);
+        memoryMediaUrlRef.current = null;
+        setMemoryMedia(null);
+        setMemoryLoading(false);
+    }, []);
 
     // ── fMP4 remux state ────────────────────────────────────────────
     const [fmp4Remuxing, setFmp4Remuxing] = useState(false);
@@ -59,6 +78,11 @@ export function AdaptiveMediaPlayer({
     const remuxGenerationRef = useRef(0);
     const remuxWindowRef = useRef({ start: 0, complete: false, key: null as string | null });
     const pendingSeekRef = useRef<{ time: number; play: boolean } | null>(null);
+    // User intent is not equivalent to HTMLVideoElement.paused: an incomplete
+    // growing stream can pause spontaneously before reporting ended=true.
+    const nativeUserPauseRef = useRef(false);
+    const nativeOriginalRetryRef = useRef(0);
+    const nativeCompletedRetryRef = useRef(0);
     const sourceDurationRef = useRef<number | null>(null);
     const [movieTime, setMovieTime] = useState(0);
     const [nativePaused, setNativePaused] = useState(false);
@@ -70,11 +94,14 @@ export function AdaptiveMediaPlayer({
     // Changing restartNonce forces the hook to reinitialize by altering the streamUrl
     const restartStreamUrl = useMemo(() => {
         if (restartNonce > 0) {
+            if (fmp4StreamUrl) {
+                return nativeRemuxRevisionUrl(effectiveStreamUrl, restartNonce);
+            }
             const sep = effectiveStreamUrl.includes('?') ? '&' : '?';
             return `${effectiveStreamUrl}${sep}_r=${restartNonce}`;
         }
         return effectiveStreamUrl;
-    }, [effectiveStreamUrl, restartNonce]);
+    }, [effectiveStreamUrl, fmp4StreamUrl, restartNonce]);
 
     // ── Refs for late-bound values needed by progressive handler ─────
     const abortMseRef = useRef<(() => void) | null>(null);
@@ -85,7 +112,13 @@ export function AdaptiveMediaPlayer({
     const handleProgressiveDetected = useCallback((requestedTime?: number) => {
         if (fmp4RemuxingRef.current) return;
         if (!transcodeCapsRef.current?.available) return;
+        clearMemoryMedia();
         fmp4RemuxingRef.current = true;
+        // A different audio selection/seek window has its own bounded
+        // decoder recovery allowance; do not inherit a previous window's
+        // failed parser state.
+        nativeCompletedRetryRef.current = 0;
+        setNativeDecoderRevision(0);
         setFmp4Remuxing(true);
         setFmp4RemuxError(null);
         const gen = remuxGenerationRef.current;
@@ -124,7 +157,10 @@ export function AdaptiveMediaPlayer({
                     complete: result.status === 'ready',
                     key: result.output_file_key,
                 };
-                const fullUrl = `${streamBaseRef.current}${result.url}?token=${streamAuthRef.current}`;
+                const fullUrl = buildAuthenticatedRemuxUrl(
+                    streamBaseRef.current, result.url, streamAuthRef.current,
+                );
+                if (!fullUrl) throw new Error('Invalid local fMP4 remux URL');
                 if (result.status === 'ready') {
                     setFmp4StreamUrl(fullUrl);
                     setFmp4Remuxing(false);
@@ -154,10 +190,31 @@ export function AdaptiveMediaPlayer({
                         if (wasPlayingPartial) {
                             const activeVideo = fallbackVideoRef.current;
                             const time = pendingSeekRef.current?.time ?? (remuxWindowRef.current.start + (activeVideo?.currentTime ?? 0));
-                            const resume = pendingSeekRef.current?.play ?? !activeVideo?.paused;
+                            const resume = shouldResumeAfterRemuxFinish(
+                                pendingSeekRef.current, activeVideo,
+                                nativePlaybackStartedRef.current && !nativeUserPauseRef.current,
+                            );
                             savedTimeRef.current = time;
                             pendingSeekRef.current = { time, play: resume };
-                            setNativeAutoPlay(false);
+                            // The finished HTTP-range stream can initially
+                            // report zero duration/empty seekable ranges in
+                            // WebKit. If autoplay stays disabled while the
+                            // pending seek waits for media ranges, neither
+                            // operation ever advances. Start the new stream
+                            // only when playback was requested; the pending
+                            // seek still restores the absolute position once
+                            // the decoder reports valid ranges.
+                            setNativeAutoPlay(resume);
+                            // Explicitly detach the *growing* media pipeline
+                            // before mounting the completed HTTP-range source.
+                            // A keyed React replacement alone may leave
+                            // WebKit/GStreamer consuming the old live stream.
+                            // The seek/play state above survives this teardown.
+                            if (activeVideo) {
+                                activeVideo.pause();
+                                activeVideo.removeAttribute('src');
+                                activeVideo.load();
+                            }
                             setRestartNonce(n => n + 1);
                         }
                         fmp4RemuxingRef.current = false;
@@ -172,7 +229,7 @@ export function AdaptiveMediaPlayer({
                 fmp4RemuxingRef.current = false;
             }
         })();
-    }, [file.id, activeFolderId]);
+    }, [file.id, activeFolderId, clearMemoryMedia]);
 
     // ── progressive callback for useAdaptiveStreaming ────────────────
     const progressiveCallback = useMemo(
@@ -196,9 +253,25 @@ export function AdaptiveMediaPlayer({
         abort: abortMse,
     } = useAdaptiveStreaming(restartStreamUrl, file.name, progressiveCallback, !!fmp4StreamUrl);
 
+    // A native decoder retry changes ONLY the <video> URL and React key,
+    // never useAdaptiveStreaming's pipeline URL. fMP4 aliases must be
+    // derived from the canonical key: stacking '__refresh' suffixes would
+    // defeat the server's single bounded alias-to-file resolution.
+    const nativeMediaUrl = useMemo(() => {
+        if (memoryMediaUrl && !fmp4StreamUrl) return memoryMediaUrl;
+        if (nativeDecoderRevision === 0) return fallbackUrl;
+        if (fmp4StreamUrl) {
+            return nativeRemuxRevisionUrl(fmp4StreamUrl, restartNonce + nativeDecoderRevision);
+        }
+        return nativeProgressiveRevisionUrl(fallbackUrl, nativeDecoderRevision);
+    }, [fallbackUrl, fmp4StreamUrl, memoryMediaUrl, restartNonce, nativeDecoderRevision]);
+
     // ── HLS transcode state ──────────────────────────────────────────
     // playbackMode is the single source of truth: 'original' or 'hls'
     const [playbackMode, setPlaybackMode] = useState<'original' | 'hls'>('original');
+    useEffect(() => {
+        if (playbackMode === 'hls') clearMemoryMedia();
+    }, [playbackMode, clearMemoryMedia]);
     const [hlsQuality, setHlsQuality] = useState<StreamingQuality | null>(null);
     const [hlsPhase, setHlsPhase] = useState<TranscodeJobPhase>('idle');
     const [hlsProgress, setHlsProgress] = useState(0);
@@ -219,18 +292,24 @@ export function AdaptiveMediaPlayer({
         nativePlaybackStartedRef.current = false;
         setNativePhase('loading');
         setNativeError(null);
-    }, [fallbackUrl]);
+    }, [nativeMediaUrl]);
 
     // Decoder errors may arrive before the asynchronous FFmpeg capability
     // check. Retry once capabilities arrive instead of losing that fallback.
     useEffect(() => {
         if (nativePhase === 'error' && transcodeCapabilities?.available
             && (preferRemux || file.name.toLowerCase().endsWith('.mp4'))
-            && !fmp4StreamUrl && !fmp4RemuxError && !fmp4RemuxingRef.current) {
+            && !fmp4StreamUrl && !fmp4RemuxError && !fmp4RemuxingRef.current
+            // Opted-in private-memory playback must not silently convert
+            // an ordinary MP4 if its decoder reports another error.
+            && !memoryMediaUrl && !memoryLoading
+            // Ordinary MP4 is opt-in after native recovery fails. An
+            // explicit remux preference already authorizes the fallback.
+            && shouldRemuxAfterNativeDecoderFailure(preferRemux, nativeOriginalRetryRef.current)) {
             handleProgressiveDetected();
         }
     }, [nativePhase, transcodeCapabilities, preferRemux, file.name,
-        fmp4StreamUrl, fmp4RemuxError, handleProgressiveDetected]);
+        fmp4StreamUrl, fmp4RemuxError, memoryMediaUrl, memoryLoading, handleProgressiveDetected]);
     const [mediaTracks, setMediaTracks] = useState<MediaTrackProbe>({ audio_tracks: [], subtitle_tracks: [] });
     const sourceDuration = mediaTracks.duration_secs != null && Number.isFinite(mediaTracks.duration_secs) && mediaTracks.duration_secs > 0
         ? mediaTracks.duration_secs : null;
@@ -240,10 +319,18 @@ export function AdaptiveMediaPlayer({
     const [selectedSubtitleStream, setSelectedSubtitleStream] = useState<number | null>(null);
     const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
     const [subtitleLoading, setSubtitleLoading] = useState(false);
+    // File changes and rapid track switches must invalidate late subtitle IPC.
+    const subtitleSelectionGenerationRef = useRef(0);
     const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const savedTimeRef = useRef<number>(0);
     const savedPlaybackRef = useRef(true);
     const hlsQualityRef = useRef<StreamingQuality | null>(null);
+    // Late FFmpeg preparation or polling replies must not resurrect an HLS
+    // playlist after a file/quality switch or a player unmount.
+    const hlsGenerationRef = useRef(0);
+    // The Rust transcoder reuses job IDs by folder/file/quality. A stale
+    // response must not cancel an identical job requested by a newer intent.
+    const hlsDesiredJobRef = useRef<string | null>(null);
     const streamAuthRef = useRef<string>('');
     const currentJobIdRef = useRef<string | null>(null);
     const streamBaseRef = useRef<string>('');
@@ -419,15 +506,49 @@ export function AdaptiveMediaPlayer({
     }, [getActiveVideo, handleProgressiveDetected]);
 
     const seekTo = useCallback((time: number) => {
+        const remuxComplete = playbackMode === 'original' && !!fmp4StreamUrl
+            && remuxWindowRef.current.complete;
         if (playbackMode === 'original' && pendingSeekRef.current) {
             const duration = sourceDurationRef.current;
-            requestRemuxAt(Math.max(0, Math.min(duration ?? Infinity, time)));
-            return;
+            const target = Math.max(0, Math.min(duration ?? Infinity, time));
+            if (!fmp4StreamUrl && useFallback
+                && !remuxWindowRef.current.key && !fmp4RemuxingRef.current) {
+                // The native original decoder has an unresolved seek (it may
+                // report an incorrect 20 ms duration). Repeated user seeks
+                // must update the pending target, never launch a remux just
+                // because decoder recovery has not started yet.
+                pendingSeekRef.current.time = target;
+                setMovieTime(target);
+                return;
+            }
+            if (!remuxComplete || target < remuxWindowRef.current.start) {
+                requestRemuxAt(target);
+                return;
+            }
+            // Seeking again while the *completed* video initializes should
+            // update the saved absolute position, not start a fresh remux.
+            pendingSeekRef.current.time = target;
+            setMovieTime(target);
         }
         const video = getActiveVideo();
         if (!video) return;
         const remux = useFallback && playbackMode === 'original' && !!fmp4StreamUrl;
-        const plan = planPlaybackSeek(video, remuxWindowRef.current.start, sourceDurationRef.current, time, remux);
+        const plan = planPlaybackSeek(video, remuxWindowRef.current.start, sourceDurationRef.current,
+            time, remux, remux && remuxWindowRef.current.complete);
+        const truncatedOriginal = !remux && useFallback && playbackMode === 'original'
+            && sourceDurationRef.current !== null && sourceDurationRef.current > 3
+            && (!Number.isFinite(video.duration)
+                || video.duration < sourceDurationRef.current - 2);
+        if (plan.kind === 'local' && plan.time > 0
+            && ((remux && shouldDeferCompletedRemuxSeek(
+                video, remuxWindowRef.current.complete, plan.time))
+                || (truncatedOriginal && shouldDeferCompletedRemuxSeek(
+                    video, true, plan.time)))) {
+            const play = pendingSeekRef.current?.play ?? !nativeUserPauseRef.current;
+            pendingSeekRef.current = { time, play };
+            setMovieTime(time);
+            return;
+        }
         if (plan.kind === 'remux') requestRemuxAt(plan.time);
         else video.currentTime = plan.time;
     }, [getActiveVideo, useFallback, playbackMode, fmp4StreamUrl, requestRemuxAt]);
@@ -441,8 +562,18 @@ export function AdaptiveMediaPlayer({
         if (!pending) return;
         const localTime = Math.max(0, pending.time - remuxWindowRef.current.start);
         const plan = planPlaybackSeek(video, remuxWindowRef.current.start, sourceDurationRef.current,
-            pending.time, !!remuxWindowRef.current.key);
-        if (localTime > 0 && plan.kind !== 'local') return;
+            pending.time, !!remuxWindowRef.current.key, remuxWindowRef.current.complete);
+        const truncatedOriginal = !remuxWindowRef.current.key
+            && sourceDurationRef.current !== null && sourceDurationRef.current > 3
+            && (!Number.isFinite(video.duration)
+                || video.duration < sourceDurationRef.current - 2);
+        if (localTime > 0 && (plan.kind !== 'local'
+            || shouldDeferCompletedRemuxSeek(
+                video, remuxWindowRef.current.complete, localTime,
+            )
+            || (truncatedOriginal && shouldDeferCompletedRemuxSeek(
+                video, true, localTime,
+            )))) return;
         video.currentTime = localTime;
         pendingSeekRef.current = null;
         savedTimeRef.current = 0;
@@ -451,6 +582,149 @@ export function AdaptiveMediaPlayer({
         if (pending.play) video.play().catch(() => {});
         else video.pause();
     }, []);
+
+    // Manual recovery after the one automatic retry is opt-in. Reload only
+    // the native URI, preserve play/seek intent and leave FFmpeg/MSE alone.
+    const retryNativePlayback = useCallback(() => {
+        const video = fallbackVideoRef.current;
+        const resume = pendingSeekRef.current?.play ?? !nativeUserPauseRef.current;
+        pendingSeekRef.current = {
+            time: pendingSeekRef.current?.time
+                ?? (remuxWindowRef.current.start + (video?.currentTime ?? 0)),
+            play: resume,
+        };
+        nativeOriginalRetryRef.current = 0;
+        nativeCompletedRetryRef.current = 0;
+        setNativeAutoPlay(resume);
+        setNativeError(null);
+        setNativePhase('loading');
+        if (video) {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+        }
+        setNativeDecoderRevision(n => n + 1);
+    }, []);
+
+    // Explicitly requested, bounded, private-memory compatibility for small
+    // MP4s. The normal HTTP path stays streaming, and no FFmpeg job is started.
+    const loadMemoryPlayback = useCallback(async () => {
+        if (memoryFetchRef.current || !eligibleNativeMemoryMp4(file.name, file.size, !!file.is_split, streamUrl)) return;
+        const controller = new AbortController();
+        memoryFetchRef.current = controller;
+        const generation = ++memoryGenerationRef.current;
+        setMemoryLoading(true);
+        try {
+            const blob = await fetchBoundedNativeMp4(streamUrl, file.size, controller.signal);
+            if (controller.signal.aborted || generation !== memoryGenerationRef.current) return;
+            const objectUrl = URL.createObjectURL(blob);
+            if (memoryMediaUrlRef.current) URL.revokeObjectURL(memoryMediaUrlRef.current);
+            memoryMediaUrlRef.current = objectUrl;
+            const video = fallbackVideoRef.current;
+            const resume = pendingSeekRef.current?.play ?? !nativeUserPauseRef.current;
+            pendingSeekRef.current = {
+                time: pendingSeekRef.current?.time ?? (video?.currentTime ?? 0),
+                play: resume,
+            };
+            nativeOriginalRetryRef.current = 0;
+            setNativeAutoPlay(resume);
+            if (video) {
+                video.pause();
+                video.removeAttribute('src');
+                video.load();
+            }
+            setNativeError(null);
+            setNativePhase('loading');
+            setMemoryMedia({ source: streamUrl, url: objectUrl });
+            setNativeDecoderRevision(n => n + 1);
+        } catch {
+            if (!controller.signal.aborted && generation === memoryGenerationRef.current) {
+                // Never log or display the authenticated local source URL.
+                setNativeError('In-memory MP4 recovery failed. Retry the stream or choose compatibility playback.');
+                setNativePhase('error');
+            }
+        } finally {
+            if (generation === memoryGenerationRef.current) {
+                memoryFetchRef.current = null;
+                setMemoryLoading(false);
+            }
+        }
+    }, [file.name, file.size, file.is_split, streamUrl]);
+
+    // The original MP4 can encounter the same WebKit/GStreamer 20ms decoder
+    // truncation without any remux being involved. Give the *original*
+    // URL its own single bounded native restart rather than treating a
+    // valid file as a permanently unplayable clip. Do not start FFmpeg.
+    useEffect(() => {
+        if (fmp4StreamUrl || !useFallback || playbackMode !== 'original'
+            || fmp4RemuxingRef.current || nativePhase === 'error') return;
+        const video = fallbackVideoRef.current;
+        if (!video) return;
+        const generation = remuxGenerationRef.current;
+        const timer = setTimeout(() => {
+            if (generation !== remuxGenerationRef.current
+                || fallbackVideoRef.current !== video || fmp4RemuxingRef.current
+                || remuxWindowRef.current.key) return;
+            const expected = sourceDurationRef.current;
+            if (expected === null || expected <= 3 || !Number.isFinite(video.duration)
+                || video.duration >= expected - 2) return;
+            if (nativeOriginalRetryRef.current >= 1) {
+                setNativeError('The video decoder could not load the complete file. Use Retry playback.');
+                setNativePhase('error');
+                return;
+            }
+            nativeOriginalRetryRef.current += 1;
+            const resume = pendingSeekRef.current?.play ?? !nativeUserPauseRef.current;
+            pendingSeekRef.current = {
+                time: pendingSeekRef.current?.time ?? video.currentTime,
+                play: resume,
+            };
+            setNativeAutoPlay(resume);
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            setNativeDecoderRevision(n => n + 1);
+        }, 2500);
+        return () => clearTimeout(timer);
+    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision, nativePhase]);
+
+    // A native decoder can keep the first 200ms media fragment as the entire
+    // duration even after fetching the fully completed, independently ranged
+    // fMP4. One bounded *decoder* retry is safer than silently freezing or
+    // triggering another expensive/duplicate Telegram remux.
+    useEffect(() => {
+        if (!fmp4StreamUrl || !useFallback || playbackMode !== 'original'
+            || !remuxWindowRef.current.complete) return;
+        const video = fallbackVideoRef.current;
+        if (!video) return;
+        const generation = remuxGenerationRef.current;
+        const timer = setTimeout(() => {
+            if (generation !== remuxGenerationRef.current
+                || fallbackVideoRef.current !== video || !remuxWindowRef.current.complete) return;
+            const expected = sourceDurationRef.current == null ? null
+                : sourceDurationRef.current - remuxWindowRef.current.start;
+            if (expected === null || expected <= 3
+                || !Number.isFinite(video.duration) || video.duration >= expected - 2) return;
+            if (nativeCompletedRetryRef.current >= 1) {
+                setNativeError('The media decoder could not load the completed video. Use Retry playback.');
+                setNativePhase('error');
+                return;
+            }
+            nativeCompletedRetryRef.current += 1;
+            // Respect the user's latest play/pause choice and pending seek.
+            const resume = pendingSeekRef.current?.play ?? !nativeUserPauseRef.current;
+            pendingSeekRef.current = {
+                time: pendingSeekRef.current?.time ?? remuxWindowRef.current.start + video.currentTime,
+                play: resume,
+            };
+            setNativeAutoPlay(resume);
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            setNativeDecoderRevision(n => n + 1);
+        }, 2500);
+        return () => clearTimeout(timer);
+    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision]);
 
     useEffect(() => {
         const audio = mediaTracks.audio_tracks.find(track => track.index === selectedAudioStream)
@@ -470,11 +744,16 @@ export function AdaptiveMediaPlayer({
         const pending = pendingSeekRef.current;
         if (pending) {
             pending.play = !pending.play;
+            nativeUserPauseRef.current = !pending.play;
             setNativePaused(!pending.play);
             return;
         }
         const video = getActiveVideo();
-        if (video) video.paused ? video.play().catch(() => {}) : video.pause();
+        if (video) {
+            nativeUserPauseRef.current = !video.paused;
+            if (video.paused) video.play().catch(() => {});
+            else video.pause();
+        }
     }, [getActiveVideo]);
 
     const handleAudioTrackChange = useCallback((streamIndex: number) => {
@@ -493,6 +772,11 @@ export function AdaptiveMediaPlayer({
 
         requestRemuxAt(moviePosition);
         if (playbackMode === 'hls') {
+            hlsGenerationRef.current += 1;
+            hlsDesiredJobRef.current = null;
+            const previousJobId = currentJobIdRef.current;
+            currentJobIdRef.current = null;
+            if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
             hlsRef.current?.destroy();
             hlsRef.current = null;
             if (pollTimerRef.current) clearInterval(pollTimerRef.current);
@@ -503,9 +787,13 @@ export function AdaptiveMediaPlayer({
     }, [getMoviePosition, requestRemuxAt, playbackMode, setQuality]);
 
     const handleSubtitleTrackChange = useCallback(async (streamIndex: number | null) => {
+        const generation = ++subtitleSelectionGenerationRef.current;
         setSelectedSubtitleStream(streamIndex);
         setSubtitleUrl(null);
-        if (streamIndex === null) return;
+        if (streamIndex === null) {
+            setSubtitleLoading(false);
+            return;
+        }
 
         setSubtitleLoading(true);
         try {
@@ -514,23 +802,30 @@ export function AdaptiveMediaPlayer({
                 folderId: activeFolderId,
                 streamIndex,
             });
-            const separator = relativeUrl.includes('?') ? '&' : '?';
-            const fullUrl = streamBaseRef.current + relativeUrl + separator + 'token=' + streamAuthRef.current;
+            if (generation !== subtitleSelectionGenerationRef.current) return;
+            const fullUrl = buildAuthenticatedSubtitleUrl(
+                streamBaseRef.current, relativeUrl, streamAuthRef.current,
+            );
+            if (!fullUrl) throw new Error('Invalid local subtitle URL');
             setSubtitleUrl(fullUrl);
         } catch (error) {
+            if (generation !== subtitleSelectionGenerationRef.current) return;
             toast.error('Subtitle preparation failed: ' + String(error));
             setSelectedSubtitleStream(null);
         } finally {
-            setSubtitleLoading(false);
+            if (generation === subtitleSelectionGenerationRef.current) setSubtitleLoading(false);
         }
     }, [file.id, activeFolderId]);
 
-    // Extract stream token and base URL once
+    // Extract stream token and base URL for each source, never retaining an
+    // earlier file's local bearer token across a source switch or parse error.
     useEffect(() => {
+        clearMemoryMedia();
+        streamAuthRef.current = '';
+        streamBaseRef.current = '';
         try {
             const url = new URL(streamUrl);
-            const authValue = url.searchParams.get('token');
-            if (authValue) streamAuthRef.current = authValue;
+            streamAuthRef.current = url.searchParams.get('token') || '';
             // Store origin for constructing HLS URLs
             const streamIdx = streamUrl.indexOf(STREAM_BASE_KEY);
             if (streamIdx !== -1) {
@@ -538,7 +833,7 @@ export function AdaptiveMediaPlayer({
             } else {
                 streamBaseRef.current = url.origin;
             }
-        } catch { /* ignore */ }
+        } catch { /* Invalid source has no reusable authentication or origin. */ }
 
         // Reset fMP4 remux state when switching files.
         // Prevents stale error / loading state from a previous progressive
@@ -553,23 +848,40 @@ export function AdaptiveMediaPlayer({
         setNativeAutoPlay(true);
         fmp4RemuxingRef.current = false;
         remuxGenerationRef.current += 1;
+        hlsGenerationRef.current += 1;
+        hlsDesiredJobRef.current = null;
+        if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+        }
+        const previousJobId = currentJobIdRef.current;
+        currentJobIdRef.current = null;
+        if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
         remuxWindowRef.current = { start: 0, complete: false, key: null };
         pendingSeekRef.current = null;
         savedTimeRef.current = 0;
         savedPlaybackRef.current = true;
+        nativeUserPauseRef.current = false;
+        nativeOriginalRetryRef.current = 0;
+        nativeCompletedRetryRef.current = 0;
+        setNativeDecoderRevision(0);
         setMovieTime(0);
         setNativePaused(false);
         return () => {
+            clearMemoryMedia();
             remuxGenerationRef.current += 1;
+            hlsGenerationRef.current += 1;
+            hlsDesiredJobRef.current = null;
             const fileKey = remuxWindowRef.current.key;
             if (fileKey) invoke('cmd_cancel_fmp4_stream', { fileKey }).catch(() => {});
         };
-    }, [streamUrl]);
+    }, [streamUrl, clearMemoryMedia]);
 
     // Probe embedded audio/subtitle tracks from the authenticated local
     // stream. Failure is non-fatal: playback still works without selectors.
     useEffect(() => {
         let cancelled = false;
+        subtitleSelectionGenerationRef.current += 1;
         setMediaTracks({ audio_tracks: [], subtitle_tracks: [] });
         setSelectedAudioStream(null);
         selectedAudioStreamRef.current = null;
@@ -595,6 +907,7 @@ export function AdaptiveMediaPlayer({
 
         return () => {
             cancelled = true;
+            subtitleSelectionGenerationRef.current += 1;
         };
     }, [file.id, activeFolderId, streamUrl]);
 
@@ -643,16 +956,33 @@ export function AdaptiveMediaPlayer({
     // ── Poll transcode status ────────────────────────────────────────
     const pollTranscodeStatus = useCallback((jobId: string, quality: StreamingQuality) => {
         if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+        const generation = hlsGenerationRef.current;
+        let consecutiveFailures = 0;
+        let statusRequestInFlight = false;
 
-        pollTimerRef.current = setInterval(async () => {
+        const intervalId = setInterval(async () => {
+            if (statusRequestInFlight) return;
+            statusRequestInFlight = true;
+            let statusTimeout: ReturnType<typeof setTimeout> | null = null;
             try {
-                const status = await invoke<{
-                    job_id: string;
-                    status: string;
-                    progress: number;
-                    error: string | null;
-                    playlist_url: string | null;
-                }>('cmd_get_transcode_status', { jobId });
+                const status = await Promise.race([
+                    invoke<{
+                        job_id: string;
+                        status: string;
+                        progress: number;
+                        error: string | null;
+                        playlist_url: string | null;
+                    }>('cmd_get_transcode_status', { jobId }),
+                    new Promise<never>((_, reject) => {
+                        // A hung native IPC should not strand the quality
+                        // spinner forever or issue overlapping poll requests.
+                        statusTimeout = setTimeout(() => reject(new Error('HLS status timeout')), 8000);
+                    }),
+                ]);
+                if (generation !== hlsGenerationRef.current
+                    || currentJobIdRef.current !== jobId
+                    || pollTimerRef.current !== intervalId) return;
+                consecutiveFailures = 0;
 
                 log('cmd_get_transcode_status result', { jobId, status: status.status, progress: status.progress });
 
@@ -667,42 +997,89 @@ export function AdaptiveMediaPlayer({
                         setHlsProgress(status.progress);
                         break;
                     case 'ready':
-                        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+                        clearInterval(intervalId);
+                        pollTimerRef.current = null;
+                        currentJobIdRef.current = null;
+                        const readyPlaylistUrl = buildAuthenticatedHlsUrl(
+                            streamBaseRef.current, status.playlist_url || '', streamAuthRef.current,
+                        );
+                        if (!readyPlaylistUrl) {
+                            // Never publish a ready player without a valid,
+                            // authenticated, same-origin HLS media URL.
+                            setHlsPhase('failed');
+                            setHlsError('Transcode completed without a valid playlist. Retry conversion.');
+                            setHlsVariantStates(prev => ({ ...prev, [q]: 'failed' }));
+                            break;
+                        }
                         setHlsPhase('ready');
                         setHlsProgress(1);
-                        if (status.playlist_url) {
-                            const fullUrl = `${streamBaseRef.current}${status.playlist_url}?token=${streamAuthRef.current}`;
-                            setHlsPlaylistUrl(fullUrl);
-                        }
+                        setHlsPlaylistUrl(readyPlaylistUrl);
                         setHlsVariantStates(prev => ({ ...prev, [q]: 'ready' }));
                         break;
                     case 'error':
-                        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+                        clearInterval(intervalId);
+                        pollTimerRef.current = null;
+                        currentJobIdRef.current = null;
                         setHlsPhase('failed');
                         setHlsError(status.error || 'Transcode failed');
                         setHlsVariantStates(prev => ({ ...prev, [q]: 'failed' }));
                         break;
                     case 'cancelled':
-                        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-                        setHlsPhase('idle');
+                        clearInterval(intervalId);
+                        pollTimerRef.current = null;
+                        currentJobIdRef.current = null;
+                        setHlsPhase('failed');
+                        setHlsError('Previous conversion is stopping. Select Retry to start it again.');
+                        setHlsVariantStates(prev => ({ ...prev, [q]: 'failed' }));
                         break;
                 }
             } catch {
-                // Status check failed, will retry
+                // Keep transient IPC errors retryable, but do not leave an HLS
+                // quality and spinner stuck forever when status IPC is down.
+                if (generation !== hlsGenerationRef.current
+                    || currentJobIdRef.current !== jobId
+                    || pollTimerRef.current !== intervalId) return;
+                consecutiveFailures += 1;
+                if (consecutiveFailures >= 5) {
+                    clearInterval(intervalId);
+                    pollTimerRef.current = null;
+                    currentJobIdRef.current = null;
+                    setHlsPhase('failed');
+                    setHlsError('Could not check conversion status. Retry conversion.');
+                    setHlsVariantStates(prev => ({ ...prev, [quality]: 'failed' }));
+                }
+            } finally {
+                if (statusTimeout !== null) clearTimeout(statusTimeout);
+                statusRequestInFlight = false;
             }
         }, 1000);
+        pollTimerRef.current = intervalId;
     }, []);
 
     // ── Start HLS transcode for a quality ───────────────────────────
     const startTranscode = useCallback(async (quality: StreamingQuality) => {
         if (quality === 'original' || !HLS_QUALITIES.includes(quality)) return;
+        const generation = ++hlsGenerationRef.current;
+        // Matches TranscodeKey::job_id in src-tauri/src/transcode.rs.
+        const desiredJobId = `${activeFolderId ?? 0}_${file.id}_${quality}`;
+        hlsDesiredJobRef.current = desiredJobId;
+        if (pollTimerRef.current) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+        }
+        const previousJobId = currentJobIdRef.current;
+        currentJobIdRef.current = null;
+        if (previousJobId && previousJobId !== desiredJobId) {
+            invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
+        }
 
         log('startTranscode', { quality, activeFolderId, messageId: file.id });
 
         // Save current playback time from whichever player is visible.
         const video = getActiveVideo();
         savedTimeRef.current = getMoviePosition();
-        savedPlaybackRef.current = pendingSeekRef.current?.play ?? !video?.paused;
+        savedPlaybackRef.current = pendingSeekRef.current?.play
+            ?? (nativeUserPauseRef.current ? false : !video?.paused);
         pendingSeekRef.current = null;
         remuxGenerationRef.current += 1;
         fmp4RemuxingRef.current = false;
@@ -735,20 +1112,43 @@ export function AdaptiveMediaPlayer({
                 quality,
             });
 
-            log('cmd_prepare_transcoded_stream result', result);
+            // If a different movie/quality took over, only cancel the job
+            // owned by this obsolete request; never display its playlist.
+            if (generation !== hlsGenerationRef.current) {
+                // Rust keys transcodes by folder/file/quality, not request
+                // generation. Two requests can share a job. Never cancel the
+                // replacement's matching job, nor a finished cached variant.
+                if (result.job_id && result.status !== 'ready'
+                    && result.job_id !== hlsDesiredJobRef.current) {
+                    invoke('cmd_cancel_transcode', { jobId: result.job_id }).catch(() => {});
+                }
+                return;
+            }
+            log('cmd_prepare_transcoded_stream result', { status: result.status });
 
             if (result.status === 'ready') {
+                const fullUrl = buildAuthenticatedHlsUrl(
+                    streamBaseRef.current, result.playlist_url || '', streamAuthRef.current,
+                );
+                if (!fullUrl) {
+                    // A disk/cache race or unexpected URL must never publish
+                    // an unusable/cross-origin media source carrying local auth.
+                    setHlsPhase('failed');
+                    setHlsError('Transcode completed without a valid playlist. Retry conversion.');
+                    setHlsVariantStates(prev => ({ ...prev, [quality]: 'failed' }));
+                    return;
+                }
                 setHlsPhase('ready');
                 setHlsProgress(1);
                 setHlsVariantStates(prev => ({ ...prev, [quality]: 'ready' }));
-                if (result.playlist_url) {
-                    const fullUrl = `${streamBaseRef.current}${result.playlist_url}?token=${streamAuthRef.current}`;
-                    log('hlsPlaylistUrl', fullUrl);
-                    setHlsPlaylistUrl(fullUrl);
-                }
-            } else if (result.status === 'error') {
+                // The URL carries a local stream auth token; don't log it.
+                log('hlsPlaylistReady', { quality });
+                setHlsPlaylistUrl(fullUrl);
+            } else if (result.status === 'error' || result.status === 'cancelled') {
                 setHlsPhase('failed');
-                setHlsError('Transcode failed to start');
+                setHlsError(result.status === 'cancelled'
+                    ? 'Previous conversion is stopping. Select Retry to start it again.'
+                    : 'Transcode failed to start');
                 setHlsVariantStates(prev => ({ ...prev, [quality]: 'failed' }));
             } else {
                 // Job started, begin polling
@@ -757,6 +1157,7 @@ export function AdaptiveMediaPlayer({
                 pollTranscodeStatus(result.job_id, quality);
             }
         } catch (e: any) {
+            if (generation !== hlsGenerationRef.current) return;
             log('startTranscode error', String(e));
             setHlsPhase('failed');
             setHlsError(String(e));
@@ -772,6 +1173,11 @@ export function AdaptiveMediaPlayer({
         setQuality(quality);
 
         if (quality === 'original') {
+            hlsGenerationRef.current += 1;
+            hlsDesiredJobRef.current = null;
+            const previousJobId = currentJobIdRef.current;
+            currentJobIdRef.current = null;
+            if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
             const restoreRemux = playbackMode === 'hls' && !!fmp4StreamUrl;
             const moviePosition = restoreRemux ? getMoviePosition() : 0;
             // Clean up HLS if switching back from transcode mode
@@ -898,7 +1304,8 @@ export function AdaptiveMediaPlayer({
         const video = hlsVideoRef.current;
         if (!video) return;
 
-        log('Initializing HLS playback', { playlistUrl: hlsPlaylistUrl });
+        // Playlist URL contains the local bearer token: log no URL or query.
+        log('Initializing HLS playback');
 
         // Seek to saved position
         const savedTime = savedTimeRef.current;
@@ -910,7 +1317,6 @@ export function AdaptiveMediaPlayer({
                 log('HLS metadata', {
                     width: v.videoWidth,
                     height: v.videoHeight,
-                    src: v.currentSrc,
                 });
                 // Capture source resolution for the badge
                 if (v.videoWidth > 0 && v.videoHeight > 0) {
@@ -924,8 +1330,7 @@ export function AdaptiveMediaPlayer({
             video.src = hlsPlaylistUrl;
             video.addEventListener('loadedmetadata', () => {
                 onHlsMetadata();
-                if (savedTime > 0) video.currentTime = savedTime;
-                video.play().catch(() => {});
+                restoreCompatibilityPlayback(video, savedTime, savedPlaybackRef.current);
             }, { once: true });
         } else if (Hls.isSupported()) {
             const authValue = streamAuthRef.current;
@@ -933,12 +1338,17 @@ export function AdaptiveMediaPlayer({
                 enableWorker: true,
                 lowLatencyMode: false,
                 backBufferLength: 90,
-                // ── Token propagation: append ?token=... to every /hls/ request ──
-                // Guard against URLs that already have a token param
+                // Authenticate only this player's local playlist/segment URLs.
+                // Never send a local bearer token to an external HLS URI.
                 xhrSetup: (xhr, url) => {
-                    if (authValue && url.includes('/hls/') && !/[?&]token=/.test(url)) {
-                        const sep = url.includes('?') ? '&' : '?';
-                        xhr.open('GET', `${url}${sep}token=${encodeURIComponent(authValue)}`, true);
+                    const allowedUrl = authorizeHlsChildRequestUrl(hlsPlaylistUrl, url, authValue);
+                    if (!allowedUrl) {
+                        // hls.js otherwise falls through to its original URL.
+                        // Do not contact an unexpected off-origin child URI.
+                        // The backend refuses this unauthenticated local path.
+                        xhr.open('GET', new URL('/hls/_rejected', hlsPlaylistUrl).toString(), true);
+                    } else if (allowedUrl !== url) {
+                        xhr.open('GET', allowedUrl, true);
                     }
                 },
             });
@@ -950,8 +1360,7 @@ export function AdaptiveMediaPlayer({
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 log('HLS MANIFEST_PARSED, seeking to', savedTime);
                 onHlsMetadata();
-                if (savedTime > 0) video.currentTime = savedTime;
-                video.play().catch(() => {});
+                restoreCompatibilityPlayback(video, savedTime, savedPlaybackRef.current);
             });
 
             hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -978,13 +1387,15 @@ export function AdaptiveMediaPlayer({
     }, [playbackMode, hlsPlaylistUrl, hlsPhase, hlsVideoReady, log]);
 
     // ── Cancel ongoing transcode ─────────────────────────────────────
-    const cancelTranscode = useCallback(async () => {
+    const cancelTranscode = useCallback(() => {
         log('cancelTranscode');
+        hlsGenerationRef.current += 1;
+        hlsDesiredJobRef.current = null;
         const jobId = currentJobIdRef.current;
-        if (jobId) {
-            try { await invoke('cmd_cancel_transcode', { jobId }); } catch {}
-            currentJobIdRef.current = null;
-        }
+        currentJobIdRef.current = null;
+        // Invalidate the old player immediately. Never await cancellation:
+        // a slow/stale response must not wipe a newer user's quality choice.
+        if (jobId) invoke('cmd_cancel_transcode', { jobId }).catch(() => {});
         if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -1014,6 +1425,10 @@ export function AdaptiveMediaPlayer({
     // ── Cleanup ──────────────────────────────────────────────────────
     useEffect(() => {
         return () => {
+            hlsGenerationRef.current += 1;
+            const jobId = currentJobIdRef.current;
+            currentJobIdRef.current = null;
+            if (jobId) invoke('cmd_cancel_transcode', { jobId }).catch(() => {});
             if (hlsRef.current) {
                 hlsRef.current.destroy();
                 hlsRef.current = null;
@@ -1029,7 +1444,13 @@ export function AdaptiveMediaPlayer({
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
             const target = e.target as HTMLElement;
-            if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+            // Select menus, inputs, and accessible sliders own their own arrow keys.
+            // Do not seek the video while a keyboard user adjusts one of them.
+            if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA'
+                || target?.tagName === 'SELECT' || target?.isContentEditable
+                || target?.getAttribute?.('role') === 'slider'
+                || target?.getAttribute?.('role') === 'combobox') return;
+            if ((target?.tagName === 'BUTTON' || target?.tagName === 'VIDEO') && e.key === ' ') return;
             const key = e.key.toLowerCase();
             if (e.shiftKey && e.key === 'ArrowRight') { e.preventDefault(); onNext?.(); }
             else if (e.shiftKey && e.key === 'ArrowLeft') { e.preventDefault(); onPrev?.(); }
@@ -1056,6 +1477,38 @@ export function AdaptiveMediaPlayer({
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [onClose, onNext, onPrev, seekBy, toggleFullscreen, toggleMute, toggleDebugOverlay, togglePlayback]);
 
+    // Keep keyboard focus in the modal and return it to the invoking control
+    // when the player closes. Native media controls still receive their keys.
+    useEffect(() => {
+        const previous = document.activeElement;
+        const dialog = containerRef.current;
+        dialog?.querySelector<HTMLButtonElement>('[data-player-close]')?.focus();
+        const containFocus = (event: KeyboardEvent) => {
+            if (event.key !== 'Tab' || !dialog) return;
+            const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+                'button:not([disabled]), select:not([disabled]), input:not([disabled]), video[controls], [tabindex]:not([tabindex="-1"])',
+            )).filter(element => element.getClientRects().length > 0);
+            if (!focusable.length) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (!dialog.contains(document.activeElement)) {
+                event.preventDefault();
+                (event.shiftKey ? last : first).focus();
+            } else if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+        window.addEventListener('keydown', containFocus);
+        return () => {
+            window.removeEventListener('keydown', containFocus);
+            if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
+        };
+    }, []);
+
     // ── Determine current display state ──────────────────────────────
     const isHlsMode = playbackMode === 'hls';
     const hasVideoTrack = tracks.some(t => t.type === 'video');
@@ -1063,6 +1516,12 @@ export function AdaptiveMediaPlayer({
     const isHlsLoading = hlsPhase === 'preparing' || hlsPhase === 'caching' || hlsPhase === 'transcoding';
     const displayPhase: string = isHlsMode ? hlsPhase : fmp4RemuxError ? 'error' : useFallback ? nativePhase : (isMseLoading ? 'loading' : msePhase);
     const displayError: string | null = isHlsMode ? hlsError : fmp4RemuxError || (useFallback ? nativeError : mseError);
+    // An opt-in alternate playback engine for a native decoder failure.
+    // Respect the backend's supported quality list and never upscale an
+    // independently probed lower-resolution source.
+    const compatibilityQuality = transcodeCapabilities?.available
+        ? chooseCompatibilityQuality(transcodeCapabilities.variants, sourceHeight)
+        : null;
     const showOriginalVideo = !isHlsMode && !useFallback;
 
     // Build the effective quality label
@@ -1073,19 +1532,20 @@ export function AdaptiveMediaPlayer({
             className={`fixed inset-0 z-[200] bg-black/90 animate-in fade-in duration-200 ${isFullscreen ? 'p-0' : 'flex items-center justify-center p-4 backdrop-blur-md'}`}
             onClick={onClose}
         >
-            <div ref={containerRef} className={`relative ${isFullscreen ? 'fixed inset-0 w-screen h-screen max-w-none' : 'w-full max-w-6xl flex flex-col items-center'}`} onClick={e => e.stopPropagation()}>
+            <div ref={containerRef} role="dialog" aria-modal="true" aria-label={`Video player: ${file.name}`} className={`relative ${isFullscreen ? 'fixed inset-0 w-screen h-screen max-w-none' : 'w-full max-w-6xl flex flex-col items-center'}`} onClick={e => e.stopPropagation()}>
                 {/* Video seek buttons. Shift+Arrow keeps previous/next file navigation. */}
-                <button onClick={() => seekBy(-10)} className={`absolute left-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'left-4' : ''}`} title="Back 10 seconds (ArrowLeft / J)">
+                <button onClick={() => seekBy(-10)} aria-label="Back 10 seconds" className={`absolute left-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'left-4' : ''}`} title="Back 10 seconds (ArrowLeft / J)">
                     <ChevronLeft className="w-6 h-6" />
                     <span className="sr-only">Back 10 seconds</span>
                 </button>
-                <button onClick={() => seekBy(10)} className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'right-4' : ''}`} title="Forward 10 seconds (ArrowRight / L)">
+                <button onClick={() => seekBy(10)} aria-label="Forward 10 seconds" className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'right-4' : ''}`} title="Forward 10 seconds (ArrowRight / L)">
                     <ChevronRight className="w-6 h-6" />
                     <span className="sr-only">Forward 10 seconds</span>
                 </button>
                 <div className={`absolute z-30 flex items-center gap-2 ${isFullscreen ? 'top-4 right-4' : '-top-12 right-0'}`}>
                     <button
                         onClick={toggleFullscreen}
+                        aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                         className="w-10 h-10 flex items-center justify-center text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all"
                         title={isFullscreen ? 'Exit fullscreen (F)' : 'Fullscreen (F)'}
                     >
@@ -1093,6 +1553,8 @@ export function AdaptiveMediaPlayer({
                     </button>
                     <button
                         onClick={onClose}
+                        data-player-close
+                        aria-label="Close video player"
                         className="w-10 h-10 flex items-center justify-center text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all"
                         title="Close (Esc)"
                     >
@@ -1104,7 +1566,7 @@ export function AdaptiveMediaPlayer({
                 <div className={`bg-black overflow-hidden flex items-center justify-center relative ${isFullscreen ? 'w-full h-full rounded-none shadow-none ring-0' : 'w-full aspect-video rounded-xl shadow-2xl ring-1 ring-white/10'}`}>
                     {/* fMP4 remux loading overlay */}
                     {fmp4Remuxing && (
-                        <div className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
+                        <div role="status" className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
                             <Zap className="w-10 h-10 text-telegram-primary animate-pulse" />
                             <div className="flex flex-col items-center gap-1">
                                 <p className="text-sm font-medium">Converting to streaming format...</p>
@@ -1117,10 +1579,36 @@ export function AdaptiveMediaPlayer({
 
                     {/* Error display */}
                     {!fmp4Remuxing && (displayPhase === 'error' || displayPhase === 'failed') && (
-                        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 text-white px-8">
+                        <div role="alert" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 text-white px-8">
                             <AlertTriangle className="w-10 h-10 text-red-400" />
                             <p className="text-sm text-red-400 font-medium">Playback Error</p>
                             <p className="text-xs text-white/40 text-center max-w-md">{displayError || 'Unknown error'}</p>
+                            {!isHlsMode && useFallback && !fmp4RemuxError && (
+                                <button type="button" onClick={retryNativePlayback} disabled={memoryLoading}
+                                    className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium disabled:opacity-40"
+                                    aria-label="Retry video playback">
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                    Retry playback
+                                </button>
+                            )}
+                            {!isHlsMode && useFallback && !fmp4StreamUrl && !fmp4RemuxError
+                                && !memoryMediaUrl && eligibleNativeMemoryMp4(file.name, file.size, !!file.is_split, streamUrl) && (
+                                <button type="button" onClick={memoryLoading ? clearMemoryMedia : loadMemoryPlayback}
+                                    aria-label={memoryLoading ? 'Cancel in-memory MP4 playback download' : 'Try in-memory MP4 playback'}
+                                    className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium">
+                                    {memoryLoading ? <StopCircle className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                                    {memoryLoading ? 'Cancel in-memory MP4 download' : 'Try in-memory MP4 (max 8 MB, no FFmpeg)'}
+                                </button>
+                            )}
+                            {!isHlsMode && useFallback && !fmp4RemuxError && compatibilityQuality && (
+                                <button type="button" disabled={memoryLoading}
+                                    onClick={() => startTranscode(compatibilityQuality)}
+                                    aria-label="Try compatibility playback"
+                                    className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium disabled:opacity-40">
+                                    <Play className="w-3.5 h-3.5" />
+                                    Try compatibility playback ({compatibilityQuality}, FFmpeg)
+                                </button>
+                            )}
                             {isHlsMode && (
                                 <button onClick={retryTranscode} className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium transition-colors">
                                     <RefreshCw className="w-3.5 h-3.5" />
@@ -1132,7 +1620,7 @@ export function AdaptiveMediaPlayer({
 
                     {/* Loading overlay */}
                     {isHlsLoading && (
-                        <div className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
+                        <div role="status" className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
                             <Loader2 className="w-10 h-10 text-telegram-primary animate-spin" />
                             <div className="flex flex-col items-center gap-1">
                                 <p className="text-sm font-medium">
@@ -1142,7 +1630,7 @@ export function AdaptiveMediaPlayer({
                                 </p>
                                 {hlsProgress > 0 && (
                                     <div className="flex items-center gap-2">
-                                        <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                                        <div role="progressbar" aria-label="Video transcoding progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(hlsProgress * 100)} className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
                                             <div className="h-full bg-telegram-primary rounded-full transition-all duration-300" style={{ width: `${Math.round(hlsProgress * 100)}%` }} />
                                         </div>
                                         <span className="text-[11px] text-white/40">{Math.round(hlsProgress * 100)}%</span>
@@ -1163,13 +1651,13 @@ export function AdaptiveMediaPlayer({
 
                     {/* MSE loading overlay (original mode) */}
                     {showOriginalVideo && isMseLoading && (
-                        <div className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
+                        <div role="status" className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
                             <Loader2 className="w-10 h-10 text-telegram-primary animate-spin" />
                             <div className="flex flex-col items-center gap-1">
                                 <p className="text-sm font-medium">Loading video</p>
                                 {loadProgress > 0 && (
                                     <div className="flex items-center gap-2">
-                                        <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                                        <div role="progressbar" aria-label="Video loading progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(loadProgress)} className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
                                             <div className="h-full bg-telegram-primary rounded-full transition-all duration-300" style={{ width: `${loadProgress}%` }} />
                                         </div>
                                         <span className="text-[11px] text-white/40">{loadProgress}%</span>
@@ -1185,10 +1673,23 @@ export function AdaptiveMediaPlayer({
                     {/* Fallback: native playback with a source-duration timeline for remux windows. */}
                     {useFallback && !isHlsMode && (
                         <video
+                            // A completed fMP4 source must create a fresh
+                            // WebKit/GStreamer player. Updating src on the
+                            // existing element can leave its former growing
+                            // response's zero-duration parser attached even
+                            // after the final ranged URL is selected.
+                            // pendingSeekRef restores position/play intent.
+                            key={`${nativeDecoderRevision}:${nativeMediaUrl}`}
                             ref={fallbackVideoRef}
-                            src={fallbackUrl}
+                            aria-label={`Video: ${file.name}`}
+                            src={nativeMediaUrl}
                             controls={!fmp4StreamUrl || sourceDuration === null}
                             controlsList="nodownload"
+                            // WebKitGTK's automatic HTTP preload enables GStreamer
+                            // downloadbuffer, whose /var/tmp cache path can fail
+                            // in constrained native runtimes. Seekable media
+                            // remains requested on demand during playback.
+                            preload="metadata"
                             autoPlay={nativeAutoPlay}
                             className="w-full h-full object-contain"
                             onLoadedMetadata={(event) => {
@@ -1237,6 +1738,7 @@ export function AdaptiveMediaPlayer({
                     {isHlsMode && (
                         <video
                             ref={hlsVideoCallbackRef}
+                            aria-label={`Video: ${file.name}`}
                             controls={hlsPhase === 'ready'}
                             controlsList="nodownload"
                             autoPlay
@@ -1259,6 +1761,7 @@ export function AdaptiveMediaPlayer({
                     {showOriginalVideo && (
                         <video
                             ref={mseVideoRef}
+                            aria-label={`Video: ${file.name}`}
                             controls
                             controlsList="nodownload"
                             autoPlay
@@ -1411,6 +1914,7 @@ export function AdaptiveMediaPlayer({
                                 {/* Play/Pause */}
                                 <button
                                     onClick={togglePlayback}
+                                    aria-label={nativePaused ? "Play video" : "Pause video"}
                                     className="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-full transition-all"
                                     title="Play/Pause (Space)"
                                 >
@@ -1422,12 +1926,13 @@ export function AdaptiveMediaPlayer({
                                     onMouseEnter={() => setShowVolumeSlider(true)}
                                     onMouseLeave={() => setShowVolumeSlider(false)}
                                 >
-                                    <button onClick={toggleMute} className="p-1.5 text-white/60 hover:text-white rounded-full hover:bg-white/10" title={isMuted ? 'Unmute' : 'Mute'}>
+                                    <button onClick={toggleMute} aria-label={isMuted ? "Unmute video" : "Mute video"} className="p-1.5 text-white/60 hover:text-white rounded-full hover:bg-white/10" title={isMuted ? 'Unmute' : 'Mute'}>
                                         {isMuted || volume === 0 ? <VolumeX className="w-4 h-4" /> : volume < 0.5 ? <Volume1 className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
                                     </button>
                                     <div className={`overflow-hidden transition-all duration-200 ${showVolumeSlider ? 'w-20 opacity-100' : 'w-0 opacity-0'}`}>
                                         <input
                                             type="range"
+                                            aria-label="Volume"
                                             min={0} max={1} step={0.05}
                                             value={isMuted ? 0 : volume}
                                             onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
@@ -1458,6 +1963,7 @@ export function AdaptiveMediaPlayer({
                                 {/* Exit fullscreen */}
                                 <button
                                     onClick={exitFullscreen}
+                                    aria-label="Exit fullscreen"
                                     className="w-10 h-10 flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 rounded-full transition-all"
                                     title="Exit fullscreen (F)"
                                 >
@@ -1467,6 +1973,7 @@ export function AdaptiveMediaPlayer({
                                 {/* Close */}
                                 <button
                                     onClick={onClose}
+                                    aria-label="Close video player"
                                     className="w-10 h-10 flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 rounded-full transition-all"
                                     title="Close (Esc)"
                                 >

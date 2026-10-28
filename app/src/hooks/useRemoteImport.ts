@@ -21,7 +21,7 @@ import {
 } from '../remoteImport';
 export { REMOTE_IMPORT_STORE_KEY } from '../remoteImport';
 
-type EnqueuePreparedImports = (inputs: PreparedImportInput[]) => Promise<string[]>;
+type EnqueuePreparedImports = (inputs: PreparedImportInput[], options?: { isCancelled: () => boolean }) => Promise<string[]>;
 
 type JobsUpdater = RemoteImportJob[] | ((current: RemoteImportJob[]) => RemoteImportJob[]);
 
@@ -55,11 +55,15 @@ export function useRemoteImport(
     activeFolderId: number | null,
     store: Store | null,
     enqueuePreparedImports: EnqueuePreparedImports,
+    cancelUploadItem?: (queueId: string) => void,
 ) {
     const [jobs, setJobsState] = useState<RemoteImportJob[]>([]);
     const [initialized, setInitialized] = useState(false);
     const jobsRef = useRef<RemoteImportJob[]>([]);
     const finalizingRef = useRef<Set<string>>(new Set());
+    const cancelledRef = useRef<Set<string>>(new Set());
+    const activeAcquisitionsRef = useRef<Set<string>>(new Set());
+    const activeEnqueuesRef = useRef<Set<string>>(new Set());
     const jobMutationTailRef = useRef<Promise<unknown>>(Promise.resolve());
     const queryClient = useQueryClient();
 
@@ -83,7 +87,12 @@ export function useRemoteImport(
     }, [persistSnapshot]);
 
     const updateJob = useCallback((jobId: string, update: (job: RemoteImportJob) => RemoteImportJob) => {
-        return setJobs(current => current.map(job => job.id === jobId ? update(job) : job));
+        return setJobs(current => current.map(job => {
+            if (job.id !== jobId) return job;
+            const next = update(job);
+            return cancelledRef.current.has(jobId) && next.phase !== 'cancelled'
+                ? { ...job, phase: 'cancelled' as const, error: undefined, progress: undefined } : next;
+        }));
     }, [setJobs]);
 
     useEffect(() => {
@@ -118,6 +127,8 @@ export function useRemoteImport(
         void listen<RemoteImportProgress>('remote-import-progress', event => {
             if (disposed) return;
             const payload = event.payload;
+            const current = jobsRef.current.find(job => job.id === payload.job_id);
+            if (!current || cancelledRef.current.has(current.id) || !['analyzing', 'downloading', 'processing', 'ready-to-upload'].includes(current.phase)) return;
             const normalizedPhase = normalizeBackendImportPhase(payload.phase);
             // Progress ticks stay in memory; phase transitions are already made
             // durable before starting each backend operation, avoiding disk writes
@@ -353,6 +364,7 @@ export function useRemoteImport(
         await updateJob(jobId, current => ({
             ...current,
             phase: 'analyzing',
+            dismissedAt: undefined,
             error: undefined,
             updatedAt: Date.now(),
         }));
@@ -361,6 +373,7 @@ export function useRemoteImport(
             const ready: RemoteImportJob = {
                 ...job,
                 phase: 'waiting-for-selection',
+                dismissedAt: undefined,
                 analysis,
                 selectedIds: options?.defaultSelection !== false ? defaultRemoteImportSelectionIds(analysis) : [],
                 error: undefined,
@@ -381,20 +394,35 @@ export function useRemoteImport(
     }, [getJob, updateJob]);
 
     const enqueueOutputs = useCallback(async (job: RemoteImportJob): Promise<RemoteImportJob> => {
+        const isCancelled = () => cancelledRef.current.has(job.id) || getJob(job.id)?.phase === 'cancelled';
+        if (isCancelled()) return getJob(job.id) ?? job;
         if (!job.outputs.length) throw new Error('Remote Import has no acquired files to upload');
-        const queueIds = await enqueuePreparedImports(preparedInputs(job));
-        if (!queueIds.length) throw new Error('Upload setup was cancelled. Retry when you are ready.');
-        const uploading: RemoteImportJob = {
-            ...job,
-            phase: 'uploading',
-            uploadQueueIds: queueIds,
-            error: undefined,
-            progress: undefined,
-            updatedAt: Date.now(),
-        };
-        await updateJob(job.id, () => uploading);
-        return uploading;
-    }, [enqueuePreparedImports, updateJob]);
+        activeEnqueuesRef.current.add(job.id);
+        try {
+            if (job.dismissedAt !== undefined) {
+                await updateJob(job.id, current => ({ ...current, dismissedAt: undefined }));
+            }
+            const queueIds = await enqueuePreparedImports(preparedInputs(job), { isCancelled });
+            if (isCancelled()) {
+                await updateJob(job.id, current => ({ ...current, phase: 'cancelled', uploadQueueIds: queueIds }));
+                for (const id of queueIds) cancelUploadItem?.(id);
+                return getJob(job.id) ?? job;
+            }
+            if (!queueIds.length) throw new Error('Upload setup was cancelled. Retry when you are ready.');
+            await updateJob(job.id, current => ({
+                ...current, phase: 'uploading', uploadQueueIds: queueIds,
+                error: undefined, progress: undefined, updatedAt: Date.now(),
+            }));
+            if (isCancelled()) for (const id of queueIds) cancelUploadItem?.(id);
+            return getJob(job.id) ?? job;
+        } finally {
+            activeEnqueuesRef.current.delete(job.id);
+            const current = getJob(job.id);
+            if (isCancelled() && !current?.uploadQueueIds.length && !activeAcquisitionsRef.current.has(job.id)) {
+                await invoke('cmd_remote_import_cleanup', { jobId: job.id }).catch(() => false);
+            }
+        }
+    }, [cancelUploadItem, enqueuePreparedImports, getJob, updateJob]);
 
     const startImport = useCallback(async (
         jobId: string,
@@ -412,6 +440,7 @@ export function useRemoteImport(
         const downloading: RemoteImportJob = {
             ...job,
             phase: 'downloading',
+            dismissedAt: undefined,
             selectedIds: selectionIds,
             uploadQueueIds: [],
             error: undefined,
@@ -421,7 +450,9 @@ export function useRemoteImport(
         };
         await updateJob(job.id, () => downloading);
 
+        activeAcquisitionsRef.current.add(job.id);
         try {
+            if (cancelledRef.current.has(job.id)) return getJob(job.id) ?? job;
             const selections = buildRemoteImportSelections(job.analysis, selectionIds);
             const acquired = await invoke<RemoteImportAcquireResult>('cmd_remote_import_acquire', {
                 req: {
@@ -430,6 +461,8 @@ export function useRemoteImport(
                     selections,
                 },
             });
+            const current = getJob(job.id);
+            if (current?.phase === 'cancelled') return current;
             if (!acquired.outputs.length) throw new Error('Remote Import produced no files');
             const ready: RemoteImportJob = {
                 ...downloading,
@@ -443,6 +476,8 @@ export function useRemoteImport(
             await updateJob(job.id, () => ready);
             return await enqueueOutputs(ready);
         } catch (error) {
+            const current = getJob(job.id);
+            if (current?.phase === 'cancelled') return current;
             const message = errorMessage(error);
             await updateJob(job.id, current => ({
                 ...current,
@@ -451,12 +486,20 @@ export function useRemoteImport(
                 updatedAt: Date.now(),
             }));
             throw new Error(message);
+        } finally {
+            activeAcquisitionsRef.current.delete(job.id);
+            // Acquisition has settled; a cancelled worker can no longer recreate staging.
+            const current = getJob(job.id);
+            if (current?.phase === 'cancelled' && current.uploadQueueIds.length === 0) {
+                await invoke('cmd_remote_import_cleanup', { jobId: job.id }).catch(() => false);
+            }
         }
     }, [enqueueOutputs, getJob, updateJob]);
 
     const retryJob = useCallback(async (jobId: string): Promise<RemoteImportJob> => {
         const job = getJob(jobId);
         if (!job) throw new Error('Remote Import job no longer exists');
+        cancelledRef.current.delete(jobId);
         if (job.outputs.length > 0 && job.uploadQueueIds.length === 0) {
             return enqueueOutputs(job);
         }
@@ -471,35 +514,48 @@ export function useRemoteImport(
     const cancelJob = useCallback(async (jobId: string) => {
         const job = getJob(jobId);
         if (!job) return false;
-        if (job.uploadQueueIds.length > 0) {
-            throw new Error('This import is already uploading. Use the upload queue to cancel its file transfers.');
+        if (job.uploadQueueIds.length && !cancelUploadItem) {
+            throw new Error('Use the upload queue to cancel this import');
         }
+        // Record intent before any native acknowledgement or store await.
+        cancelledRef.current.add(jobId);
+        await updateJob(job.id, current => ({
+            ...current, phase: 'cancelled', error: undefined, progress: undefined, updatedAt: Date.now(),
+        }));
+        for (const id of getJob(jobId)?.uploadQueueIds ?? []) cancelUploadItem?.(id);
         await invoke<boolean>('cmd_remote_import_cancel', { jobId: job.id }).catch(() => false);
-        const cancelled: RemoteImportJob = {
-            ...job,
-            phase: 'cancelled',
-            error: undefined,
-            progress: undefined,
-            updatedAt: Date.now(),
-        };
-        await updateJob(job.id, () => cancelled);
-        await invoke('cmd_remote_import_cleanup', { jobId: job.id }).catch(() => false);
+        if (!activeAcquisitionsRef.current.has(jobId) && !activeEnqueuesRef.current.has(jobId) && !job.uploadQueueIds.length) {
+            await invoke('cmd_remote_import_cleanup', { jobId: job.id }).catch(() => false);
+        }
         return true;
-    }, [getJob, updateJob]);
+    }, [cancelUploadItem, getJob, updateJob]);
 
-    const dismissJob = useCallback(async (jobId: string) => {
+    const dismissJob = useCallback(async (jobId: string, options?: { retainJournal?: boolean }) => {
         const job = getJob(jobId);
         if (!job) return;
         if (!['success', 'partial-error', 'error', 'cancelled'].includes(job.phase)) {
             throw new Error('Remote Import is still active');
         }
+        if (options?.retainJournal) {
+            // Batch stack finalization and retries still need this job's outcomes.
+            // Persist visibility separately; do not delete its journal or staging.
+            await updateJob(jobId, current => {
+                if (!['success', 'partial-error', 'error', 'cancelled'].includes(current.phase)) {
+                    throw new Error('Remote Import is still active');
+                }
+                const now = Date.now();
+                return { ...current, dismissedAt: now, updatedAt: now };
+            });
+            return;
+        }
         if (job.uploadQueueIds.length === 0) {
             await invoke('cmd_remote_import_cleanup', { jobId: job.id }).catch(() => false);
         }
         await setJobs(current => current.filter(candidate => candidate.id !== jobId));
-    }, [getJob, setJobs]);
+    }, [getJob, setJobs, updateJob]);
 
     const resetRemoteImportUploadOutcomes = useCallback(async (jobId: string, queueIds: string[]) => {
+        cancelledRef.current.delete(jobId);
         const reset = new Set(queueIds);
         await updateJob(jobId, current => {
             const outcomes = { ...(current.uploadOutcomes ?? {}) };
@@ -507,6 +563,7 @@ export function useRemoteImport(
             return {
                 ...current,
                 phase: 'uploading',
+                dismissedAt: undefined,
                 uploadOutcomes: outcomes,
                 error: undefined,
                 deferAutomaticFinalization: true,

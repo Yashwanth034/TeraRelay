@@ -829,8 +829,7 @@ body,
       color-mix(in srgb, var(--tr-panel-strong) 94%, var(--color-telegram-primary) 2%),
       var(--tr-panel));
   box-shadow: var(--tr-shadow-panel);
-  backdrop-filter: blur(20px) saturate(115%);
-  -webkit-backdrop-filter: blur(20px) saturate(115%);
+  /* Avoid full-height backdrop rasterization while the sidebar scrolls. */
 }
 
 .tr-sidebar::before {
@@ -1422,11 +1421,10 @@ body,
 
 .tr-topbar {
   position: relative;
-  background: color-mix(in srgb, var(--tr-panel-strong) 82%, transparent) !important;
+  background: color-mix(in srgb, var(--tr-panel-strong) 96%, transparent) !important;
   border-bottom-color: var(--tr-border-soft) !important;
   box-shadow: 0 12px 34px rgba(0,0,0,.08), inset 0 -1px color-mix(in srgb, var(--color-telegram-text) 2%, transparent);
-  backdrop-filter: blur(20px) saturate(118%);
-  -webkit-backdrop-filter: blur(20px) saturate(118%);
+  /* Opaque enough to retain the design without costly scroll-linked blur. */
 }
 
 .tr-topbar__identity {

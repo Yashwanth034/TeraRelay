@@ -106,9 +106,104 @@ pub fn tdlib_message_id_to_server_id(tdlib_message_id: i64) -> Result<i64, Strin
     Ok(server_id)
 }
 
+/// Telegram RPC wait errors appear either as a symbolic suffix or Grammers'
+/// "(value: N)" display. Keep the exact server duration for both forms.
+pub fn flood_wait_seconds(error: &str) -> Option<u64> {
+    for marker in ["FLOOD_PREMIUM_WAIT", "FLOOD_WAIT"] {
+        if let Some(start) = error.find(marker) {
+            let suffix = &error[start + marker.len()..];
+            if let Some(value) = suffix.strip_prefix('_') {
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(seconds) = digits.parse() {
+                    return Some(seconds);
+                }
+            }
+            if let Some(start) = suffix.find("(value: ") {
+                let digits: String = suffix[start + 8..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(seconds) = digits.parse() {
+                    return Some(seconds);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn map_error(e: impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    match flood_wait_seconds(&text) {
+        Some(seconds) => format!("FLOOD_WAIT_{seconds}"),
+        None => text,
+    }
+}
+
+/// Flood waits are server scheduling decisions, not failed network attempts.
+/// They must be honored even after the transient retry budget is exhausted.
+pub fn transfer_retry_delay(
+    error: &str,
+    respect_flood: bool,
+    retries_left: &mut u32,
+    retry_limit: u32,
+    base_ms: u64,
+    max_ms: u64,
+) -> Option<std::time::Duration> {
+    if respect_flood {
+        if let Some(seconds) = flood_wait_seconds(error) {
+            return Some(std::time::Duration::from_secs(seconds.max(1)));
+        }
+    }
+    if *retries_left == 0 {
+        return None;
+    }
+    let attempt = retry_limit.saturating_sub(*retries_left);
+    *retries_left -= 1;
+    Some(std::time::Duration::from_millis(
+        crate::vpn_optimizer::backoff_ms(attempt, base_ms, max_ms),
+    ))
+}
+
 #[cfg(test)]
 mod message_id_tests {
-    use super::tdlib_message_id_to_server_id;
+    use super::{map_error, tdlib_message_id_to_server_id, transfer_retry_delay};
+
+    #[test]
+    fn flood_wait_preserves_telegram_duration() {
+        assert_eq!(map_error("FLOOD_WAIT_7"), "FLOOD_WAIT_7");
+        assert_eq!(map_error("FLOOD_PREMIUM_WAIT_901"), "FLOOD_WAIT_901");
+        assert_eq!(
+            map_error("rpc error FLOOD_WAIT (value: 450)"),
+            "FLOOD_WAIT_450"
+        );
+        assert_eq!(
+            map_error("FILE_REFERENCE_EXPIRED"),
+            "FILE_REFERENCE_EXPIRED"
+        );
+    }
+
+    #[test]
+    fn server_flood_wait_does_not_spend_network_retries_or_clip_long_waits() {
+        let mut retries = 0;
+        assert_eq!(
+            transfer_retry_delay("FLOOD_WAIT_901", true, &mut retries, 5, 100, 1000),
+            Some(std::time::Duration::from_secs(901))
+        );
+        assert_eq!(retries, 0);
+        assert_eq!(
+            transfer_retry_delay("network", true, &mut retries, 5, 100, 1000),
+            None
+        );
+        let mut retries = 2;
+        assert_eq!(
+            transfer_retry_delay("FLOOD_WAIT_7", true, &mut retries, 2, 100, 1000),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(retries, 2);
+        assert!(transfer_retry_delay("network", true, &mut retries, 2, 100, 1000).is_some());
+        assert_eq!(retries, 1);
+    }
 
     #[test]
     fn final_tdlib_message_id_converts_to_server_id() {
@@ -121,23 +216,4 @@ mod message_id_tests {
         assert!(tdlib_message_id_to_server_id(-1).is_err());
         assert!(tdlib_message_id_to_server_id((123_i64 << 20) + 1).is_err());
     }
-}
-
-pub fn map_error(e: impl std::fmt::Display) -> String {
-    let err_str = e.to_string();
-    if err_str.contains("FLOOD_WAIT") || err_str.contains("FLOOD_PREMIUM_WAIT") {
-        // Grammers normally renders Telegram RPC wait errors with
-        // "(value: N)". Normalize both ordinary and premium waits so the
-        // transfer scheduler applies the same bounded backoff.
-        if let Some(start) = err_str.find("(value: ") {
-            let rest = &err_str[start + 8..];
-            if let Some(end) = rest.find(')') {
-                if let Ok(seconds) = rest[..end].parse::<i64>() {
-                    return format!("FLOOD_WAIT_{}", seconds);
-                }
-            }
-        }
-        return "FLOOD_WAIT_60".to_string();
-    }
-    err_str
 }

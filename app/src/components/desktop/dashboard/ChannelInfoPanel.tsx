@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -57,7 +57,32 @@ export function ChannelInfoPanel({
     onClose,
 }: ChannelInfoPanelProps) {
     const [showAllMembers, setShowAllMembers] = useState(false);
+    const panelRef = useRef<HTMLElement>(null);
     useEscapeToClose(open, onClose);
+
+    const trapPanelTab = (event: React.KeyboardEvent<HTMLElement>) => {
+        if (event.key !== 'Tab') return;
+        const panel = panelRef.current;
+        if (!panel) return;
+        const focusable = Array.from(panel.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        )).filter(element => element.getClientRects().length > 0);
+        if (focusable.length === 0) {
+            event.preventDefault();
+            panel.focus();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !panel.contains(active))) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
 
     useEffect(() => {
         if (open) setShowAllMembers(false);
@@ -99,13 +124,18 @@ export function ChannelInfoPanel({
     return (
         <div className="tr-side-panel-backdrop fixed inset-0 z-[230] flex justify-end" onClick={onClose}>
             <aside
+                ref={panelRef}
+                tabIndex={-1}
+                onKeyDown={trapPanelTab}
                 className="tr-side-panel w-full max-w-[390px]"
                 onClick={(event) => event.stopPropagation()}
-                aria-label="Channel information"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="tr-channel-info-title"
             >
                 <div className="tr-side-panel__header sticky top-0 z-10 flex items-center justify-between px-5 py-4">
                     <div className="min-w-0">
-                        <h2 className="truncate text-base font-semibold text-telegram-text">{channelName}</h2>
+                        <h2 id="tr-channel-info-title" className="truncate text-base font-semibold text-telegram-text">{channelName}</h2>
                         <p className="mt-0.5 text-xs font-medium text-telegram-subtext">
                             {role === 'owner' ? 'Owner' : 'Member'}
                         </p>
@@ -115,6 +145,7 @@ export function ChannelInfoPanel({
                         onClick={onClose}
                         className="tr-modal-close"
                         aria-label="Close channel info"
+                        autoFocus
                     >
                         <X className="h-4 w-4" />
                     </button>

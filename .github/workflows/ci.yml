@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_only:
-        description: Run source checks without rebuilding installers
+        description: Run source and test-only CI without building installers (default)
         type: boolean
-        default: false
+        default: true
   push:
     branches: [main]
   pull_request:
@@ -36,9 +36,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            xdg-utils \
-            ffmpeg
-          ffmpeg -version
+            xdg-utils
 
       - uses: actions/setup-node@v7
         with:
@@ -63,17 +61,43 @@ jobs:
         working-directory: .
         run: python3 scripts/test-macos-file-provider-build.py
 
+      - name: Archive preview and signed-updater security contracts
+        working-directory: .
+        run: |
+          node scripts/test-rar-preview-failclosed.cjs
+          node scripts/test-app-updater.cjs
+
       - name: Frontend build
         run: npm run build
 
-      - name: Desktop interaction regression tests
+      - name: Desktop interaction, native platform and recovery regression tests
         working-directory: .
         run: >-
-          node --test
+          node --test --test-concurrency=1
           scripts/test-file-selection-scroll.cjs
           scripts/test-thumbnail-visibility.cjs
           scripts/test-remote-import-recovery-controls.cjs
           scripts/test-auth-query-isolation.cjs
+          scripts/test-saved-session-restore.cjs
+          scripts/test-focused-ui.cjs
+          scripts/test-remote-import-background.cjs
+          scripts/test-remote-import-batch-cancel.cjs
+          scripts/test-transfer-recovery.cjs
+          scripts/test-native-drive-platforms.cjs
+          scripts/test-settings-accessibility.cjs
+          scripts/test-settings-tab-trap.cjs
+          scripts/test-secondary-modal-accessibility.cjs
+          scripts/test-version-stack-accessibility.cjs
+          scripts/test-bulk-share-accessibility.cjs
+          scripts/test-share-clipboard.cjs
+
+      - name: Playback, batch import and mount recovery contract tests
+        working-directory: .
+        run: |
+          node scripts/test-playback-seeking.cjs
+          node scripts/test-remote-import-ui.cjs
+          node scripts/test-remote-import-batch.cjs
+          node scripts/test-drive-mount-recovery.cjs
 
       - name: Locale structure
         run: node check-i18n.cjs
@@ -89,13 +113,220 @@ jobs:
         working-directory: app/src-tauri
         run: cargo check --locked
 
+      - name: Outstanding RustSec reachability regression (not an audit waiver)
+        working-directory: .
+        run: python3 scripts/test-rustsec-reachability.py
+
       - name: Rust tests
         timeout-minutes: 10
         working-directory: app/src-tauri
         run: cargo test --locked
 
+      - name: Strict Rust Clippy (all targets, warnings denied)
+        timeout-minutes: 10
+        working-directory: app/src-tauri
+        # Each stable high-arity Tauri/transfer/metadata signature carries a
+        # documented, exact-function #[expect] rather than a global lint waiver.
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Native HTTP range, V2 cache and pending-read integrity fixtures
+        timeout-minutes: 3
+        working-directory: .
+        run: |
+          python3 scripts/test-drive-http-range.py
+          python3 scripts/test-drive-v2-read-recovery.py
+          python3 scripts/test-drive-pending-read-integrity.py
+
+      - name: Upload progress and disposable-cache cleanup fixtures
+        working-directory: .
+        run: |
+          python3 scripts/test-upload-progress.py
+          python3 scripts/test-tdlib-cache-cleanup.py
+
       - name: Python worker syntax
         run: python3 -m py_compile src-tauri/src/tdlib_fast_worker.py
+
+  linux-webkit-media-e2e:
+    name: Real WebKitGTK player, seeking and audio-switch E2E
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install isolated Linux WebKit media test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            python3-gi \
+            gir1.2-webkit2-4.1 \
+            xvfb \
+            xauth \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Build frontend assets for isolated player fixture
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run actual WebKitGTK playback and seek E2E without bypassing sandbox
+        timeout-minutes: 10
+        run: node scripts/test-native-media.cjs
+
+  linux-native-drive-e2e:
+    name: Real Linux FUSE, accessibility, recovery, cache and project E2E (synthetic QA)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install native Linux GUI, DBus and FUSE test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            fuse3 \
+            libfuse3-dev \
+            xvfb \
+            xauth \
+            openbox \
+            x11-utils \
+            wmctrl \
+            xdotool \
+            dbus-x11 \
+            python3-gi \
+            gir1.2-gtk-3.0 \
+            gir1.2-atspi-2.0 \
+            at-spi2-core
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: isolated-native-fuse-e2e
+
+      - name: Build private test frontend and native debug application (no installer)
+        run: |
+          cd app
+          npm ci
+          npm run build
+          cd src-tauri
+          CARGO_BUILD_JOBS=2 cargo build --locked
+
+      - name: Require an accessible real FUSE device
+        run: |
+          test -c /dev/fuse || { echo "BLOCKED: this runner lacks /dev/fuse; real native E2E did not run"; exit 2; }
+          command -v fusermount3
+          command -v wmctrl
+          command -v xdotool
+          test -x app/src-tauri/target/debug/terarelay
+
+      - name: Run ten isolated native accessibility, filesystem, recovery and cache QA suites
+        timeout-minutes: 22
+        env:
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          CARGO_BUILD_JOBS: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p .repotunnel-tmp
+          VITE_TERA_QA_FEATURE_A=1 npm --prefix app run dev -- --host 127.0.0.1 --port 1420 --strictPort > "$RUNNER_TEMP/terarelay-native-vite.log" 2>&1 &
+          vite_pid=$!
+          trap 'kill "$vite_pid" 2>/dev/null || true; wait "$vite_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --silent --fail http://127.0.0.1:1420/ >/dev/null; then break; fi
+            if ! kill -0 "$vite_pid" 2>/dev/null; then cat "$RUNNER_TEMP/terarelay-native-vite.log"; exit 1; fi
+            sleep 0.25
+          done
+          curl --silent --fail http://127.0.0.1:1420/ >/dev/null || { echo "BLOCKED: private QA frontend did not start"; exit 2; }
+          xvfb-run -a dbus-run-session -- bash scripts/test-native-drive-ci-runner.sh
+
+  rustsec-audit:
+    name: Rust dependency vulnerability audit (no ignores)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install verified cargo-audit binary on ephemeral CI runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+          fallback: none
+
+      - name: Fail on unresolved RustSec vulnerabilities
+        working-directory: app/src-tauri
+        run: cargo audit --file Cargo.lock
+
+  native-host-tests:
+    name: Native Rust tests / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS ARM64
+            os: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          key: native-host-tests-${{ matrix.name }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend assets for Tauri test compilation
+        run: npm run build
+
+      - name: Test native Rust backend on the actual host operating system
+        working-directory: app/src-tauri
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --locked -- --test-threads=1
 
   desktop:
     if: ${{ !inputs.source_only }}

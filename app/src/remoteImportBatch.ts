@@ -265,63 +265,57 @@ export async function analyzeBatchEntriesSequentially(
         rememberJobId: (jobId: string) => Promise<void>,
     ) => Promise<{ id: string }>,
     persist: (batch: RemoteImportBatch) => Promise<void>,
+    readCurrent?: () => RemoteImportBatch | undefined,
 ): Promise<RemoteImportBatch> {
-    let batch: RemoteImportBatch = { ...initialBatch, phase: 'analyzing', updatedAt: Date.now() };
-    await persist(batch);
-    for (const original of batch.entries) {
-        if (original.phase === 'skipped' || original.phase === 'success' || original.jobId) continue;
-        const current = batch.entries.find(entry => entry.id === original.id)!;
-        batch = replaceBatchEntry(batch, current.id, { ...current, phase: 'analyzing', error: undefined });
-        batch = { ...batch, activeEntryIndex: current.ordinal, updatedAt: Date.now() };
-        await persist(batch);
-
+    let batch = readCurrent?.() ?? initialBatch;
+    const refresh = () => { batch = readCurrent?.() ?? batch; return batch; };
+    const save = async (next: RemoteImportBatch) => {
+        if (refresh().phase === 'cancelled') return;
+        await persist(next);
+        batch = readCurrent?.() ?? next;
+    };
+    if (batch.phase === 'cancelled') return batch;
+    await save({ ...batch, phase: 'analyzing', updatedAt: Date.now() });
+    for (const original of initialBatch.entries) {
+        batch = refresh();
+        if (batch.phase === 'cancelled') return batch;
+        const current = batch.entries.find(entry => entry.id === original.id);
+        if (!current || current.phase === 'skipped' || current.phase === 'success' || current.jobId) continue;
+        await save({ ...replaceBatchEntry(batch, current.id, { ...current, phase: 'analyzing', error: undefined }), activeEntryIndex: current.ordinal });
         const rememberJobId = async (jobId: string) => {
-            const latest = batch.entries.find(entry => entry.id === current.id) ?? current;
-            batch = replaceBatchEntry(batch, current.id, {
-                ...latest,
-                jobId,
-                phase: 'analyzing',
-                error: undefined,
-            });
-            batch = { ...batch, activeEntryIndex: current.ordinal, updatedAt: Date.now() };
-            await persist(batch);
+            batch = refresh();
+            const latest = batch.entries.find(entry => entry.id === current.id);
+            if (!latest || batch.phase === 'cancelled' || latest.phase === 'skipped') return;
+            await save(replaceBatchEntry(batch, current.id, { ...latest, jobId }));
         };
-
         try {
             const job = await analyze(current, rememberJobId);
-            const latest = batch.entries.find(entry => entry.id === current.id) ?? current;
-            if (latest.jobId !== job.id) await rememberJobId(job.id);
-            const remembered = batch.entries.find(entry => entry.id === current.id) ?? latest;
-            const analyzed: RemoteImportBatchEntry = {
-                ...remembered,
-                jobId: job.id,
-                selectedIds: [],
-                phase: 'waiting-for-selection',
-                error: undefined,
-            };
-            batch = replaceBatchEntry(batch, current.id, analyzed);
+            batch = refresh();
+            const latest = batch.entries.find(entry => entry.id === current.id);
+            if (batch.phase === 'cancelled') return batch;
+            if (!latest || latest.phase === 'skipped') continue;
+            await save(replaceBatchEntry(batch, current.id, {
+                ...latest, jobId: job.id, phase: 'waiting-for-selection', error: undefined,
+            }));
         } catch (error) {
-            const latest = batch.entries.find(entry => entry.id === current.id) ?? current;
+            batch = refresh();
+            const latest = batch.entries.find(entry => entry.id === current.id);
+            if (batch.phase === 'cancelled') return batch;
+            if (!latest || latest.phase === 'skipped') continue;
             const failedJobId = error && typeof error === 'object' && 'remoteImportJobId' in error
-                ? String((error as { remoteImportJobId: unknown }).remoteImportJobId)
-                : latest.jobId;
-            batch = replaceBatchEntry(batch, current.id, {
-                ...latest,
-                jobId: failedJobId,
-                phase: 'error',
+                ? String((error as { remoteImportJobId: unknown }).remoteImportJobId) : latest.jobId;
+            await save(replaceBatchEntry(batch, current.id, {
+                ...latest, jobId: failedJobId, phase: 'error',
                 error: error instanceof Error ? error.message : String(error),
-            });
+            }));
         }
-        await persist(batch);
     }
-    const hasErrors = batch.entries.some(entry => entry.phase === 'error');
-    batch = {
-        ...batch,
-        phase: hasErrors ? 'paused' : 'waiting-for-selection',
-        activeEntryIndex: null,
-        updatedAt: Date.now(),
-    };
-    await persist(batch);
+    batch = refresh();
+    if (batch.phase === 'cancelled') return batch;
+    await save({
+        ...batch, phase: batch.entries.some(entry => entry.phase === 'error') ? 'paused' : 'waiting-for-selection',
+        activeEntryIndex: null, updatedAt: Date.now(),
+    });
     return batch;
 }
 
@@ -329,43 +323,42 @@ export async function runSequentialBatchEntries(
     initialBatch: RemoteImportBatch,
     runEntry: (entry: RemoteImportBatchEntry) => Promise<RemoteImportBatchEntry>,
     persist: (batch: RemoteImportBatch) => Promise<void>,
+    readCurrent?: () => RemoteImportBatch | undefined,
 ): Promise<RemoteImportBatch> {
-    const startedAt = initialBatch.startedAt ?? Date.now();
-    let batch: RemoteImportBatch = {
-        ...initialBatch,
-        phase: 'importing',
-        startedAt,
-        updatedAt: Date.now(),
+    let batch = readCurrent?.() ?? initialBatch;
+    const refresh = () => { batch = readCurrent?.() ?? batch; return batch; };
+    const save = async (next: RemoteImportBatch) => {
+        if (refresh().phase === 'cancelled') return;
+        await persist(next);
+        batch = readCurrent?.() ?? next;
     };
-    await persist(batch);
-    for (const original of batch.entries) {
-        if (original.phase === 'success' || original.phase === 'skipped') continue;
-        if (original.phase === 'cancelled') {
-            batch = { ...batch, phase: 'cancelled', activeEntryIndex: null, updatedAt: Date.now() };
-            await persist(batch);
+    if (batch.phase === 'cancelled') return batch;
+    await save({ ...batch, phase: 'importing', startedAt: batch.startedAt ?? Date.now(), updatedAt: Date.now() });
+    for (const original of initialBatch.entries) {
+        batch = refresh();
+        if (batch.phase === 'cancelled') return batch;
+        const current = batch.entries.find(entry => entry.id === original.id);
+        if (!current || current.phase === 'success' || current.phase === 'skipped') continue;
+        if (current.phase === 'cancelled') {
+            await save({ ...batch, phase: 'cancelled', activeEntryIndex: null, updatedAt: Date.now() });
             return batch;
         }
-        const current = batch.entries.find(entry => entry.id === original.id)!;
-        batch = replaceBatchEntry(batch, current.id, { ...current, phase: 'importing', error: undefined });
-        batch = { ...batch, activeEntryIndex: current.ordinal, updatedAt: Date.now() };
-        await persist(batch);
+        await save({ ...replaceBatchEntry(batch, current.id, { ...current, phase: 'importing', error: undefined }), activeEntryIndex: current.ordinal });
+        batch = refresh();
+        if (batch.phase === 'cancelled') return batch;
         const result = await runEntry(batch.entries.find(entry => entry.id === current.id)!);
-        batch = replaceBatchEntry(batch, current.id, result);
-        await persist(batch);
+        batch = refresh();
+        if (batch.phase === 'cancelled') return batch;
+        await save(replaceBatchEntry(batch, current.id, result));
         if (result.phase === 'error' || result.phase === 'cancelled') {
-            batch = {
-                ...batch,
-                phase: result.phase === 'cancelled' ? 'cancelled' : 'paused',
-                activeEntryIndex: null,
-                error: result.error,
-                updatedAt: Date.now(),
-            };
-            await persist(batch);
+            await save({ ...batch, phase: result.phase === 'cancelled' ? 'cancelled' : 'paused',
+                activeEntryIndex: null, error: result.error, updatedAt: Date.now() });
             return batch;
         }
     }
-    batch = { ...batch, phase: 'finalizing', activeEntryIndex: null, error: undefined, updatedAt: Date.now() };
-    await persist(batch);
+    batch = refresh();
+    if (batch.phase === 'cancelled') return batch;
+    await save({ ...batch, phase: 'finalizing', activeEntryIndex: null, error: undefined, updatedAt: Date.now() });
     return batch;
 }
 

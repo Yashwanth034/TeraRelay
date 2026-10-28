@@ -91,6 +91,74 @@ for (const [name, bytesKey, status] of [['UploadQueue', 'uploadedBytes', 'upload
     assert.ok(html.includes('200 B / 1 KB'), 'Confirmed file bytes changed');
   });
 }
+test('transfer queues expose named actions, determinate progress and completion/error announcements', () => {
+  for (const [name, verb, bytesKey, fileKey, activeStatus] of [
+    ['UploadQueue', 'Upload', 'uploadedBytes', 'path', 'uploading'],
+    ['DownloadQueue', 'Download', 'downloadedBytes', 'filename', 'downloading'],
+  ]) {
+    const Component = load(path.join(root, 'app/src/components/desktop/dashboard/' + name + '.tsx'))[name];
+    const filename = 'qa-accessible-transfer.bin';
+    const render = (status, bytes, progress = 20) => renderToStaticMarkup(React.createElement(Component, {
+      ...queueProps,
+      onDismissItem() {},
+      items: [{
+        id: 'qa-accessible', path: filename, filename, folderId: null, status,
+        progress, [bytesKey]: bytes, totalBytes: 600, speedBytesPerSec: 1, error: status === 'error' ? 'QA transfer failed' : undefined,
+      }],
+    }));
+    for (const status of [activeStatus, 'pending', 'paused', 'pausing', 'error', 'cancelled', 'success']) {
+      const html = render(status, 120);
+      assert.ok(html.includes('role="list"'), name + ' list lacks its landmark');
+      assert.ok(html.includes('role="listitem"'), name + ' item lacks list identity');
+      const buttons = [...html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(match => match[0]);
+      assert.ok(buttons.length > 0, name + ' ' + status + ' had no controls');
+      for (const button of buttons) {
+        const plainText = button.replace(/<[^>]*>/g, '').trim();
+        assert.ok(button.includes('aria-label=') || plainText.length > 0,
+          name + ' ' + status + ' has an unnamed keyboard action');
+      }
+      if (status === activeStatus || status === 'paused' || status === 'pausing') {
+        assert.ok(html.includes('role="progressbar"'), name + ' lacks screen-reader progress');
+        assert.ok(html.includes('aria-valuenow="20"'), name + ' misreports 120/600 bytes');
+        assert.ok(html.includes('aria-valuemin="0"') && html.includes('aria-valuemax="100"'));
+        assert.ok(html.includes(verb + ' progress for ' + filename));
+      }
+      if (status === 'error') assert.ok(html.includes('role="alert"'), name + ' does not announce errors');
+      if (status === 'success' || status === 'cancelled') {
+        assert.ok(html.includes('role="status"'), name + ' does not announce its terminal state');
+      }
+    }
+  }
+});
+
+test('adaptive video player exposes named modal controls and protects native widget keys', () => {
+  const playerLoad = loader({
+    '../../../hooks/useAdaptiveStreaming': {
+      useAdaptiveStreaming: () => ({
+        videoRef: { current: null }, phase: 'loading', error: null,
+        tracks: [], loadProgress: 10, currentQuality: 'original', setQuality() {},
+        adaptiveMode: false, setAdaptiveMode() {}, measuredKbps: 0,
+        useFallback: true, fallbackUrl: 'http://localhost/fixture.mp4', abort() {},
+      }),
+    },
+  });
+  const player = playerLoad(path.join(root, 'app/src/components/desktop/dashboard/AdaptiveMediaPlayer.tsx')).AdaptiveMediaPlayer;
+  const html = renderToStaticMarkup(React.createElement(player, {
+    file: { id: 1, name: 'qa-accessible.mp4', size: 123, type: 'video' },
+    activeFolderId: null, streamUrl: 'http://localhost/fixture.mp4', onClose() {},
+  }));
+  assert.ok(html.includes('role="dialog"') && html.includes('aria-modal="true"'));
+  assert.ok(html.includes('Video player: qa-accessible.mp4'), 'Dialog has no file-scoped accessible name');
+  assert.ok(html.includes('aria-label="Close video player"'));
+  assert.ok(html.includes('aria-label="Enter fullscreen"'));
+  assert.ok(html.includes('aria-label="Video: qa-accessible.mp4"'));
+  const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/AdaptiveMediaPlayer.tsx'), 'utf8');
+  assert.ok(source.includes("target?.tagName === 'SELECT'"), 'Arrow navigation still steals select controls');
+  assert.ok(source.includes("e.key === ' '"), 'Native button spacebar handling is unverified');
+  assert.ok(source.includes("event.key !== 'Tab'"), 'Modal focus trap is missing');
+  assert.ok(source.includes('previous.isConnected) previous.focus()'), 'Dialog does not restore prior focus');
+});
+
 test('multipart video opens the actual preview handler', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/DesktopDashboard.tsx'), 'utf8');
   const ast = ts.createSourceFile('Dashboard.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -172,6 +240,19 @@ test('stream source changes recompute native fallback without freezing the first
     assert.equal(hook('http://localhost/fmp4/8/output.mp4', 'fixture.mp4', undefined, true).useFallback, true, 'Growing remux must use native streaming');
   } finally { global.MediaSource = previous; }
 });
+test('progressive MP4 cache warming skips small files rather than racing the native parser', () => {
+  const hook = loader()(path.join(root, 'app/src/hooks/useAdaptiveStreaming.ts'));
+  const select = hook.progressiveMoovWarmRange;
+  assert.equal(typeof select, 'function', 'progressive cache warm selector was not exported');
+  assert.equal(select(3_667_074), null,
+    'Generated 3.6MB MP4 should not spawn a second almost-full HTTP download');
+  assert.equal(select(6_291_456), null,
+    'A file no larger than 2x cache warm bytes does not benefit from prefetch');
+  assert.equal(select(0), null);
+  assert.equal(select(Number.NaN), null);
+  assert.equal(select(60_000_000), 'bytes=56854272-');
+});
+
 test('ordinary progressive MP4 gets native playback before remux', () => {
   const effects = [], cleanups = [];
   const parser = { stop() {}, flush() {} };
@@ -214,15 +295,28 @@ function remuxHarness(options = {}) {
   const state = { polls: 0, reloads: 0, url: null, error: null, autoPlay: true };
   const context = {
     file: { id: 7 }, activeFolderId: 1, fmp4RemuxingRef: { current: false },
+    clearMemoryMedia() { state.memoryCleared = true; },
     transcodeCapsRef: { current: { available: true } }, remuxGenerationRef: { current: 0 },
     selectedAudioStreamRef: { current: 2 }, streamBaseRef: { current: 'http://localhost' },
     streamAuthRef: { current: 'qa' }, abortMseRef: { current() {} }, logRef: { current() {} },
     savedTimeRef: { current: 0 }, remuxWindowRef: { current: { start: 0, complete: false, key: null } },
-    pendingSeekRef: { current: null }, nativePlaybackStartedRef: { current: true }, setMovieTime() {},
-    fallbackVideoRef: { current: { currentTime: 3.5, paused: !!options.paused, pause() {}, removeAttribute() {}, load() {} } },
+    pendingSeekRef: { current: null }, nativePlaybackStartedRef: { current: true },
+    nativeUserPauseRef: { current: !!options.paused },
+    nativeCompletedRetryRef: { current: 0 }, setMovieTime() {},
+    setNativeDecoderRevision: () => {},
+    fallbackVideoRef: { current: {
+      currentTime: 3.5, paused: !!options.paused,
+      pause() { state.oldPaused = true; },
+      removeAttribute(name) { if (name === 'src') state.oldSrcDetached = true; },
+      load() { state.oldDecoderUnloaded = true; },
+    } },
     setFmp4Remuxing() {}, setFmp4RemuxError: value => { state.error = value; },
     setNativeAutoPlay: value => { state.autoPlay = value; },
     setFmp4StreamUrl: value => { state.url = value; }, setRestartNonce: () => { state.reloads++; },
+    shouldResumeAfterRemuxFinish: load(path.join(root,
+      'app/src/components/desktop/dashboard/playbackTimeline.tsx')).shouldResumeAfterRemuxFinish,
+    buildAuthenticatedRemuxUrl: load(path.join(root,
+      'app/src/components/desktop/dashboard/playbackTimeline.tsx')).buildAuthenticatedRemuxUrl,
     setTimeout: callback => { callback(); return 1; },
     invoke: async name => {
       if (name === 'cmd_prepare_fmp4_stream') return { status: 'processing', url: '/fmp4/qa/output.mp4', output_file_key: 'qa' };
@@ -241,6 +335,9 @@ test('early remux playback keeps polling and switches to final seekable output',
   assert.equal(state.polls, 2, 'First playable fragment was confused with final completion');
   assert.ok(state.url.includes('/fmp4/qa/output.mp4'));
   assert.equal(state.reloads, 2, 'Final ranged source did not replace the growing source');
+  assert.equal(state.oldPaused, true, 'Growing source was not paused before completed source startup');
+  assert.equal(state.oldSrcDetached, true, 'Growing source URI was not detached before replacement');
+  assert.equal(state.oldDecoderUnloaded, true, 'Growing decoder was left active alongside completed decoder');
   assert.equal(context.savedTimeRef.current, 3.5, 'Completion reload lost playback position');
   assert.equal(context.fmp4RemuxingRef.current, false);
 });
@@ -321,7 +418,8 @@ test('native conversion failures are visible while the decoder is still loading'
     react: {
       ...React,
       useState(initial) {
-        if (stateIndex++ === 2) return ['fixture conversion failed', () => {}];
+        // Two memory-recovery useState slots precede fMP4 error state.
+        if (stateIndex++ === 5) return ['fixture conversion failed', () => {}];
         return React.useState(initial);
       },
     },
@@ -701,19 +799,21 @@ if (process.argv.includes('--fixture')) {
   }));
   const css = fs.readdirSync(path.join(root, 'app/dist/assets')).filter(n => n.endsWith('.css')).map(n => fs.readFileSync(path.join(root, 'app/dist/assets', n), 'utf8')).join('\n');
   const body = renderToStaticMarkup(React.createElement('div', { style: { height: '100vh', display: 'flex', flexDirection: 'column' } }, feed, dock));
-  const html = '<!doctype html><html><head><style>' + css + '</style></head><body>' + body + '<script>window.addEventListener("load",()=>{const b=[...document.querySelectorAll("button")].find(e=>e.textContent.trim()==="Add folder");const r=b.getBoundingClientRect();const h=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);window.__qaReport={pass:b===h||b.contains(h),button:[r.x,r.y,r.width,r.height],hit:h?.outerHTML.slice(0,180)};});</script></body></html>';
+  const html = '<!doctype html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body>' + body + '<script>window.addEventListener("load",()=>{const b=[...document.querySelectorAll("button")].find(e=>e.textContent.trim()==="Add folder");const r=b.getBoundingClientRect();const h=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);window.__qaReport={pass:b===h||b.contains(h),button:[r.x,r.y,r.width,r.height],hit:h?.outerHTML.slice(0,180)};});</script></body></html>';
   assert.ok(process.env.TERA_QA_UI_OUTPUT, '--fixture requires TERA_QA_UI_OUTPUT');
   fs.writeFileSync(process.env.TERA_QA_UI_OUTPUT, html);
 }
-test('device continuity reuses existing Drive sync before desktop mount', () => {
+test('device continuity preserves reconciliation independently from desktop mount', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
-  const snapshot = source.indexOf("invoke<DriveSnapshotLike>('cmd_drive_get_snapshot')");
-  const sync = source.indexOf("invoke<DriveSyncResultLike>('cmd_drive_sync_metadata')");
-  const crypto = source.indexOf("invoke<DriveCryptoStatusLike>('cmd_drive_crypto_status')");
+  const snapshot = source.indexOf("validateDriveSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'))");
+  const sync = source.indexOf("validateDriveSyncResult(await invoke<unknown>('cmd_drive_sync_metadata'))");
+  const crypto = source.indexOf("validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_status'))");
   const mount = source.indexOf("invoke('cmd_drive_mount')");
+  const continuityStart = source.indexOf('const runInitialContinuity');
   assert.ok(snapshot >= 0 && sync > snapshot, 'Continuity must snapshot local Drive before remote reconciliation');
   assert.ok(crypto > sync, 'Continuity must inspect encryption after remote metadata is reconciled');
-  assert.ok(mount > crypto, 'Desktop Drive mount must start only after the initial reconciliation/classification');
+  assert.ok(mount >= 0 && mount < continuityStart, 'Independent provider recovery must own the initial mount');
+  assert.ok(!source.slice(continuityStart).includes("invoke('cmd_drive_mount')"), 'Delayed metadata sync must not request a second mount');
   assert.ok(source.includes("invoke('cmd_drive_recover_pending')"), 'Existing pending-write recovery was dropped');
   assert.ok(source.includes('15_000'), 'Existing 15-second metadata retry interval was dropped');
   assert.ok(source.includes('if (!isMobile)'), 'Linux mount/recovery is not kept desktop-only');
@@ -753,8 +853,10 @@ test('device continuity classifier executes the new-device and encryption rules'
 test('device continuity metadata sync runs on mobile without mounting Drive', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
   assert.match(source, /cmd_drive_sync_metadata[\s\S]*15_000/, 'Authenticated clients do not retain periodic metadata sync');
-  assert.match(source, /if \(!isMobile\)[\s\S]*cmd_drive_mount/, 'Mount is not gated to desktop');
-  assert.ok(!source.includes('authenticated || isMobile'), 'Mobile clients are still excluded from metadata continuity');
+  assert.match(source, /if \(!authenticated \|\| isMobile\) return;[\s\S]*cmd_drive_status[\s\S]*cmd_drive_mount/, 'Independent mount recovery is not gated to authenticated desktop clients');
+  const metadataStart = source.indexOf('  useEffect(() => {\n    if (!authenticated) {');
+  assert.ok(metadataStart >= 0, 'Metadata continuity must have an authentication-only entry guard');
+  assert.ok(!source.slice(metadataStart).includes('authenticated || isMobile'), 'Mobile clients are excluded from metadata continuity');
 });
 
 test('App delegates Drive startup to device continuity instead of duplicating sync logic', () => {
@@ -767,7 +869,9 @@ test('App delegates Drive startup to device continuity instead of duplicating sy
 
 test('continuity unlock uses only the existing Drive passphrase path', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/components/shared/DriveContinuityUnlock.tsx'), 'utf8');
-  assert.ok(source.includes("invoke<DriveCryptoStatusLike>('cmd_drive_crypto_unlock'"), 'Unlock dialog does not use the existing unlock command');
+  assert.ok(source.includes("validateDriveCryptoStatus(response)")
+    && source.includes("invoke<unknown>('cmd_drive_crypto_unlock'"),
+    'Unlock dialog must verify native crypto status after existing unlock command');
   assert.ok(!source.includes('cmd_drive_crypto_setup'), 'New-device restore must never create a replacement encryption key');
   assert.ok(source.includes('Later'), 'Unlock dialog cannot be safely dismissed');
   assert.ok(source.includes('type="password"'), 'Drive passphrase field is not protected as a password input');
@@ -797,31 +901,38 @@ test('periodic continuity sync never overlaps a slow Telegram reconciliation', (
 
 test('continuity cancellation cannot leave a late signed-out desktop mount active', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
-  assert.match(source, /if \(disposed\) return;\s*if \(!isMobile\)/, 'Cancelled initial continuity can still start a desktop mount');
-  assert.match(source, /await invoke\('cmd_drive_mount'\);\s*if \(disposed\) \{[\s\S]*shouldDetachNativeDriveRef\.current[\s\S]*cmd_drive_unmount/, 'A mount that completes after resolved sign-out is not immediately undone');
+  assert.match(source, /if \(disposed \|\| inFlight\) return;/, 'Cancelled independent recovery can still start a desktop mount');
+  assert.match(source, /validateNativeDriveMountStatus\(await invoke<unknown>\('cmd_drive_status'\)\);\s*if \(disposed\) return;/,
+    'Late provider status can still start a cancelled mount');
+  assert.match(source, /if \(!status.supported\) \{[\s\S]*?return;[\s\S]*?if \(status.mounted \|\| status.native_recovery \|\| mountHandedToNative\) \{[\s\S]*?return;/,
+    'Recovery must not duplicate a mount already supported/owned natively');
+  assert.match(source, /await invoke\('cmd_drive_mount'\);\s*mountHandedToNative = true;\s*if \(disposed && shouldDetachNativeDriveRef\.current\) \{\s*await invoke\('cmd_drive_unmount'\)/,
+    'A mount that completes after resolved sign-out is not immediately undone');
 });
 
 test('native Drive lifetime is not owned by WebView effect cleanup', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
   assert.ok(source.includes('authResolved && !authenticated && !isMobile'), 'Resolved signed-out state does not explicitly detach desktop Drive');
-  const cleanupStart = source.indexOf('return () => {');
+  const cleanupStart = source.lastIndexOf('return () => {');
   const cleanupEnd = source.indexOf('};\n  }, [authenticated, authResolved, isMobile]);', cleanupStart);
   assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, 'Continuity effect cleanup could not be inspected');
   const cleanup = source.slice(cleanupStart, cleanupEnd);
   assert.ok(!cleanup.includes('cmd_drive_unmount'), 'WebView/effect teardown still owns native Drive unmounting');
   const appSource = fs.readFileSync(path.join(root, 'app/src/App.tsx'), 'utf8');
-  assert.ok(appSource.includes('authResolved: authStatus !== "loading"'), 'Continuity cannot distinguish transient session loading from resolved sign-out');
+  assert.match(appSource, /authResolved:\s*authStatus === "authenticated" \|\| authStatus === "unauthenticated"/,
+    'Continuity must treat saved-session recovery as unresolved, never as a signed-out Drive detachment');
 });
 
 test('cancelled continuity cannot mutate the next session crypto decision', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
-  const safeCryptoChecks = source.match(/crypto = await invoke<DriveCryptoStatusLike>\('cmd_drive_crypto_status'\);\s*if \(disposed\) return;/g) || [];
+  const safeCryptoChecks = source.match(/crypto = validateDriveCryptoStatus\(await invoke<unknown>\('cmd_drive_crypto_status'\)\);\s*if \(disposed\) return;/g) || [];
   assert.ok(safeCryptoChecks.length >= 2, 'An old async crypto check can still mutate startup state after its effect was cancelled');
 });
 
 test('cancelled initial snapshot cannot overwrite a newer continuity baseline', () => {
   const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
-  assert.match(source, /before = await invoke<DriveSnapshotLike>\('cmd_drive_get_snapshot'\);\s*if \(disposed\) return;\s*initialSnapshotRef\.current = before;/, 'A stale startup snapshot can overwrite the next session baseline');
+  assert.match(source, /before = validateDriveSnapshot\(await invoke<unknown>\('cmd_drive_get_snapshot'\)\);\s*if \(disposed\) return;\s*initialSnapshotRef\.current = before;/,
+    'A stale startup snapshot can overwrite the next session baseline');
 });
 
 test('successful continuity reconciliation advances the restore baseline', () => {

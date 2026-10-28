@@ -577,6 +577,8 @@ class Worker:
             raise RuntimeError("TDLib download request has no chunks")
 
         output_path = Path(str(request["path"])).expanduser().resolve()
+        if output_path.is_relative_to(self.files_dir.resolve()):
+            raise RuntimeError("Save downloaded files outside the disposable TDLib cache.")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         force = bool(request.get("force", False))
         inactivity_timeout = float(request.get("inactivity_timeout", request.get("timeout", 7200.0)))
@@ -961,6 +963,9 @@ class Worker:
                     )
 
             output.flush()
+            # Do not release resumable cache bytes until the saved output is durable.
+            import os
+            os.fsync(output.fileno())
 
         if reconstructed != total_expected:
             try:
@@ -979,11 +984,36 @@ class Worker:
             # excluding bytes already present in TDLib's cache at start.
             measured_network_bytes = max(0, total_expected - cached_at_start)
 
+        # This is still Rust's temporary export stage. Keep cached parts until
+        # output publication AND durable queue completion succeed; the idle
+        # cleanup guard also protects other downloads sharing these file IDs.
         return {
             "bytes_downloaded": reconstructed,
             "network_seconds": network_elapsed,
             "average_bytes_per_sec": int(measured_network_bytes / network_elapsed),
         }
+
+    def clean_file_cache(self) -> dict:
+        if not self.ready:
+            raise RuntimeError("TDLib cache cleanup requires an authorized idle worker")
+        # Rust serializes this request with transfers and rejects it when a
+        # saved upload/download is unfinished. Never enable background GC:
+        # TDLib's generic optimizer may also remove partial download files.
+        return self.td.request(
+            {
+                "@type": "optimizeStorage",
+                "size": 0,
+                "ttl": 0,
+                "count": 0,
+                "immunity_delay": 0,
+                "file_types": [],
+                "chat_ids": [],
+                "exclude_chat_ids": [],
+                "return_deleted_file_statistics": True,
+                "chat_limit": 0,
+            },
+            timeout=30,
+        )
 
     def logout(self) -> dict:
         if self.ready:
@@ -1058,6 +1088,8 @@ def main() -> int:
                 result = worker.upload(request_id, request)
             elif action == "download":
                 result = worker.download(request_id, request)
+            elif action == "clean_file_cache":
+                result = worker.clean_file_cache()
             elif action == "logout":
                 result = worker.logout()
             elif action == "close":

@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { SidebarItem } from './SidebarItem';
 import { TeraRelayBrand } from '../../shared/TeraRelayBrand';
 import { BandwidthWidget } from './BandwidthWidget';
-import { TelegramFolder, BandwidthStats, FolderGroup } from '../../../types';
+import { TelegramFolder, FolderGroup } from '../../../types';
 import { useSettings } from '../../../context/SettingsContext';
 import {
     PremiumBadge,
@@ -118,7 +118,6 @@ interface SidebarProps {
     isConnected: boolean;
     onSync: () => void;
     onLogout: () => void;
-    bandwidth: BandwidthStats | null;
     onAssignFolderToGroup: (folderId: number, groupId: number | null) => Promise<void>;
     onReorderFolders: (reordered: TelegramFolder[]) => Promise<void>;
     onUpdateGroupOrder: (reorderedGroups: FolderGroup[]) => Promise<void>;
@@ -129,7 +128,7 @@ interface SidebarProps {
 
 export function Sidebar({
     folders, groups = [], activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onToggleVisibility, onCreate, onJoinChannel,
-    isSyncing, isConnected, onSync, onLogout, bandwidth,
+    isSyncing, isConnected, onSync, onLogout,
     onAssignFolderToGroup, onReorderFolders, onUpdateGroupOrder, onCreateGroup, onUpdateGroup, onDeleteGroup
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
@@ -248,7 +247,7 @@ export function Sidebar({
 
     return (
         <aside 
-            className={`tr-sidebar transition-all duration-300 ${settings.sidebarCollapsed ? 'w-14' : 'w-64'} flex flex-col`}
+            className={`tr-sidebar ${settings.sidebarCollapsed ? 'w-14' : 'w-64'} flex flex-col`}
             onClick={e => e.stopPropagation()}
         >
             <div className={`tr-sidebar-brand-row p-4 flex ${settings.sidebarCollapsed ? 'flex-col items-center gap-2' : 'items-center justify-between'} min-h-[64px]`}>
@@ -590,7 +589,7 @@ export function Sidebar({
                             </PremiumButton>
                         </div>
 
-                        {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
+                        <BandwidthWidget enabled={isConnected} />
                     </>
                 )}
             </div>

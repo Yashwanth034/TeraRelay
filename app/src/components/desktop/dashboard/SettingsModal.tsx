@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, FolderArchive, Shield, Zap, Activity, Gauge, Wifi, ChevronDown, Link, Sparkles, Info, Clipboard, Monitor, Loader2, Languages, Play, Palette, Plus, Tag } from 'lucide-react';
+import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, Search, RefreshCw, FolderArchive, Shield, Zap, Activity, Gauge, Wifi, ChevronDown, Link, Sparkles, Info, Clipboard, Monitor, Loader2, Languages, Play, Palette, Plus, Tag } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { type as operatingSystemType } from '@tauri-apps/plugin-os';
 import { open } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { useSettings } from '../../../context/SettingsContext';
@@ -16,6 +17,44 @@ import { CustomTheme, ThemeColorPalette, generateThemeId } from '../../../theme/
 import { getDefaultPalette } from '../../../theme/presets';
 import { TeraRelayBrand } from '../../shared/TeraRelayBrand';
 import { useEscapeToClose } from '../../../hooks/useEscapeToClose';
+import { validateDriveCryptoStatus, validateDriveSyncResult, type DriveCryptoStatusLike } from '../../../deviceContinuity';
+import { normalizeDriveFinderSnapshot, filterDriveFinderEntries, type DriveFinderEntry, type DriveFinderKind } from '../../../driveLocalFinder';
+import { summarizeDriveStorage } from '../../../driveStorageInsights';
+import { sortDriveFinderEntries, type DriveFinderSortOrder } from '../../../driveFinderSort';
+import { filterDriveFinderBySize, type DriveFinderSizeFilter } from '../../../driveFinderSizeFilter';
+import { filterDriveFinderWithinFolder, parentDriveFinderFolder } from '../../../driveFinderFolderScope';
+import { formatDriveFinderCsv } from '../../../driveFinderCsv';
+import { DriveBulkOrganizer } from './DriveBulkOrganizer';
+import { DriveBatchRestore } from './DriveBatchRestore';
+import { DriveBatchTrash } from './DriveBatchTrash';
+import { DriveFolderOperations } from './DriveFolderOperations';
+import { DriveFolderUndo } from './DriveFolderUndo';
+import { DriveFolderClone } from './DriveFolderClone';
+import { DriveFolderBlueprint } from './DriveFolderBlueprint';
+import { DriveFileCopy } from './DriveFileCopy';
+import { DriveFolderCompleteCopy } from './DriveFolderCompleteCopy';
+import { DriveFolderMirror } from './DriveFolderMirror';
+import { DriveFolderTreeTrash } from './DriveFolderTreeTrash';
+import { DriveTreeReceipt } from './DriveTreeReceipt';
+import { DriveBulkUndo } from './DriveBulkUndo';
+import { DriveHealthDoctor } from './DriveHealthDoctor';
+import { DriveTransferCenter } from './DriveTransferCenter';
+import { DrivePendingRescue } from './DrivePendingRescue';
+import { DriveBulkExport } from './DriveBulkExport';
+import { DriveIntegrityLedger } from './DriveIntegrityLedger';
+import { DriveNamespaceAudit } from './DriveNamespaceAudit';
+import { DriveTimeCapsule } from './DriveTimeCapsule';
+import { DrivePortableManifest } from './DrivePortableManifest';
+import { DriveFolderParity } from './DriveFolderParity';
+import { DriveBackupWatchlist } from './DriveBackupWatchlist';
+import { DriveBackupTimeline } from './DriveBackupTimeline';
+import { DriveBackupBatchRepair } from './DriveBackupBatchRepair';
+import { DriveDuplicateExplorer } from './DriveDuplicateExplorer';
+import { DriveCollections } from './DriveCollections';
+import { DriveChangeReviewPanel } from './DriveChangeReview';
+import { DriveSafeMode } from './DriveSafeMode';
+import { DriveSmartViews } from './DriveSmartViews';
+import { filterDriveTrashEntries, filterDriveTrashAvailability, filterDriveTrashByAge, normalizeDriveTrashEntries, sortDriveTrashEntries, formatDriveTrashBytes, formatDriveTrashInventory, summarizeSelectedDriveTrashSizes, type DriveTrashFilterKind, type DriveTrashSortOrder, type DriveTrashAvailability, type DriveTrashAgeRange } from '../../../driveTrashBrowse';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -29,14 +68,23 @@ interface ApiSettings {
     running: boolean;
 }
 
-interface DriveCryptoStatus {
-    configured: boolean;
-    unlocked: boolean;
-    version: number | null;
+type DriveCryptoStatus = DriveCryptoStatusLike;
+
+interface DriveSyncOutcome {
+    revision: number;
+    dirty: boolean;
+    source: string;
+}
+type DriveRestoreSyncState = 'synced' | 'pending' | 'qa-local' | 'unverified' | 'offline';
+
+interface DrivePendingRecoveryResult {
+    recovered: number;
+    remaining: number;
+    failures: number;
 }
 
 interface DriveTrashItem {
-    kind: 'file' | 'folder';
+    kind: 'file' | 'folder' | 'symlink';
     id: string;
     name: string;
     deleted_at: number;
@@ -51,11 +99,89 @@ const SHOW_ADVANCED_SETTINGS = false;
 
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     useEscapeToClose(isOpen, onClose);
+    const dialogRef = useRef<HTMLDivElement>(null);
+    const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        const frame = requestAnimationFrame(() => closeButtonRef.current?.focus({ preventScroll: true }));
+        return () => {
+            cancelAnimationFrame(frame);
+            if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+        };
+    }, [isOpen]);
+
+    const trapDialogTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.key !== 'Tab') return;
+        const root = dialogRef.current;
+        if (!root) return;
+        const focusable = Array.from(root.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        )).filter(element => element.getClientRects().length > 0);
+        if (!focusable.length) {
+            event.preventDefault();
+            root.focus();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !root.contains(active))) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && (active === last || !root.contains(active))) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
     const { settings, updateSetting, resetSettings } = useSettings();
     const { status: updateStatus, release: updateRelease, error: updateError, checkForUpdates } = useAppUpdate();
     const { confirm } = useConfirm();
     const { t } = useTranslation();
     const [clearing, setClearing] = useState(false);
+    const [linuxAutostartSupported, setLinuxAutostartSupported] = useState(false);
+    const [linuxAutostartEnabled, setLinuxAutostartEnabled] = useState<boolean | null>(null);
+    const [linuxAutostartBusy, setLinuxAutostartBusy] = useState(false);
+    const [linuxAutostartError, setLinuxAutostartError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        try {
+            if (operatingSystemType() !== 'linux') return;
+        } catch {
+            return;
+        }
+        setLinuxAutostartSupported(true);
+        let mounted = true;
+        void invoke<boolean>('cmd_desktop_autostart_status')
+            .then(enabled => {
+                if (mounted) {
+                    setLinuxAutostartEnabled(enabled);
+                    setLinuxAutostartError(null);
+                }
+            })
+            .catch(error => {
+                if (mounted) setLinuxAutostartError(String(error));
+            });
+        return () => { mounted = false; };
+    }, [isOpen]);
+
+    const toggleLinuxAutostart = async () => {
+        if (linuxAutostartEnabled === null || linuxAutostartBusy) return;
+        setLinuxAutostartBusy(true);
+        try {
+            const enabled = await invoke<boolean>('cmd_desktop_autostart_set', { enabled: !linuxAutostartEnabled });
+            setLinuxAutostartEnabled(enabled);
+            setLinuxAutostartError(null);
+            toast.success(enabled ? 'TeraRelay Drive will start after Linux sign-in.' : 'TeraRelay Drive login startup disabled.');
+        } catch (error) {
+            setLinuxAutostartError(String(error));
+            toast.error('Could not change TeraRelay startup preference.');
+        } finally {
+            setLinuxAutostartBusy(false);
+        }
+    };
 
     // Transcode cache state
     const [transcodeCache, setTranscodeCache] = useState<DetailedCacheInfo | null>(null);
@@ -73,10 +199,174 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const [driveCurrentPassphrase, setDriveCurrentPassphrase] = useState('');
     const [driveNewPassphrase, setDriveNewPassphrase] = useState('');
     const [driveConfirmPassphrase, setDriveConfirmPassphrase] = useState('');
+    const [driveFinderOpen, setDriveFinderOpen] = useState(false);
+    const [driveFinderEntries, setDriveFinderEntries] = useState<DriveFinderEntry[]>([]);
+    const [driveFinderSearch, setDriveFinderSearch] = useState('');
+    const [driveFinderKind, setDriveFinderKind] = useState<DriveFinderKind>('all');
+    const [driveFinderSort, setDriveFinderSort] = useState<DriveFinderSortOrder>('path');
+    const [driveFinderSizeFilter, setDriveFinderSizeFilter] = useState<DriveFinderSizeFilter>('all');
+    const [driveFinderFolderScope, setDriveFinderFolderScope] = useState('');
+    const [driveFinderVisibleLimit, setDriveFinderVisibleLimit] = useState(50);
+    const [driveFinderBusy, setDriveFinderBusy] = useState(false);
+    const [driveFinderCopyBusy, setDriveFinderCopyBusy] = useState(false);
+    const [driveFinderCsvCopyBusy, setDriveFinderCsvCopyBusy] = useState(false);
+    const [driveFinderError, setDriveFinderError] = useState<string | null>(null);
+    const [driveFinderSkipped, setDriveFinderSkipped] = useState(0);
+    const [driveFinderTruncated, setDriveFinderTruncated] = useState(0);
+    const driveFinderMatches = useMemo(() => sortDriveFinderEntries(filterDriveFinderBySize(filterDriveFinderEntries(
+        filterDriveFinderWithinFolder(driveFinderEntries, driveFinderFolderScope), driveFinderSearch, driveFinderKind), driveFinderSizeFilter), driveFinderSort),
+        [driveFinderEntries, driveFinderFolderScope, driveFinderSearch, driveFinderKind, driveFinderSizeFilter, driveFinderSort]);
+    const driveFinderShown = driveFinderMatches.slice(0, driveFinderVisibleLimit);
+    // Storage totals cover the whole verified local index, not the user's
+    // text filter or the first 50 visible rows. They are logical bytes only.
+    const driveFinderInsights = useMemo(() => summarizeDriveStorage(driveFinderEntries), [driveFinderEntries]);
     const [driveTrashOpen, setDriveTrashOpen] = useState(false);
     const [driveTrash, setDriveTrash] = useState<DriveTrashItem[]>([]);
     const [driveTrashBusy, setDriveTrashBusy] = useState(false);
+    const [driveTrashError, setDriveTrashError] = useState<string | null>(null);
+    const [driveTrashWarning, setDriveTrashWarning] = useState<string | null>(null);
+    const [driveTrashSearch, setDriveTrashSearch] = useState('');
+    const [driveTrashFilter, setDriveTrashFilter] = useState<DriveTrashFilterKind>('all');
+    const [driveTrashAvailability, setDriveTrashAvailability] = useState<DriveTrashAvailability>('all');
+    const [driveTrashAge, setDriveTrashAge] = useState<DriveTrashAgeRange>('all');
+    const [driveTrashClock, setDriveTrashClock] = useState(() => Date.now());
+    const [driveTrashSort, setDriveTrashSort] = useState<DriveTrashSortOrder>('newest');
+    const [driveTrashVisibleLimit, setDriveTrashVisibleLimit] = useState(50);
+    const [selectedDriveTrashKeys, setSelectedDriveTrashKeys] = useState<string[]>([]);
+    const [driveTrashBatchProgress, setDriveTrashBatchProgress] = useState<{ completed: number; total: number } | null>(null);
+    const [driveTrashBatchError, setDriveTrashBatchError] = useState<string | null>(null);
+    const [driveTrashBatchStopRequested, setDriveTrashBatchStopRequested] = useState(false);
+    const [driveTrashInventoryCopyBusy, setDriveTrashInventoryCopyBusy] = useState(false);
+    const hasActiveDriveTrashFilters = driveTrashSearch.trim() !== ''
+        || driveTrashFilter !== 'all'
+        || driveTrashAvailability !== 'all'
+        || driveTrashAge !== 'all'
+        || driveTrashSort !== 'newest';
+    const resetDriveTrashFilters = () => {
+        setDriveTrashSearch('');
+        setDriveTrashFilter('all');
+        setDriveTrashAvailability('all');
+        setDriveTrashAge('all');
+        setDriveTrashSort('newest');
+        setDriveTrashVisibleLimit(50);
+    };
+    const visibleDriveTrash = useMemo(() => sortDriveTrashEntries(
+        filterDriveTrashByAge(
+            filterDriveTrashAvailability(
+                filterDriveTrashEntries(driveTrash, driveTrashSearch, driveTrashFilter), driveTrashAvailability,
+            ), driveTrashAge, driveTrashClock,
+        ), driveTrashSort,
+    ), [driveTrash, driveTrashSearch, driveTrashFilter, driveTrashAvailability, driveTrashAge, driveTrashClock, driveTrashSort]);
+    // Large deleted-item lists should not mount thousands of DOM rows at once.
+    // Apply display paging only after the full local search/type/sort pass.
+    const shownDriveTrash = visibleDriveTrash.slice(0, driveTrashVisibleLimit);
+    const selectedRestorableDriveTrash = driveTrash.filter(item => item.restorable
+        && selectedDriveTrashKeys.includes(item.kind + ':' + item.id));
+    const selectedDriveTrashSizes = summarizeSelectedDriveTrashSizes(selectedRestorableDriveTrash);
+    const shownRestorableDriveTrash = shownDriveTrash.filter(item => item.restorable);
+    const selectShownDriveTrash = () => {
+        setSelectedDriveTrashKeys(current => [...new Set([
+            ...current, ...shownRestorableDriveTrash.map(item => item.kind + ':' + item.id),
+        ])].slice(0, 100));
+    };
+    const copyFilteredDriveTrashInventory = async () => {
+        if (!driveSettingsOpenRef.current || !driveTrashOpen || driveTrashBusy || driveTrashError
+            || driveTrashInventoryCopyInFlightRef.current || visibleDriveTrash.length === 0) return;
+        driveTrashInventoryCopyInFlightRef.current = true;
+        setDriveTrashInventoryCopyBusy(true);
+        const session = driveTrashSessionRef.current;
+        const inventory = formatDriveTrashInventory(visibleDriveTrash);
+        try {
+            await navigator.clipboard.writeText(inventory.text);
+            if (driveSettingsOpenRef.current && session === driveTrashSessionRef.current) {
+                toast.success(`Copied ${inventory.exported} matching deleted Drive items${inventory.omitted > 0 ? `; ${inventory.omitted} more were omitted.` : '.'}`);
+            }
+        } catch {
+            if (driveSettingsOpenRef.current && session === driveTrashSessionRef.current) {
+                toast.error('Could not copy deleted Drive list. Check clipboard access and retry.');
+            }
+        } finally {
+            driveTrashInventoryCopyInFlightRef.current = false;
+            if (driveSettingsOpenRef.current && session === driveTrashSessionRef.current) {
+                setDriveTrashInventoryCopyBusy(false);
+            }
+        }
+    };
+    // Age windows are rolling, not snapshots of the moment the dialog opened.
+    // Tick only while a time filter is visible; never poll Telegram for this.
+    useEffect(() => {
+        if (!isOpen || !driveTrashOpen || driveTrashAge === 'all') return;
+        setDriveTrashClock(Date.now());
+        const timer = window.setInterval(() => setDriveTrashClock(Date.now()), 60_000);
+        return () => window.clearInterval(timer);
+    }, [isOpen, driveTrashOpen, driveTrashAge]);
     const [restoringDriveItem, setRestoringDriveItem] = useState<string | null>(null);
+    const [driveRestoreSyncProblem, setDriveRestoreSyncProblem] = useState<Exclude<DriveRestoreSyncState, 'synced'> | null>(null);
+    const [driveRestoreSyncBusy, setDriveRestoreSyncBusy] = useState(false);
+    const [drivePendingRecoveryBusy, setDrivePendingRecoveryBusy] = useState(false);
+    const [drivePendingRecoveryResult, setDrivePendingRecoveryResult] = useState<DrivePendingRecoveryResult | null>(null);
+    const [drivePendingRecoveryError, setDrivePendingRecoveryError] = useState<string | null>(null);
+    // A delayed list reply cannot overwrite a newer refresh or another
+    // Settings session. Guard mutations synchronously before React rerenders.
+    const driveFinderRequestRef = useRef(0);
+    const driveFinderFetchInFlightRef = useRef(false);
+    const driveFinderCopyInFlightRef = useRef(false);
+    const driveFinderCsvCopyInFlightRef = useRef(false);
+    const driveFinderCsvCopyGenerationRef = useRef(0);
+    const driveTrashRequestRef = useRef(0);
+    const driveTrashSessionRef = useRef(0);
+    const driveTrashInventoryCopyInFlightRef = useRef(false);
+    const driveCryptoSessionRef = useRef(0);
+    const driveCryptoStatusEpochRef = useRef(0);
+    const driveCryptoActionInFlightRef = useRef(false);
+    const driveTrashRestoreInFlightRef = useRef(false);
+    const driveTrashBatchStopRequestedRef = useRef(false);
+    const driveRestoreSyncInFlightRef = useRef(false);
+    const drivePendingRecoveryInFlightRef = useRef(false);
+    const drivePendingRecoverySessionRef = useRef(0);
+    const driveSettingsOpenRef = useRef(isOpen);
+    driveSettingsOpenRef.current = isOpen;
+    useEffect(() => {
+        if (isOpen) {
+            if (driveRestoreSyncInFlightRef.current) setDriveRestoreSyncBusy(true);
+            if (drivePendingRecoveryInFlightRef.current) setDrivePendingRecoveryBusy(true);
+            return;
+        }
+        drivePendingRecoverySessionRef.current += 1;
+        setDrivePendingRecoveryResult(null);
+        setDrivePendingRecoveryError(null);
+        setDrivePendingRecoveryBusy(false);
+        driveFinderRequestRef.current += 1;
+        driveFinderFetchInFlightRef.current = false;
+        driveFinderCopyInFlightRef.current = false;
+        driveFinderCsvCopyInFlightRef.current = false;
+        driveFinderCsvCopyGenerationRef.current++;
+        setDriveFinderCopyBusy(false);
+        setDriveFinderCsvCopyBusy(false);
+        setDriveFinderOpen(false);
+        setDriveFinderEntries([]);
+        setDriveFinderSearch('');
+        setDriveFinderKind('all');
+        setDriveFinderSort('path');
+        setDriveFinderSizeFilter('all');
+        setDriveFinderFolderScope('');
+        setDriveFinderVisibleLimit(50);
+        setDriveFinderBusy(false);
+        setDriveFinderError(null);
+        setDriveFinderSkipped(0);
+        setDriveFinderTruncated(0);
+        driveTrashRequestRef.current += 1;
+        driveTrashSessionRef.current += 1;
+        setDriveTrashVisibleLimit(50);
+        setSelectedDriveTrashKeys([]);
+        setDriveTrashBatchProgress(null);
+        setDriveTrashBatchError(null);
+        driveTrashBatchStopRequestedRef.current = true;
+        setDriveTrashBatchStopRequested(false);
+        setDriveTrashInventoryCopyBusy(false);
+        setDriveTrashBusy(false);
+        setDriveRestoreSyncBusy(false);
+    }, [isOpen]);
 
     // Update check state
     // Reconnect state
@@ -131,7 +421,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         const share = shares.find(s => s.id === id);
         if (!share) return;
         
-        let link = `http://127.0.0.1:14201/d/${share.id}`;
+        let link = share.link;
         if (globalDomain.trim()) {
             link = `http://${globalDomain.trim()}/d/${share.id}`;
         }
@@ -149,11 +439,19 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const [keyCopied, setKeyCopied] = useState(false);
 
     const fetchDriveCryptoStatus = useCallback(async () => {
+        const session = driveCryptoSessionRef.current;
+        const request = ++driveCryptoStatusEpochRef.current;
         try {
-            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_status');
-            setDriveCryptoStatus(status);
+            const status = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_status'));
+            if (driveSettingsOpenRef.current && session === driveCryptoSessionRef.current
+                && request === driveCryptoStatusEpochRef.current) {
+                setDriveCryptoStatus(status);
+            }
         } catch {
-            setDriveCryptoStatus(null);
+            if (driveSettingsOpenRef.current && session === driveCryptoSessionRef.current
+                && request === driveCryptoStatusEpochRef.current) {
+                setDriveCryptoStatus(null);
+            }
         }
     }, []);
 
@@ -164,36 +462,365 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         setDriveConfirmPassphrase('');
     }, []);
 
+    // Treat every close/reopen as a fresh crypto UI session. Clear sensitive
+    // passphrases on close rather than leaving them in a hidden React dialog.
+    // Native requests already issued are not cancelled; their late UI results
+    // must never leak into a different Settings session.
+    useEffect(() => {
+        if (isOpen) {
+            if (driveCryptoActionInFlightRef.current) setDriveCryptoBusy(true);
+            return;
+        }
+        driveCryptoSessionRef.current += 1;
+        clearDrivePassphrases();
+        setDriveCryptoBusy(false);
+    }, [isOpen, clearDrivePassphrases]);
+
+    const isCurrentDriveCryptoSession = (session: number) =>
+        driveSettingsOpenRef.current && session === driveCryptoSessionRef.current;
+
     const fetchDriveTrash = useCallback(async () => {
+        const request = ++driveTrashRequestRef.current;
         setDriveTrashBusy(true);
+        setDriveTrashError(null);
         try {
-            const entries = await invoke<DriveTrashItem[]>('cmd_drive_list_trash');
+            const response = await invoke<unknown>('cmd_drive_list_trash');
+            if (!driveSettingsOpenRef.current || request !== driveTrashRequestRef.current) return;
+            const { entries, skipped } = normalizeDriveTrashEntries(response);
+            if (skipped > 0 && entries.length === 0) {
+                throw new TypeError('Native Drive returned no valid recently deleted items');
+            }
             setDriveTrash(entries);
+            const available = new Set(entries.filter(item => item.restorable)
+                .map(item => item.kind + ':' + item.id));
+            setSelectedDriveTrashKeys(current => current.filter(key => available.has(key)));
+            setDriveTrashWarning(skipped > 0
+                ? `Skipped ${skipped} malformed or duplicate deleted Drive ${skipped === 1 ? 'item' : 'items'}. The remaining entries are available; refresh to retry.`
+                : null);
+            setDriveTrashError(null);
         } catch (error) {
-            toast.error('Could not load TeraRelay Drive recently deleted items: ' + String(error));
+            if (driveSettingsOpenRef.current && request === driveTrashRequestRef.current) {
+                setDriveTrashError('Could not refresh recently deleted items. The previous list may be out of date.');
+            }
         } finally {
-            setDriveTrashBusy(false);
+            if (driveSettingsOpenRef.current && request === driveTrashRequestRef.current) {
+                setDriveTrashBusy(false);
+            }
         }
     }, []);
 
+    // The panel stays expanded across Settings sessions. Reopen must fetch
+    // a fresh list, but expanding once should never issue duplicate requests.
+    useEffect(() => {
+        if (isOpen && driveTrashOpen) void fetchDriveTrash();
+    }, [isOpen, driveTrashOpen, fetchDriveTrash]);
+
+    const recoverPendingDriveWrites = async () => {
+        if (drivePendingRecoveryInFlightRef.current) return;
+        drivePendingRecoveryInFlightRef.current = true;
+        const session = drivePendingRecoverySessionRef.current;
+        const isCurrentDialog = () => driveSettingsOpenRef.current
+            && session === drivePendingRecoverySessionRef.current;
+        setDrivePendingRecoveryBusy(true);
+        setDrivePendingRecoveryResult(null);
+        setDrivePendingRecoveryError(null);
+        try {
+            // This native command finalizes closed staged writes. It is
+            // intentionally user-initiated here, never an automatic UI poll.
+            const value = await invoke<unknown>('cmd_drive_recover_pending');
+            if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                throw new TypeError('Native Drive recovery returned an invalid result');
+            }
+            const row = value as Record<string, unknown>;
+            const counters = [row.recovered, row.remaining, row.failures];
+            if (counters.some(count => typeof count !== 'number'
+                || !Number.isSafeInteger(count) || count < 0 || count > 0xffffffff)) {
+                throw new TypeError('Native Drive recovery returned invalid item counts');
+            }
+            if (!isCurrentDialog()) return;
+            const result: DrivePendingRecoveryResult = {
+                recovered: row.recovered as number,
+                remaining: row.remaining as number,
+                failures: row.failures as number,
+            };
+            setDrivePendingRecoveryResult(result);
+            if (result.remaining > 0 || result.failures > 0) {
+                toast.warning('Drive write recovery: ' + result.recovered + ' completed, '
+                    + result.remaining + ' still pending, ' + result.failures + ' failed.');
+            } else {
+                toast.success(result.recovered > 0
+                    ? 'Recovered ' + result.recovered + ' pending Drive '
+                        + (result.recovered === 1 ? 'write.' : 'writes.')
+                    : 'No closed pending Drive writes need recovery.');
+            }
+        } catch (error) {
+            if (isCurrentDialog()) {
+                setDrivePendingRecoveryError('Could not retry pending Drive writes: ' + String(error));
+                toast.error('Drive write recovery did not complete. You can retry.');
+            }
+        } finally {
+            // Do not release native ownership on close. The old command must
+            // actually settle before a reopened dialog can retry it.
+            drivePendingRecoveryInFlightRef.current = false;
+            if (driveSettingsOpenRef.current) setDrivePendingRecoveryBusy(false);
+        }
+    };
+
+    const classifyDriveRestoreSync = (result: unknown): DriveRestoreSyncState => {
+        // Native IPC's compile-time types do not guarantee a real revision,
+        // publication status or source. Never claim Telegram sync from a
+        // corrupt response after a successful local restore.
+        let verified: ReturnType<typeof validateDriveSyncResult>;
+        try {
+            verified = validateDriveSyncResult(result);
+        } catch {
+            return 'unverified';
+        }
+        if (verified.source === 'qa-local') return 'qa-local';
+        if (verified.dirty) return 'pending';
+        return 'synced';
+    };
+
+    const retryDriveRestoreMetadataSync = async () => {
+        if (!driveRestoreSyncProblem || driveRestoreSyncInFlightRef.current
+            || driveTrashRestoreInFlightRef.current) return;
+        driveRestoreSyncInFlightRef.current = true;
+        const session = driveTrashSessionRef.current;
+        const isCurrentDialog = () => driveSettingsOpenRef.current && session === driveTrashSessionRef.current;
+        setDriveRestoreSyncBusy(true);
+        try {
+            const result = await invoke<DriveSyncOutcome>('cmd_drive_sync_metadata');
+            if (!isCurrentDialog()) return;
+            const outcome = classifyDriveRestoreSync(result);
+            setDriveRestoreSyncProblem(outcome === 'synced' ? null : outcome);
+            if (outcome === 'synced') {
+                toast.success('Restored Drive metadata is now synchronized.');
+            } else {
+                toast.warning(outcome === 'qa-local'
+                    ? 'Drive is in QA mode; metadata is still local.'
+                    : outcome === 'pending'
+                        ? 'Drive metadata still has pending changes. You can retry synchronization.'
+                        : 'Drive synchronization completed, but remote publication could not be verified.');
+            }
+        } catch {
+            if (isCurrentDialog()) {
+                setDriveRestoreSyncProblem('offline');
+                toast.warning('Drive metadata is still local. Retry when Telegram is connected.');
+            }
+        } finally {
+            driveRestoreSyncInFlightRef.current = false;
+            // A closed/reopened Settings session must never receive the old
+            // notification, but should no longer appear busy after native work ends.
+            if (driveSettingsOpenRef.current) setDriveRestoreSyncBusy(false);
+        }
+    };
+
     const restoreDriveTrashItem = async (entry: DriveTrashItem) => {
-        setRestoringDriveItem(entry.id);
+        if (driveTrashRestoreInFlightRef.current || driveRestoreSyncInFlightRef.current) return;
+        driveTrashRestoreInFlightRef.current = true;
+        const session = driveTrashSessionRef.current;
+        const isCurrentDialog = () => driveSettingsOpenRef.current && session === driveTrashSessionRef.current;
+        setRestoringDriveItem(entry.kind + ':' + entry.id);
         try {
             const restoredName = await invoke<string>('cmd_drive_restore_trash_item', {
                 kind: entry.kind,
                 id: entry.id,
             });
-            await fetchDriveTrash();
+            // Native restore has already succeeded. Immediately remove the exact
+            // restored row so the user cannot retry it while a slow list refresh
+            // is pending. Invalidate any pre-restore list reply first: otherwise
+            // an older response could reintroduce this deleted item.
+            if (isCurrentDialog()) {
+                ++driveTrashRequestRef.current;
+                setDriveTrash(current => current.filter(item =>
+                    item.kind !== entry.kind || item.id !== entry.id));
+                setDriveTrashBusy(false);
+            }
+            // Cloud metadata sync is essential; don't hold it hostage to an
+            // optional, potentially slow, Recently Deleted list refresh.
+            let syncOutcome: DriveRestoreSyncState = 'offline';
             try {
-                await invoke('cmd_drive_sync_metadata');
-                toast.success('Restored ' + restoredName + ' to TeraRelay Drive');
+                const result = await invoke<DriveSyncOutcome>('cmd_drive_sync_metadata');
+                syncOutcome = classifyDriveRestoreSync(result);
             } catch {
-                toast.warning('Restored locally. Remote Drive layout will sync when Telegram is available.');
+                // Native restore already succeeded; only metadata sync failed.
+            }
+            if (driveSettingsOpenRef.current) void fetchDriveTrash();
+            if (isCurrentDialog()) {
+                setDriveRestoreSyncProblem(syncOutcome === 'synced' ? null : syncOutcome);
+                switch (syncOutcome) {
+                    case 'synced':
+                        toast.success('Restored ' + restoredName + '; Drive metadata is synchronized.');
+                        break;
+                    case 'qa-local':
+                        toast.warning('Restored ' + restoredName + ' locally. QA mode does not sync to Telegram.');
+                        break;
+                    case 'pending':
+                        toast.warning('Restored ' + restoredName + ' locally. Drive metadata still has pending changes.');
+                        break;
+                    case 'unverified':
+                        toast.warning('Restored ' + restoredName + ' locally, but remote sync status could not be verified.');
+                        break;
+                    default:
+                        toast.warning('Restored ' + restoredName + ' locally. Remote Drive sync is unavailable; retry when Telegram is connected.');
+                }
             }
         } catch (error) {
-            toast.error('Could not restore ' + entry.name + ': ' + String(error));
+            if (isCurrentDialog()) toast.error('Could not restore ' + entry.name + ': ' + String(error));
         } finally {
+            driveTrashRestoreInFlightRef.current = false;
             setRestoringDriveItem(null);
+        }
+    };
+
+    const restoreSelectedDriveTrash = async () => {
+        if (driveTrashRestoreInFlightRef.current || driveRestoreSyncInFlightRef.current
+            || driveTrashBusy || driveTrashError) return;
+        // Snapshot verified, restorable identities at the moment of the click.
+        // A bounded sequential batch avoids overlapping native restore writes.
+        const entries = selectedRestorableDriveTrash.slice(0, 100);
+        if (entries.length === 0) return;
+        driveTrashRestoreInFlightRef.current = true;
+        const session = driveTrashSessionRef.current;
+        const isCurrentDialog = () => driveSettingsOpenRef.current
+            && session === driveTrashSessionRef.current;
+        setRestoringDriveItem('bulk');
+        setDriveTrashBatchProgress({ completed: 0, total: entries.length });
+        setDriveTrashBatchError(null);
+        driveTrashBatchStopRequestedRef.current = false;
+        setDriveTrashBatchStopRequested(false);
+        let restored = 0;
+        let failed: string | null = null;
+        try {
+            for (const entry of entries) {
+                // Closing Settings stops the batch after any already-issued
+                // native request settles, without abandoning its metadata sync.
+                if (!isCurrentDialog() || driveTrashBatchStopRequestedRef.current) break;
+                try {
+                    await invoke('cmd_drive_restore_trash_item', { kind: entry.kind, id: entry.id });
+                } catch (error) {
+                    failed = `Could not restore ${entry.name}: ${String(error)}. Remaining items were not attempted.`;
+                    if (isCurrentDialog()) setDriveTrashBatchError(failed);
+                    break;
+                }
+                restored += 1;
+                if (isCurrentDialog()) {
+                    ++driveTrashRequestRef.current;
+                    setDriveTrash(current => current.filter(item =>
+                        item.kind !== entry.kind || item.id !== entry.id));
+                    setSelectedDriveTrashKeys(current => current.filter(key => key !== entry.kind + ':' + entry.id));
+                    setDriveTrashBatchProgress({ completed: restored, total: entries.length });
+                }
+            }
+            if (restored === 0) {
+                if (failed && isCurrentDialog()) toast.error(failed);
+                else if (driveTrashBatchStopRequestedRef.current && isCurrentDialog()) {
+                    toast.warning('Bulk Drive restore stopped. No items were restored.');
+                }
+                return;
+            }
+            // Sync once after all completed native restores, including a
+            // partial batch or one closed halfway through. A failed sync must
+            // never make restored local files appear to have been published.
+            let syncOutcome: DriveRestoreSyncState = 'offline';
+            try {
+                const result = await invoke<DriveSyncOutcome>('cmd_drive_sync_metadata');
+                syncOutcome = classifyDriveRestoreSync(result);
+            } catch {
+                // The local restore still succeeded; users can retry sync.
+            }
+            if (isCurrentDialog()) void fetchDriveTrash();
+            if (isCurrentDialog()) {
+                setDriveRestoreSyncProblem(syncOutcome === 'synced' ? null : syncOutcome);
+                const summary = `Restored ${restored} of ${entries.length} selected Drive items locally.`;
+                if (failed) {
+                    toast.warning(summary + ' Some items remain selected; check the batch error.');
+                } else if (driveTrashBatchStopRequestedRef.current && restored < entries.length) {
+                    toast.warning(summary + (syncOutcome === 'synced'
+                        ? ' Stopped as requested; completed items are synchronized.'
+                        : ' Stopped as requested; completed items still need verified remote sync.'));
+                } else if (syncOutcome === 'synced') {
+                    toast.success(`Restored ${restored} Drive items; metadata synchronized.`);
+                } else {
+                    toast.warning(summary + ' Remote metadata sync is not confirmed; use Retry sync.');
+                }
+            }
+        } finally {
+            driveTrashRestoreInFlightRef.current = false;
+            setRestoringDriveItem(null);
+        }
+    };
+
+    const copyLocalDriveInventoryCsv = async () => {
+        if (!driveSettingsOpenRef.current || !driveFinderOpen || driveFinderBusy || driveFinderError
+            || driveFinderCsvCopyInFlightRef.current || driveFinderMatches.length === 0) return;
+        driveFinderCsvCopyInFlightRef.current = true;
+        setDriveFinderCsvCopyBusy(true);
+        const generation = driveFinderCsvCopyGenerationRef.current;
+        const exported = formatDriveFinderCsv(driveFinderMatches);
+        try {
+            await navigator.clipboard.writeText(exported.csv);
+            if (driveSettingsOpenRef.current && generation === driveFinderCsvCopyGenerationRef.current) {
+                toast.success(`Copied ${exported.exported} local Drive entries as CSV${exported.omitted ? `; ${exported.omitted} additional matches omitted.` : '.'}`);
+            }
+        } catch {
+            if (driveSettingsOpenRef.current && generation === driveFinderCsvCopyGenerationRef.current) {
+                toast.error('Could not copy Drive CSV inventory. Check clipboard permissions and retry.');
+            }
+        } finally {
+            if (generation === driveFinderCsvCopyGenerationRef.current) {
+                driveFinderCsvCopyInFlightRef.current = false;
+                if (driveSettingsOpenRef.current) setDriveFinderCsvCopyBusy(false);
+            }
+        }
+    };
+
+    const copyLocalDriveRelativePath = async (relativePath: string) => {
+        if (!driveSettingsOpenRef.current || !driveFinderOpen || driveFinderCopyInFlightRef.current) return;
+        driveFinderCopyInFlightRef.current = true;
+        setDriveFinderCopyBusy(true);
+        const request = driveFinderRequestRef.current;
+        try {
+            await navigator.clipboard.writeText(relativePath);
+            if (driveSettingsOpenRef.current && request === driveFinderRequestRef.current) {
+                toast.success('Drive-relative path copied. This is not an absolute OS mount path.');
+            }
+        } catch {
+            if (driveSettingsOpenRef.current && request === driveFinderRequestRef.current) {
+                toast.error('Could not copy Drive-relative path. Check clipboard access and retry.');
+            }
+        } finally {
+            if (request === driveFinderRequestRef.current) {
+                driveFinderCopyInFlightRef.current = false;
+                if (driveSettingsOpenRef.current) setDriveFinderCopyBusy(false);
+            }
+        }
+    };
+
+    const refreshLocalDriveFinder = async () => {
+        if (!driveSettingsOpenRef.current || driveFinderFetchInFlightRef.current) return;
+        driveFinderFetchInFlightRef.current = true;
+        const request = ++driveFinderRequestRef.current;
+        setDriveFinderBusy(true);
+        setDriveFinderError(null);
+        try {
+            // This reads the local metadata database only; there is no
+            // Telegram fetch, filesystem traversal, mount or mutation.
+            const snapshot = normalizeDriveFinderSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'));
+            if (!driveSettingsOpenRef.current || request !== driveFinderRequestRef.current) return;
+            setDriveFinderEntries(snapshot.entries);
+            setDriveFinderSkipped(snapshot.skipped);
+            setDriveFinderTruncated(snapshot.truncated);
+            setDriveFinderVisibleLimit(50);
+        } catch {
+            if (!driveSettingsOpenRef.current || request !== driveFinderRequestRef.current) return;
+            setDriveFinderError('Could not read and verify local Drive metadata. Retry the search.');
+            setDriveFinderEntries([]);
+        } finally {
+            if (request === driveFinderRequestRef.current) {
+                driveFinderFetchInFlightRef.current = false;
+                if (driveSettingsOpenRef.current) setDriveFinderBusy(false);
+            }
         }
     };
 
@@ -432,6 +1059,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     };
 
     const handleDriveCryptoSetup = async () => {
+        if (driveCryptoActionInFlightRef.current) return;
         if (drivePassphrase.length < 12) {
             toast.error('Drive passphrase must contain at least 12 characters');
             return;
@@ -440,63 +1068,92 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             toast.error('Drive passphrases do not match');
             return;
         }
-        const ok = await confirm({
-            title: 'Enable TeraRelay Drive encryption?',
-            message: 'New and edited Drive file contents will be encrypted before upload. Keep this passphrase safe: another computer needs it to unlock the same Drive.',
-            confirmText: 'Enable encryption',
-            variant: 'info',
-        });
-        if (!ok) return;
 
+        driveCryptoActionInFlightRef.current = true;
+        ++driveCryptoStatusEpochRef.current;
+        const cryptoSession = driveCryptoSessionRef.current;
         setDriveCryptoBusy(true);
         try {
-            // Encryption setup is intentionally online-first. Reconcile the
-            // Telegram-synced Drive manifest before generating a new master key
-            // so a second computer cannot accidentally create a competing key.
+            const ok = await confirm({
+                title: 'Enable TeraRelay Drive encryption?',
+                message: 'New and edited Drive file contents will be encrypted before upload. Keep this passphrase safe: another computer needs it to unlock the same Drive.',
+                confirmText: 'Enable encryption',
+                variant: 'info',
+            });
+            if (!ok || !isCurrentDriveCryptoSession(cryptoSession)) return;
+
+            // Reconcile the Telegram-synced Drive manifest before generating
+            // a master key, avoiding a competing key on another computer.
             await invoke('cmd_drive_sync_metadata');
-            const current = await invoke<DriveCryptoStatus>('cmd_drive_crypto_status');
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
+            const current = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_status'));
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
             if (current.configured) {
+                ++driveCryptoStatusEpochRef.current;
                 setDriveCryptoStatus(current);
                 clearDrivePassphrases();
                 toast.info('Drive encryption is already configured. Unlock it with the existing passphrase.');
                 return;
             }
 
-            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_setup', {
+            const status = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_setup', {
                 passphrase: drivePassphrase,
-            });
+            }));
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
+            if (!status?.configured || !status.unlocked) {
+                throw new Error('Drive encryption setup returned an unconfigured or locked state');
+            }
+            ++driveCryptoStatusEpochRef.current;
             setDriveCryptoStatus(status);
             clearDrivePassphrases();
             toast.success('TeraRelay Drive encryption enabled and synced');
         } catch (error) {
-            void fetchDriveCryptoStatus();
-            toast.error('Could not finish Drive encryption setup: ' + String(error));
+            if (isCurrentDriveCryptoSession(cryptoSession)) {
+                void fetchDriveCryptoStatus();
+                toast.error('Could not finish Drive encryption setup: ' + String(error));
+            }
         } finally {
-            setDriveCryptoBusy(false);
+            // Even an abandoned confirmation or a late native response must
+            // release ownership before another crypto action can be attempted.
+            driveCryptoActionInFlightRef.current = false;
+            if (driveSettingsOpenRef.current) setDriveCryptoBusy(false);
         }
     };
 
     const handleDriveCryptoUnlock = async () => {
+        if (driveCryptoActionInFlightRef.current) return;
         if (!drivePassphrase) {
             toast.error('Enter your Drive passphrase');
             return;
         }
+        driveCryptoActionInFlightRef.current = true;
+        ++driveCryptoStatusEpochRef.current;
+        const cryptoSession = driveCryptoSessionRef.current;
         setDriveCryptoBusy(true);
         try {
-            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_unlock', {
+            const status = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_unlock', {
                 passphrase: drivePassphrase,
-            });
+            }));
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
+            if (!status?.configured || !status.unlocked) {
+                throw new Error('Drive remained locked after the unlock request');
+            }
+            ++driveCryptoStatusEpochRef.current;
             setDriveCryptoStatus(status);
             clearDrivePassphrases();
             toast.success('TeraRelay Drive unlocked');
         } catch (error) {
-            toast.error('Could not unlock Drive: ' + String(error));
+            if (isCurrentDriveCryptoSession(cryptoSession)) {
+                toast.error('Could not unlock Drive: ' + String(error));
+            }
         } finally {
-            setDriveCryptoBusy(false);
+            driveCryptoActionInFlightRef.current = false;
+            if (driveSettingsOpenRef.current) setDriveCryptoBusy(false);
         }
     };
 
     const handleDriveCryptoChangePassphrase = async () => {
+        if (driveCryptoActionInFlightRef.current) return;
         if (!driveCurrentPassphrase) {
             toast.error('Enter your current Drive passphrase');
             return;
@@ -509,34 +1166,57 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             toast.error('New Drive passphrases do not match');
             return;
         }
+        driveCryptoActionInFlightRef.current = true;
+        ++driveCryptoStatusEpochRef.current;
+        const cryptoSession = driveCryptoSessionRef.current;
         setDriveCryptoBusy(true);
         try {
-            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_change_passphrase', {
+            const status = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_change_passphrase', {
                 currentPassphrase: driveCurrentPassphrase,
                 newPassphrase: driveNewPassphrase,
-            });
+            }));
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
+            if (!status?.configured || !status.unlocked) {
+                throw new Error('Drive passphrase change did not return an unlocked encrypted Drive');
+            }
+            ++driveCryptoStatusEpochRef.current;
             setDriveCryptoStatus(status);
             clearDrivePassphrases();
             toast.success('Drive passphrase changed and synced');
         } catch (error) {
-            void fetchDriveCryptoStatus();
-            toast.error('Could not finish Drive passphrase change: ' + String(error));
+            if (isCurrentDriveCryptoSession(cryptoSession)) {
+                void fetchDriveCryptoStatus();
+                toast.error('Could not finish Drive passphrase change: ' + String(error));
+            }
         } finally {
-            setDriveCryptoBusy(false);
+            driveCryptoActionInFlightRef.current = false;
+            if (driveSettingsOpenRef.current) setDriveCryptoBusy(false);
         }
     };
 
     const handleDriveCryptoLock = async () => {
+        if (driveCryptoActionInFlightRef.current) return;
+        driveCryptoActionInFlightRef.current = true;
+        ++driveCryptoStatusEpochRef.current;
+        const cryptoSession = driveCryptoSessionRef.current;
         setDriveCryptoBusy(true);
         try {
-            const status = await invoke<DriveCryptoStatus>('cmd_drive_crypto_lock');
+            const status = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_lock'));
+            if (!isCurrentDriveCryptoSession(cryptoSession)) return;
+            if (!status?.configured || status.unlocked !== false) {
+                throw new Error('Drive remained unlocked after the lock request');
+            }
+            ++driveCryptoStatusEpochRef.current;
             setDriveCryptoStatus(status);
             clearDrivePassphrases();
             toast.success('TeraRelay Drive locked');
         } catch (error) {
-            toast.error('Could not lock Drive: ' + String(error));
+            if (isCurrentDriveCryptoSession(cryptoSession)) {
+                toast.error('Could not lock Drive: ' + String(error));
+            }
         } finally {
-            setDriveCryptoBusy(false);
+            driveCryptoActionInFlightRef.current = false;
+            if (driveSettingsOpenRef.current) setDriveCryptoBusy(false);
         }
     };
 
@@ -556,14 +1236,23 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         animate={{ opacity: 1, scale: 1, y: 0 }}
                         exit={{ opacity: 0, scale: 0.95, y: 10 }}
                         transition={{ type: 'spring', damping: 25, stiffness: 220 }}
+                        ref={dialogRef}
+                        tabIndex={-1}
+                        onKeyDown={trapDialogTab}
                         className="tr-modal tr-settings-modal w-[700px] max-w-[calc(100vw-2rem)] overflow-hidden flex flex-col"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="tr-settings-dialog-title"
                         onClick={e => e.stopPropagation()}
                     >
                         {/* Header */}
                         <div className="tr-modal-header px-5 py-4 flex justify-between items-center">
-                            <h2 className="text-telegram-text font-semibold text-base">{t('settings.title')}</h2>
+                            <h2 id="tr-settings-dialog-title" className="text-telegram-text font-semibold text-base">{t('settings.title')}</h2>
                             <button
+                                ref={closeButtonRef}
+                                type="button"
                                 onClick={onClose}
+                                aria-label={t('common.close')}
                                 className="tr-modal-close"
                             >
                                 <X className="w-4 h-4" />
@@ -602,6 +1291,39 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         className="space-y-6 w-full"
                                     >
 
+                            {linuxAutostartSupported && (
+                                <section className="space-y-3">
+                                    <h3 className="tr-setting-section-title flex items-center gap-2">
+                                        <HardDrive className="w-3.5 h-3.5" />
+                                        Drive background startup
+                                    </h3>
+                                    <div className="tr-setting-row flex items-center justify-between gap-4 p-3">
+                                        <div className="min-w-0">
+                                            <p className="text-sm text-telegram-text font-medium">Start TeraRelay Drive when I sign in</p>
+                                            <p className="text-xs text-telegram-subtext">
+                                                Starts hidden in the tray after Linux login. Closing the window keeps Drive mounted;
+                                                Quit TeraRelay unmounts it. Open TeraRelay normally to return.
+                                            </p>
+                                            {linuxAutostartError && (
+                                                <p className="mt-1 text-xs text-red-400" role="alert">
+                                                    {linuxAutostartError}
+                                                </p>
+                                            )}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => { void toggleLinuxAutostart(); }}
+                                            disabled={linuxAutostartEnabled === null || linuxAutostartBusy}
+                                            aria-label="Start TeraRelay Drive when I sign in"
+                                            aria-pressed={linuxAutostartEnabled === true}
+                                            className={`relative w-11 h-6 shrink-0 rounded-full transition-colors duration-200 disabled:opacity-50 ${linuxAutostartEnabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
+                                        >
+                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${linuxAutostartEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                                        </button>
+                                    </div>
+                                </section>
+                            )}
+
                             {/* Transfers Section */}
                             <section className="space-y-3">
                                 <h3 className="tr-setting-section-title flex items-center gap-2">
@@ -621,6 +1343,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <div className="flex items-center gap-2">
                                         <button
                                             onClick={() => updateSetting('maxConcurrentUploads', Math.max(1, settings.maxConcurrentUploads - 1))}
+                                            aria-label={`${t('settings.concurrent_uploads')} -`}
                                             className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
                                         >
                                             -
@@ -630,6 +1353,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         </span>
                                         <button
                                             onClick={() => updateSetting('maxConcurrentUploads', Math.min(10, settings.maxConcurrentUploads + 1))}
+                                            aria-label={`${t('settings.concurrent_uploads')} +`}
                                             className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
                                         >
                                             +
@@ -649,6 +1373,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <div className="flex items-center gap-2">
                                         <button
                                             onClick={() => updateSetting('maxConcurrentDownloads', Math.max(1, settings.maxConcurrentDownloads - 1))}
+                                            aria-label={`${t('settings.concurrent_downloads')} -`}
                                             className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
                                         >
                                             -
@@ -658,6 +1383,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         </span>
                                         <button
                                             onClick={() => updateSetting('maxConcurrentDownloads', Math.min(10, settings.maxConcurrentDownloads + 1))}
+                                            aria-label={`${t('settings.concurrent_downloads')} +`}
                                             className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
                                         >
                                             +
@@ -696,6 +1422,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
                                     <button
                                         onClick={() => updateSetting('hideGroups', !settings.hideGroups)}
+                                        aria-label={t('common.hide_groups')}
+                                        aria-pressed={settings.hideGroups}
                                         className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${settings.hideGroups ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
                                     >
                                         <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.hideGroups ? 'translate-x-5' : 'translate-x-0'}`} />
@@ -762,6 +1490,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
                                     <div className="relative">
                                         <select
+                                            aria-label={t('settings.app_language')}
                                             value={settings.language}
                                             onChange={e => updateSetting('language', e.target.value as any)}
                                             className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
@@ -1012,6 +1741,266 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 <div className="tr-setting-row p-3 space-y-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div className="flex items-center gap-2.5 min-w-0">
+                                            <RefreshCw className="w-4 h-4 text-telegram-subtext flex-shrink-0" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-telegram-text font-medium">TeraRelay Drive · Unfinished writes</p>
+                                                <p className="text-xs text-telegram-subtext">
+                                                    Manually retry completed staging writes that did not finish recovering at startup.
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            aria-label="Retry pending TeraRelay Drive writes"
+                                            disabled={drivePendingRecoveryBusy}
+                                            onClick={() => { void recoverPendingDriveWrites(); }}
+                                            className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium bg-telegram-hover text-telegram-text hover:bg-telegram-border/60 disabled:opacity-50"
+                                        >
+                                            {drivePendingRecoveryBusy && <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />}
+                                            {drivePendingRecoveryBusy ? 'Recovering…' : 'Retry unfinished writes'}
+                                        </button>
+                                    </div>
+                                    {drivePendingRecoveryResult && (
+                                        <p className="rounded-md bg-telegram-hover/40 px-3 py-2 text-xs text-telegram-text" role="status">
+                                            Recovery checked: {drivePendingRecoveryResult.recovered} completed,
+                                            {' '}{drivePendingRecoveryResult.remaining} still pending,
+                                            {' '}{drivePendingRecoveryResult.failures} failed.
+                                            {' '}This does not independently verify Telegram metadata synchronization.
+                                        </p>
+                                    )}
+                                    {drivePendingRecoveryError && (
+                                        <p className="rounded-md border border-red-500/30 p-2 text-xs text-telegram-text" role="alert">
+                                            {drivePendingRecoveryError}
+                                        </p>
+                                    )}
+                                </div>
+
+                                <DriveBulkOrganizer active={isOpen && activeTab === 'general'} />
+                                <DriveBatchRestore active={isOpen && activeTab === 'general'} />
+                                <DriveBatchTrash active={isOpen && activeTab === 'general'} />
+                                <DriveFolderOperations active={isOpen && activeTab === 'general'} />
+                                <DriveFolderUndo active={isOpen && activeTab === 'general'} />
+                                <DriveFolderClone active={isOpen && activeTab === 'general'} />
+                                <DriveFolderBlueprint active={isOpen && activeTab === 'general'} />
+                                <DriveFileCopy active={isOpen && activeTab === 'general'} />
+                                <DriveFolderCompleteCopy active={isOpen && activeTab === 'general'} />
+                                <DriveFolderMirror active={isOpen && activeTab === 'general'} />
+                                <DriveFolderTreeTrash active={isOpen && activeTab === 'general'} />
+                                <DriveTreeReceipt active={isOpen && activeTab === 'general'} />
+                                <DriveBulkUndo active={isOpen && activeTab === 'general'} />
+                                <DriveDuplicateExplorer active={isOpen && activeTab === 'general'} />
+                                <DriveCollections active={isOpen && activeTab === 'general'} />
+                                <DriveSmartViews active={isOpen && activeTab === 'general'} />
+                                <DriveChangeReviewPanel active={isOpen && activeTab === 'general'} />
+                                <DriveHealthDoctor active={isOpen && activeTab === 'general'} />
+                                <DriveTransferCenter active={isOpen && activeTab === 'general'} />
+                                <DrivePendingRescue active={isOpen && activeTab === 'general'} />
+                                <DriveBulkExport active={isOpen && activeTab === 'general'} />
+                                <DriveIntegrityLedger active={isOpen && activeTab === 'general'} />
+                                <DriveNamespaceAudit active={isOpen && activeTab === 'general'} />
+                                <DriveTimeCapsule active={isOpen && activeTab === 'general'} />
+                                <DrivePortableManifest active={isOpen && activeTab === 'general'} />
+                                <DriveFolderParity active={isOpen && activeTab === 'general'} />
+                                <DriveBackupWatchlist active={isOpen && activeTab === 'general'} />
+                                <DriveBackupTimeline active={isOpen && activeTab === 'general'} />
+                                <DriveBackupBatchRepair active={isOpen && activeTab === 'general'} />
+                                <DriveSafeMode active={isOpen && activeTab === 'general'} />
+
+                                <div className="tr-setting-row p-3 space-y-3">
+                                    <div className="flex flex-wrap items-center justify-between gap-3">
+                                        <div className="flex items-center gap-2.5 min-w-0">
+                                            <Search className="w-4 h-4 text-telegram-subtext flex-shrink-0" />
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-telegram-text font-medium">TeraRelay Drive · Find files</p>
+                                                <p className="text-xs text-telegram-subtext">Search local Drive metadata, including unfinished writes, without downloading file contents.</p>
+                                            </div>
+                                        </div>
+                                        <button type="button" aria-label="Open local Drive file finder"
+                                            aria-expanded={driveFinderOpen}
+                                            onClick={() => {
+                                                if (driveFinderOpen) {
+                                                    ++driveFinderRequestRef.current;
+                                                    driveFinderFetchInFlightRef.current = false;
+                                                    driveFinderCopyInFlightRef.current = false;
+                                                    driveFinderCsvCopyInFlightRef.current = false;
+                                                    driveFinderCsvCopyGenerationRef.current++;
+                                                    setDriveFinderBusy(false);
+                                                    setDriveFinderCopyBusy(false);
+                                                    setDriveFinderCsvCopyBusy(false);
+                                                    setDriveFinderOpen(false);
+                                                } else {
+                                                    setDriveFinderEntries([]);
+                                                    setDriveFinderOpen(true);
+                                                    void refreshLocalDriveFinder();
+                                                }
+                                            }}
+                                            className="rounded-lg bg-telegram-hover px-3 py-1.5 text-xs text-telegram-text hover:bg-telegram-border/60"
+                                        >{driveFinderOpen ? 'Hide finder' : 'Find files'}</button>
+                                    </div>
+                                    {driveFinderOpen && (
+                                        <div className="space-y-2 pl-6">
+                                            <nav aria-label="Current local Drive folder" className="flex flex-wrap items-center gap-2 text-xs">
+                                                <span className="min-w-0 break-all font-medium text-telegram-text">
+                                                    {driveFinderFolderScope || '/ (All Drive)'}
+                                                </span>
+                                                {driveFinderFolderScope && (
+                                                    <>
+                                                        <button type="button" aria-label="Go up one Drive folder"
+                                                            onClick={() => {
+                                                                setDriveFinderFolderScope(parentDriveFinderFolder(driveFinderFolderScope));
+                                                                setDriveFinderVisibleLimit(50);
+                                                            }}
+                                                            className="rounded-md bg-telegram-hover px-2 py-1 text-telegram-primary hover:underline">
+                                                            Up
+                                                        </button>
+                                                        <button type="button" aria-label="Show all Drive folders"
+                                                            onClick={() => { setDriveFinderFolderScope(''); setDriveFinderVisibleLimit(50); }}
+                                                            className="rounded-md bg-telegram-hover px-2 py-1 text-telegram-primary hover:underline">
+                                                            All Drive
+                                                        </button>
+                                                    </>
+                                                )}
+                                            </nav>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <input type="search" aria-label="Search local Drive filenames or folder paths"
+                                                    placeholder="Find by filename or folder…" value={driveFinderSearch}
+                                                    onChange={event => { setDriveFinderSearch(event.target.value); setDriveFinderVisibleLimit(50); }}
+                                                    className="min-w-[160px] flex-1 rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text" />
+                                                <select aria-label="Filter local Drive finder by type" value={driveFinderKind}
+                                                    onChange={event => { setDriveFinderKind(event.target.value as DriveFinderKind); setDriveFinderVisibleLimit(50); }}
+                                                    className="rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text">
+                                                    <option value="all">All types</option>
+                                                    <option value="file">Files</option>
+                                                    <option value="folder">Folders</option>
+                                                    <option value="pending">Unfinished writes</option>
+                                                </select>
+                                                <select aria-label="Sort local Drive search results" value={driveFinderSort}
+                                                    onChange={event => {
+                                                        setDriveFinderSort(event.target.value as DriveFinderSortOrder);
+                                                        setDriveFinderVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text">
+                                                    <option value="path">Path A-Z</option>
+                                                    <option value="largest">Largest first</option>
+                                                    <option value="smallest">Smallest first</option>
+                                                </select>
+                                                <select aria-label="Filter local Drive finder by file size" value={driveFinderSizeFilter}
+                                                    onChange={event => {
+                                                        setDriveFinderSizeFilter(event.target.value as DriveFinderSizeFilter);
+                                                        setDriveFinderVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md border border-telegram-border bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text">
+                                                    <option value="all">All sizes</option>
+                                                    <option value="10m">10 MiB or larger</option>
+                                                    <option value="100m">100 MiB or larger</option>
+                                                    <option value="1g">1 GiB or larger</option>
+                                                    <option value="empty">Empty files (0 bytes)</option>
+                                                </select>
+                                                <button type="button" aria-label="Refresh local Drive file finder" disabled={driveFinderBusy}
+                                                    onClick={() => { void refreshLocalDriveFinder(); }}
+                                                    className="rounded-md bg-telegram-hover px-2 py-1.5 text-xs text-telegram-text disabled:opacity-50"
+                                                >{driveFinderBusy ? 'Reading…' : 'Refresh'}</button>
+                                                <button type="button" aria-label="Copy filtered local Drive inventory as CSV"
+                                                    title="Copy up to 1,000 matching Drive paths, types and known sizes as CSV (no IDs or file contents)"
+                                                    disabled={driveFinderBusy || driveFinderError !== null || driveFinderMatches.length === 0 || driveFinderCsvCopyBusy}
+                                                    onClick={() => { void copyLocalDriveInventoryCsv(); }}
+                                                    className="rounded-md bg-telegram-primary/15 px-2 py-1.5 text-xs font-semibold text-telegram-primary disabled:opacity-50"
+                                                >{driveFinderCsvCopyBusy ? 'Copying CSV…' : 'Copy CSV'}</button>
+                                            </div>
+                                            {driveFinderError && <p role="alert" className="rounded-md border border-red-500/30 p-2 text-xs text-red-400">{driveFinderError}</p>}
+                                            <p role="status" className="text-xs text-telegram-subtext">
+                                                {driveFinderShown.length} of {driveFinderMatches.length} matches ({driveFinderEntries.length} locally indexed)
+                                                {driveFinderSkipped > 0 ? ` · ${driveFinderSkipped} unverified entries skipped` : ''}
+                                                {driveFinderTruncated > 0 ? ` · ${driveFinderTruncated} entries beyond the 25,000-item safety cap not indexed` : ''}
+                                            </p>
+                                            {driveFinderEntries.length > 0 && (
+                                                <section aria-label="Local Drive storage insights" className="space-y-2 rounded-md border border-telegram-border p-2.5">
+                                                    <p className="text-xs font-semibold text-telegram-text">Storage overview · all locally indexed entries</p>
+                                                    <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-telegram-subtext">
+                                                        <span>{driveFinderInsights.files} files</span>
+                                                        <span>{driveFinderInsights.folders} folders</span>
+                                                        <span>{driveFinderInsights.pendingWrites} unfinished writes</span>
+                                                    </div>
+                                                    <div className="grid grid-cols-1 gap-1 text-xs text-telegram-text sm:grid-cols-2">
+                                                        <p>Known logical listed file bytes: <strong>{formatDriveTrashBytes(driveFinderInsights.knownFileBytes)}</strong></p>
+                                                        <p>Known unfinished write bytes: <strong>{formatDriveTrashBytes(driveFinderInsights.knownPendingBytes)}</strong></p>
+                                                    </div>
+                                                    {(driveFinderInsights.unknownFileSizes > 0 || driveFinderInsights.unknownPendingSizes > 0) && (
+                                                        <p className="text-xs text-amber-400">
+                                                            Unknown sizes: {driveFinderInsights.unknownFileSizes} files, {driveFinderInsights.unknownPendingSizes} unfinished writes (excluded from totals).
+                                                        </p>
+                                                    )}
+                                                    {driveFinderInsights.largestFolders.length > 0 && (
+                                                        <div className="space-y-1">
+                                                            <p className="text-xs font-semibold text-telegram-text">Largest folder trees by known descendant file sizes</p>
+                                                            <ol aria-label="Largest Drive folder trees" className="space-y-1">
+                                                                {driveFinderInsights.largestFolders.map(folder => (
+                                                                    <li key={folder.path} className="flex flex-wrap justify-between gap-x-2 text-xs text-telegram-subtext">
+                                                                        <span className="min-w-0 break-all">{folder.path}</span>
+                                                                        <span>{formatDriveTrashBytes(folder.knownBytes)} · {folder.knownFiles} files
+                                                                            {folder.unknownFiles > 0 ? ` · ${folder.unknownFiles} sizes unknown` : ''}
+                                                                        </span>
+                                                                    </li>
+                                                                ))}
+                                                            </ol>
+                                                        </div>
+                                                    )}
+                                                    <p className="text-[11px] text-telegram-subtext">
+                                                        Logical listed file bytes are not disk usage, physical storage or cloud quota. Hardlinks may appear more than once;
+                                                        nested folder totals overlap. Data is from the local indexed subset only.
+                                                    </p>
+                                                </section>
+                                            )}
+                                            <ul aria-label="Local Drive search results" className="max-h-72 space-y-1.5 overflow-y-auto">
+                                                {driveFinderShown.map(entry => (
+                                                    <li key={entry.kind + ':' + entry.id} className="rounded-md bg-telegram-hover/40 px-2 py-1.5">
+                                                        <p className="truncate text-xs font-medium text-telegram-text" title={entry.name}>{entry.name}</p>
+                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                            <p className="min-w-0 break-all text-[11px] text-telegram-subtext">{entry.path}</p>
+                                                            <div className="flex shrink-0 flex-wrap items-center gap-2">
+                                                                {entry.kind === 'folder' && (
+                                                                    <button type="button" aria-label={`Browse this Drive folder: ${entry.name}`}
+                                                                        onClick={() => {
+                                                                            setDriveFinderFolderScope(entry.path);
+                                                                            setDriveFinderSearch('');
+                                                                            setDriveFinderKind('all');
+                                                                            setDriveFinderSizeFilter('all');
+                                                                            setDriveFinderVisibleLimit(50);
+                                                                        }}
+                                                                        className="text-[11px] font-semibold text-telegram-primary hover:underline">
+                                                                        Browse
+                                                                    </button>
+                                                                )}
+                                                                <button type="button" aria-label={`Copy Drive-relative path for ${entry.name}`}
+                                                                    disabled={driveFinderCopyBusy}
+                                                                    onClick={() => { void copyLocalDriveRelativePath(entry.path); }}
+                                                                    className="text-[11px] font-medium text-telegram-primary hover:underline disabled:opacity-50">
+                                                                    Copy path
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                        <p className="text-[11px] text-telegram-subtext">{entry.kind === 'pending' ? 'Unfinished write' : entry.kind === 'folder' ? 'Folder' : 'File'}
+                                                            {entry.kind !== 'folder' ? ` · ${formatDriveTrashBytes(entry.size)}` : ''}
+                                                        </p>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                            {driveFinderShown.length < driveFinderMatches.length && (
+                                                <button type="button" aria-label="Show more local Drive search results"
+                                                    onClick={() => setDriveFinderVisibleLimit(current => current + 50)}
+                                                    className="text-xs font-semibold text-telegram-primary hover:underline">
+                                                    Show next {Math.min(50, driveFinderMatches.length - driveFinderShown.length)} results
+                                                </button>
+                                            )}
+                                            {driveFinderEntries.length === 0 && !driveFinderBusy && !driveFinderError &&
+                                                <p className="text-xs text-telegram-subtext">No active local Drive entries found.</p>}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="tr-setting-row p-3 space-y-2">
                                     <div className="flex items-center justify-between gap-3">
                                         <div className="flex items-center gap-2.5 min-w-0">
                                             <RotateCcw className="w-4 h-4 text-telegram-subtext flex-shrink-0" />
@@ -1023,10 +2012,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             </div>
                                         </div>
                                         <button
-                                            onClick={() => {
-                                                if (!driveTrashOpen) void fetchDriveTrash();
-                                                setDriveTrashOpen(value => !value);
-                                            }}
+                                            onClick={() => setDriveTrashOpen(value => !value)}
                                             className="px-3 py-1.5 rounded-lg text-xs bg-telegram-hover text-telegram-text hover:bg-telegram-border/60 transition flex-shrink-0"
                                             aria-expanded={driveTrashOpen}
                                         >
@@ -1035,35 +2021,251 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
                                     {driveTrashOpen && (
                                         <div className="pl-6 space-y-2">
+                                            {driveRestoreSyncProblem && (
+                                                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-500/30 p-2 text-xs text-telegram-text" role="status">
+                                                    <span>
+                                                        {driveRestoreSyncProblem === 'qa-local'
+                                                            ? 'Restored Drive metadata is local (QA mode); Telegram has not been updated.'
+                                                            : driveRestoreSyncProblem === 'pending'
+                                                                ? 'Restored Drive metadata still has pending changes.'
+                                                                : driveRestoreSyncProblem === 'offline'
+                                                                    ? 'Restored locally; Telegram metadata sync is unavailable.'
+                                                                    : 'Restored locally; remote metadata sync is not verified.'}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        aria-label="Retry Drive metadata sync after restore"
+                                                        disabled={driveRestoreSyncBusy || restoringDriveItem !== null}
+                                                        onClick={() => { void retryDriveRestoreMetadataSync(); }}
+                                                        className="font-semibold text-telegram-primary hover:underline disabled:opacity-50"
+                                                    >
+                                                        {driveRestoreSyncBusy ? 'Syncing…' : 'Retry sync'}
+                                                    </button>
+                                                </div>
+                                            )}
                                             <div className="flex justify-end">
                                                 <button
                                                     onClick={() => void fetchDriveTrash()}
-                                                    disabled={driveTrashBusy || restoringDriveItem !== null}
+                                                    disabled={driveTrashBusy || restoringDriveItem !== null || driveRestoreSyncBusy}
                                                     className="inline-flex items-center gap-1 text-xs text-telegram-subtext hover:text-telegram-text disabled:opacity-50"
                                                 >
                                                     <RefreshCw className={`w-3 h-3 ${driveTrashBusy ? 'animate-spin' : ''}`} />
                                                     Refresh
                                                 </button>
                                             </div>
-                                            {!driveTrashBusy && driveTrash.length === 0 && (
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <input
+                                                    type="search"
+                                                    aria-label="Search recently deleted Drive items"
+                                                    placeholder="Find deleted items…"
+                                                    value={driveTrashSearch}
+                                                    onChange={event => {
+                                                        setDriveTrashSearch(event.target.value);
+                                                        setDriveTrashVisibleLimit(50);
+                                                    }}
+                                                    className="min-w-0 flex-1 rounded-md bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text border border-telegram-border"
+                                                />
+                                                <select
+                                                    aria-label="Filter recently deleted Drive items by type"
+                                                    value={driveTrashFilter}
+                                                    onChange={event => {
+                                                        setDriveTrashFilter(event.target.value as DriveTrashFilterKind);
+                                                        setDriveTrashVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text border border-telegram-border"
+                                                >
+                                                    <option value="all">All types</option>
+                                                    <option value="file">Files</option>
+                                                    <option value="folder">Folders</option>
+                                                    <option value="symlink">Symlinks</option>
+                                                </select>
+                                                <select
+                                                    aria-label="Filter recently deleted Drive items by availability"
+                                                    value={driveTrashAvailability}
+                                                    onChange={event => {
+                                                        setDriveTrashAvailability(event.target.value as DriveTrashAvailability);
+                                                        setDriveTrashVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text border border-telegram-border"
+                                                >
+                                                    <option value="all">Any availability</option>
+                                                    <option value="restorable">Can restore</option>
+                                                    <option value="unavailable">Unavailable</option>
+                                                </select>
+                                                <select
+                                                    aria-label="Filter recently deleted Drive items by age"
+                                                    value={driveTrashAge}
+                                                    onChange={event => {
+                                                        setDriveTrashAge(event.target.value as DriveTrashAgeRange);
+                                                        setDriveTrashVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text border border-telegram-border"
+                                                >
+                                                    <option value="all">Any time</option>
+                                                    <option value="24h">Last 24 hours</option>
+                                                    <option value="7d">Last 7 days</option>
+                                                    <option value="30d">Last 30 days</option>
+                                                </select>
+                                                <select
+                                                    aria-label="Sort recently deleted Drive items"
+                                                    value={driveTrashSort}
+                                                    onChange={event => {
+                                                        setDriveTrashSort(event.target.value as DriveTrashSortOrder);
+                                                        setDriveTrashVisibleLimit(50);
+                                                    }}
+                                                    className="rounded-md bg-telegram-bg px-2 py-1.5 text-xs text-telegram-text border border-telegram-border"
+                                                >
+                                                    <option value="newest">Newest first</option>
+                                                    <option value="oldest">Oldest first</option>
+                                                    <option value="name">Name A–Z</option>
+                                                    <option value="largest">Largest files first</option>
+                                                    <option value="smallest">Smallest files first</option>
+                                                </select>
+                                            </div>
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                <p className="text-[11px] text-telegram-subtext" role="status">
+                                                    Showing {shownDriveTrash.length} of {visibleDriveTrash.length} matching deleted items ({driveTrash.length} total)
+                                                </p>
+                                                <button
+                                                    type="button"
+                                                    aria-label="Copy filtered recently deleted Drive inventory"
+                                                    title="Copy up to 500 matching deleted items without internal IDs or paths"
+                                                    onClick={() => { void copyFilteredDriveTrashInventory(); }}
+                                                    disabled={visibleDriveTrash.length === 0 || driveTrashBusy || driveTrashError !== null || driveTrashInventoryCopyBusy}
+                                                    className="text-xs font-medium text-telegram-primary hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-telegram-primary disabled:opacity-50"
+                                                >
+                                                    {driveTrashInventoryCopyBusy ? 'Copying…' : 'Copy list'}
+                                                </button>
+                                                {hasActiveDriveTrashFilters && (
+                                                    <button
+                                                        type="button"
+                                                        aria-label="Reset recently deleted Drive filters"
+                                                        onClick={resetDriveTrashFilters}
+                                                        className="text-xs font-medium text-telegram-primary hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-telegram-primary"
+                                                    >
+                                                        Reset filters
+                                                    </button>
+                                                )}
+                                            </div>
+                                            {driveTrash.length > 0 && (
+                                                <div className="flex flex-wrap items-center gap-2 rounded-md border border-telegram-border p-2" aria-label="Bulk restore recently deleted Drive items">
+                                                    <button
+                                                        type="button"
+                                                        aria-label="Select shown restorable Drive items"
+                                                        onClick={selectShownDriveTrash}
+                                                        disabled={shownRestorableDriveTrash.length === 0 || restoringDriveItem !== null || driveRestoreSyncBusy}
+                                                        className="text-xs text-telegram-primary hover:underline disabled:opacity-50"
+                                                    >
+                                                        Select shown
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        aria-label="Clear selected deleted Drive items"
+                                                        onClick={() => setSelectedDriveTrashKeys([])}
+                                                        disabled={selectedDriveTrashKeys.length === 0 || restoringDriveItem !== null}
+                                                        className="text-xs text-telegram-subtext hover:underline disabled:opacity-50"
+                                                    >
+                                                        Clear selection
+                                                    </button>
+                                                    <span className="text-xs text-telegram-subtext" role="status">
+                                                        {selectedRestorableDriveTrash.length} selected (up to 100)
+                                                        {selectedDriveTrashSizes.knownFiles > 0
+                                                            ? ` · ${formatDriveTrashBytes(selectedDriveTrashSizes.knownBytes)} in known file sizes`
+                                                            : ''}
+                                                        {selectedDriveTrashSizes.unknownFiles > 0
+                                                            ? ` · ${selectedDriveTrashSizes.unknownFiles} file size${selectedDriveTrashSizes.unknownFiles === 1 ? '' : 's'} unknown`
+                                                            : ''}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        aria-label="Restore selected deleted Drive items"
+                                                        onClick={() => void restoreSelectedDriveTrash()}
+                                                        disabled={selectedRestorableDriveTrash.length === 0 || restoringDriveItem !== null
+                                                            || driveRestoreSyncBusy || driveTrashBusy || driveTrashError !== null}
+                                                        className="ml-auto rounded-md bg-telegram-primary px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                                                    >
+                                                        {restoringDriveItem === 'bulk' ? 'Restoring selected…' : `Restore selected (${selectedRestorableDriveTrash.length})`}
+                                                    </button>
+                                                    {restoringDriveItem === 'bulk' && (
+                                                        <button
+                                                            type="button"
+                                                            aria-label="Stop bulk Drive restore after current item"
+                                                            disabled={driveTrashBatchStopRequested}
+                                                            onClick={() => {
+                                                                driveTrashBatchStopRequestedRef.current = true;
+                                                                setDriveTrashBatchStopRequested(true);
+                                                            }}
+                                                            className="rounded-md border border-amber-500/40 px-2 py-1.5 text-xs text-telegram-text disabled:opacity-50"
+                                                        >
+                                                            {driveTrashBatchStopRequested ? 'Stopping…' : 'Stop after current item'}
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            )}
+                                            {driveTrashBatchProgress && (
+                                                <p className="text-xs text-telegram-subtext" role="status">
+                                                    Bulk restore progress: {driveTrashBatchProgress.completed} of {driveTrashBatchProgress.total} completed
+                                                </p>
+                                            )}
+                                            {driveTrashBatchError && (
+                                                <p className="rounded-md border border-red-500/30 p-2 text-xs text-red-400" role="alert">
+                                                    {driveTrashBatchError}
+                                                </p>
+                                            )}
+                                            {driveTrashWarning && (
+                                                <p className="rounded-md border border-amber-500/30 p-2 text-xs text-telegram-text" role="alert">
+                                                    {driveTrashWarning}
+                                                </p>
+                                            )}
+                                            {driveTrashError && (
+                                                <div className="flex flex-wrap items-center gap-2 rounded-md border border-red-500/30 p-2 text-xs text-red-400" role="alert">
+                                                    <span>{driveTrashError}</span>
+                                                    <button type="button" onClick={() => void fetchDriveTrash()} className="font-semibold underline" disabled={driveTrashBusy}>
+                                                        Retry
+                                                    </button>
+                                                </div>
+                                            )}
+                                            {!driveTrashBusy && !driveTrashError && driveTrash.length === 0 && (
                                                 <p className="text-xs text-telegram-subtext py-2">No recently deleted Drive items.</p>
                                             )}
+                                            {!driveTrashBusy && !driveTrashError && driveTrash.length > 0 && visibleDriveTrash.length === 0 && (
+                                                <p className="text-xs text-telegram-subtext py-2">No deleted items match the current search, type, availability, or time filters.</p>
+                                            )}
                                             <div className="space-y-1 max-h-48 overflow-y-auto">
-                                                {driveTrash.map(entry => (
+                                                {shownDriveTrash.map(entry => (
                                                     <div key={entry.kind + ':' + entry.id} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 bg-telegram-hover/40">
+                                                        {entry.restorable && (
+                                                            <input
+                                                                type="checkbox"
+                                                                aria-label={`Select ${entry.kind} ${entry.name} for bulk restore`}
+                                                                checked={selectedDriveTrashKeys.includes(entry.kind + ':' + entry.id)}
+                                                                disabled={restoringDriveItem !== null || driveRestoreSyncBusy}
+                                                                onChange={event => {
+                                                                    const key = entry.kind + ':' + entry.id;
+                                                                    setSelectedDriveTrashKeys(current => event.target.checked
+                                                                        ? current.includes(key) ? current : [...current, key].slice(0, 100)
+                                                                        : current.filter(item => item !== key));
+                                                                }}
+                                                                className="h-4 w-4 flex-shrink-0 accent-telegram-primary"
+                                                            />
+                                                        )}
                                                         <div className="min-w-0">
                                                             <p className="text-xs text-telegram-text truncate" title={entry.name}>{entry.name}</p>
                                                             <p className="text-[11px] text-telegram-subtext">
-                                                                {entry.kind === 'folder' ? 'Folder' : 'File'} · {new Date(entry.deleted_at).toLocaleDateString()}
+                                                                {entry.kind === 'folder' ? 'Folder' : entry.kind === 'symlink' ? 'Symlink' : 'File'} · {new Date(entry.deleted_at).toLocaleString()}
+                                                                {entry.kind === 'file' ? ` · ${formatDriveTrashBytes(entry.size)}` : ''}
                                                             </p>
                                                         </div>
                                                         {entry.restorable ? (
                                                             <button
                                                                 onClick={() => void restoreDriveTrashItem(entry)}
-                                                                disabled={restoringDriveItem !== null}
+                                                                aria-label={restoringDriveItem === entry.kind + ':' + entry.id
+                                                                    ? `Restoring ${entry.kind} ${entry.name}`
+                                                                    : `Restore ${entry.kind} ${entry.name}`}
+                                                                disabled={restoringDriveItem !== null || driveRestoreSyncBusy}
                                                                 className="text-xs text-telegram-primary hover:opacity-80 disabled:opacity-50 flex-shrink-0"
                                                             >
-                                                                {restoringDriveItem === entry.id ? 'Restoring…' : 'Restore'}
+                                                                {restoringDriveItem === entry.kind + ':' + entry.id ? 'Restoring…' : 'Restore'}
                                                             </button>
                                                         ) : (
                                                             <span className="text-xs text-telegram-subtext flex-shrink-0" title="The original cloud file is no longer available">
@@ -1073,6 +2275,16 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                     </div>
                                                 ))}
                                             </div>
+                                            {shownDriveTrash.length < visibleDriveTrash.length && (
+                                                <button
+                                                    type="button"
+                                                    aria-label="Show more recently deleted Drive items"
+                                                    onClick={() => setDriveTrashVisibleLimit(limit => Math.min(limit + 50, visibleDriveTrash.length))}
+                                                    className="w-full rounded-md px-3 py-2 text-xs font-medium text-telegram-primary bg-telegram-hover/50 hover:bg-telegram-hover"
+                                                >
+                                                    Show next {Math.min(50, visibleDriveTrash.length - shownDriveTrash.length)} deleted items
+                                                </button>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -1319,6 +2531,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
                                     <button
                                         onClick={() => updateSetting('proxyEnabled', !settings.proxyEnabled)}
+                                        aria-label={t('common.enable_proxy')}
+                                        aria-pressed={settings.proxyEnabled}
                                         className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${settings.proxyEnabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
                                     >
                                         <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.proxyEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
@@ -1334,6 +2548,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         </div>
                                         <button
                                             onClick={() => updateSetting('proxyLiveStateEnabled', !settings.proxyLiveStateEnabled)}
+                                            aria-label={t('settings.live_state')}
+                                            aria-pressed={settings.proxyLiveStateEnabled}
                                             className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${settings.proxyLiveStateEnabled ? 'bg-telegram-primary' : 'bg-telegram-border'}`}
                                         >
                                             <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${settings.proxyLiveStateEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
@@ -1353,6 +2569,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     </div>
                                     <div className="relative">
                                         <select
+                                            aria-label={t('common.proxy_type')}
                                             value={settings.proxyType}
                                             onChange={e => updateSetting('proxyType', e.target.value as 'socks5' | 'http' | 'https')}
                                             className="tr-modal-input appearance-none pl-3 pr-8 py-1.5 text-sm text-telegram-text focus:outline-none focus:border-telegram-primary/50 transition cursor-pointer"
@@ -1374,6 +2591,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <input
                                         type="text"
                                         placeholder="e.g. 127.0.0.1"
+                                        aria-label={t('common.host')}
                                         value={settings.proxyHost}
                                         onChange={e => updateSetting('proxyHost', e.target.value)}
                                         className="w-40 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-right focus:outline-none focus:border-telegram-primary/50 transition placeholder:text-telegram-subtext/40"
@@ -1390,6 +2608,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         type="number"
                                         min="1"
                                         max="65535"
+                                        aria-label={t('common.port')}
                                         value={settings.proxyPort}
                                         onChange={e => updateSetting('proxyPort', Math.max(1, Math.min(65535, parseInt(e.target.value) || 1080)))}
                                         className="w-20 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-center focus:outline-none focus:border-telegram-primary/50 transition"
@@ -1405,6 +2624,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <input
                                         type="text"
                                         placeholder={t('settings.optional')}
+                                        aria-label={t('common.username')}
                                         value={settings.proxyUsername}
                                         onChange={e => updateSetting('proxyUsername', e.target.value)}
                                         className="w-40 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-right focus:outline-none focus:border-telegram-primary/50 transition placeholder:text-telegram-subtext/40"
@@ -1418,6 +2638,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <input
                                         type="password"
                                         placeholder={t('settings.optional')}
+                                        aria-label={t('common.password')}
                                         value={settings.proxyPassword}
                                         onChange={e => updateSetting('proxyPassword', e.target.value)}
                                         className="w-40 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-right focus:outline-none focus:border-telegram-primary/50 transition placeholder:text-telegram-subtext/40"

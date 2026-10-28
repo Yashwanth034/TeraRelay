@@ -30,23 +30,27 @@ import { useTranslation } from "react-i18next";
 
 const queryClient = new QueryClient();
 
-type AuthStatus = "loading" | "authenticated" | "unauthenticated";
+type AuthStatus = "loading" | "restoring" | "authenticated" | "unauthenticated";
 
 function AppContent() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
+  const [sessionRecoveryDetail, setSessionRecoveryDetail] = useState("");
+  const [sessionRetryGeneration, setSessionRetryGeneration] = useState(0);
+  const [manualSignIn, setManualSignIn] = useState(false);
   const { theme } = useTheme();
   const { isMobile } = usePlatform();
   const { settings, updateSetting, isLoaded } = useSettings();
   const { i18n } = useTranslation();
   const { state: continuity, markDriveUnlocked } = useDeviceContinuity({
     authenticated: authStatus === "authenticated",
-    authResolved: authStatus !== "loading",
+    authResolved: authStatus === "authenticated" || authStatus === "unauthenticated",
     isMobile,
   });
   const [continuityUnlockDismissed, setContinuityUnlockDismissed] = useState(false);
   const continuityRestoreNotifiedRef = useRef(false);
   const continuityWarningNotifiedRef = useRef(false);
   const continuitySecurityNotifiedRef = useRef(false);
+  const continuityMountWarningRef = useRef(false);
 
   const handleLogout = () => {
     // Cancel in-flight queries and discard account data before another login.
@@ -87,66 +91,88 @@ function AppContent() {
     }
   }, [settings.performanceMode, isLoaded]);
 
-  // On mount: check for a saved session and auto-restore it.
-  // This is the SINGLE source of truth for the initial connection.
-  // useTelegramConnection (inside Dashboard) no longer calls cmd_connect on mount.
+  // A saved session is authoritative until the user explicitly signs out.
+  // Native background startup and the frontend share one locked initializer.
+  // Transient network failures must never be interpreted as a fresh login.
   useEffect(() => {
-    const checkSession = async () => {
-      try {
-        // Explicit isolated QA mode used only by automated/manual AI Workspace
-        // testing. Production/release builds cannot enable this path.
-        const qaFeatureAEnabled =
-          import.meta.env.DEV && import.meta.env.VITE_TERA_QA_FEATURE_A === '1';
-        (globalThis as typeof globalThis & { __TERARELAY_QA_FEATURE_A__?: boolean })
-          .__TERARELAY_QA_FEATURE_A__ = qaFeatureAEnabled;
-        if (qaFeatureAEnabled) {
-          await invoke('cmd_qa_feature_a_seed');
-          setAuthStatus("authenticated");
-          return;
-        }
+    if (manualSignIn) {
+      setAuthStatus("unauthenticated");
+      return;
+    }
+    let cancelled = false;
+    let wake: (() => void) | undefined;
+    const delay = (ms: number) => new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, ms);
+      wake = () => { clearTimeout(timer); resolve(); };
+    });
+    const restoreSession = async () => {
+      // QA-only bypass remains isolated from real saved-account restoration.
+      const qaFeatureAEnabled =
+        import.meta.env.DEV && import.meta.env.VITE_TERA_QA_FEATURE_A === '1';
+      (globalThis as typeof globalThis & { __TERARELAY_QA_FEATURE_A__?: boolean })
+        .__TERARELAY_QA_FEATURE_A__ = qaFeatureAEnabled;
+      if (qaFeatureAEnabled) {
         try {
-          await invoke("cmd_migrate_legacy_api_credentials");
-        } catch (migrationError) {
-          console.warn("Secure credential migration was unavailable; existing login data was left unchanged.", migrationError);
+          await invoke('cmd_qa_feature_a_seed');
+          if (!cancelled) setAuthStatus("authenticated");
+        } catch (error) {
+          if (!cancelled) {
+            setSessionRecoveryDetail(String(error));
+            setAuthStatus("restoring");
+          }
         }
+        return;
+      }
 
-        const store = await load("config.json");
-        const savedId = await store.get<string>("api_id");
+      setAuthStatus("restoring");
+      let attempt = 0;
+      while (!cancelled) {
+        try {
+          // Read-only existence check avoids creating an empty SQLite session.
+          const hasSession = await invoke<boolean>("cmd_saved_telegram_session_exists");
+          if (cancelled) return;
+          if (!hasSession) {
+            setAuthStatus("unauthenticated");
+            return;
+          }
 
-        if (!savedId) {
-          setAuthStatus("unauthenticated");
-          return;
+          try {
+            await invoke("cmd_migrate_legacy_api_credentials");
+          } catch (error) {
+            console.warn("Credential migration unavailable; the saved session was preserved.", error);
+          }
+          const store = await load("config.json");
+          const savedId = await store.get<string | number>("api_id");
+          const apiId = typeof savedId === "number" ? savedId : Number(savedId);
+          if (!Number.isSafeInteger(apiId) || apiId <= 0) {
+            setSessionRecoveryDetail("Your saved Telegram session exists, but its API ID is unavailable. The session has not been deleted.");
+          } else {
+            const connected = await invoke<boolean>("cmd_restore_saved_telegram_session", { apiId });
+            if (cancelled) return;
+            if (connected) {
+              setAuthStatus("authenticated");
+              return;
+            }
+            // The user may have explicitly signed out while we were waiting.
+            setAuthStatus("unauthenticated");
+            return;
+          }
+        } catch (error) {
+          if (cancelled) return;
+          console.warn("Saved session reconnect unavailable; preserving the session.", error);
+          setSessionRecoveryDetail("Telegram is not responding yet. TeraRelay is keeping your saved login and retrying automatically.");
         }
-
-        const apiId = parseInt(savedId, 10);
-        if (isNaN(apiId)) {
-          setAuthStatus("unauthenticated");
-          return;
-        }
-
-        // Initialize the client with the saved API ID
-        await invoke("cmd_connect", { apiId });
-
-        // Verify the session is still valid with Telegram servers
-        const ok = await invoke<boolean>("cmd_check_connection");
-        if (ok) {
-          setAuthStatus("authenticated");
-        } else {
-          setAuthStatus("unauthenticated");
-        }
-      } catch (err) {
-        console.warn("Session restore failed, showing login:", err);
-        // Keep the application-level Telegram API credentials. A session
-        // restore can fail transiently (for example because another TeraRelay
-        // process still owns the SQLite session), and deleting api_id here
-        // incorrectly turns a recoverable account-session problem into a
-        // credentials setup problem.
-        setAuthStatus("unauthenticated");
+        if (cancelled) return;
+        attempt += 1;
+        await delay(Math.min(30_000, 5_000 * Math.min(attempt, 6)));
       }
     };
-
-    checkSession();
-  }, []);
+    void restoreSession();
+    return () => {
+      cancelled = true;
+      wake?.();
+    };
+  }, [manualSignIn, sessionRetryGeneration]);
 
   useEffect(() => {
     if (authStatus !== "authenticated") {
@@ -154,6 +180,7 @@ function AppContent() {
       continuityRestoreNotifiedRef.current = false;
       continuityWarningNotifiedRef.current = false;
       continuitySecurityNotifiedRef.current = false;
+      continuityMountWarningRef.current = false;
       return;
     }
 
@@ -164,6 +191,14 @@ function AppContent() {
         ? `${continuity.directoryCount} folder${continuity.directoryCount === 1 ? '' : 's'} and ${continuity.fileCount} file${continuity.fileCount === 1 ? '' : 's'}`
         : 'your existing TeraRelay cloud state';
       toast.success(`TeraRelay restored ${detail} from Telegram`);
+    }
+
+    if (continuity.nativeMountError && !continuityMountWarningRef.current) {
+      continuityMountWarningRef.current = true;
+      toast.warning('TeraRelay Drive could not mount. Your files were not changed; Drive will retry automatically.');
+    } else if (!continuity.nativeMountError && continuityMountWarningRef.current) {
+      continuityMountWarningRef.current = false;
+      toast.success('TeraRelay Drive is available again.');
     }
 
     if (continuity.securityError && !continuitySecurityNotifiedRef.current) {
@@ -186,6 +221,7 @@ function AppContent() {
     continuity.phase,
     continuity.error,
     continuity.securityError,
+    continuity.nativeMountError,
     continuity.restoredFromRemote,
     continuity.directoryCount,
     continuity.fileCount,
@@ -203,6 +239,32 @@ function AppContent() {
       handleClose();
     };
   }, []);
+
+  // Do not discard an existing account just because Telegram is temporarily offline.
+  if (authStatus === "restoring") {
+    return (
+      <main className="h-screen w-screen auth-gradient terarelay-auth-stage flex flex-col items-center justify-center gap-4 px-6 text-center">
+        <TeraRelayBrand size="lg" showName={false} />
+        <p className="text-telegram-text font-medium">Restoring your saved Telegram session</p>
+        <p className="text-sm text-telegram-subtext max-w-md" role="status">
+          {sessionRecoveryDetail || "Connecting to Telegram using your existing login. No code is needed."}
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <button type="button" className="rounded-lg bg-telegram-primary px-4 py-2 text-sm text-white"
+            onClick={() => { setSessionRecoveryDetail(""); setSessionRetryGeneration(n => n + 1); }}>
+            Retry now
+          </button>
+          <button type="button" className="rounded-lg bg-telegram-hover px-4 py-2 text-sm text-telegram-text"
+            onClick={() => setManualSignIn(true)}>
+            Use phone sign-in instead
+          </button>
+        </div>
+        <p className="text-xs text-telegram-subtext max-w-md">
+          Manual sign-in is optional. Your saved session and its backups have not been cleared.
+        </p>
+      </main>
+    );
+  }
 
   // Styled splash screen while verifying the session
   if (authStatus === "loading") {

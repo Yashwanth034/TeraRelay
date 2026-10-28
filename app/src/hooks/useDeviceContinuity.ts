@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { validateNativeDriveMountStatus } from '../driveMountStatus';
 import {
   classifyDeviceContinuity,
+  validateDriveSnapshot,
+  validateDriveSyncResult,
+  validateDriveCryptoStatus,
   type DriveCryptoStatusLike,
   type DriveSnapshotLike,
   type DriveSyncResultLike,
@@ -18,6 +22,8 @@ export interface DeviceContinuityState {
   syncSource: string | null;
   error: string | null;
   securityError: string | null;
+  /** Native desktop mount failure, tracked independently of cloud metadata sync. */
+  nativeMountError: string | null;
 }
 
 interface UseDeviceContinuityOptions {
@@ -35,6 +41,7 @@ const EMPTY_STATE: DeviceContinuityState = {
   syncSource: null,
   error: null,
   securityError: null,
+  nativeMountError: null,
 };
 
 export function useDeviceContinuity({ authenticated, authResolved, isMobile }: UseDeviceContinuityOptions) {
@@ -48,6 +55,92 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
     startupCryptoCheckPendingRef.current = false;
     setState(current => ({ ...current, needsDriveUnlock: false, securityError: null }));
   }, []);
+
+  // Provider recovery must not wait for Telegram metadata sync to finish.
+  useEffect(() => {
+    if (!authenticated || isMobile) return;
+    let disposed = false;
+    let inFlight = false;
+    let pendingRecoveryTicks = 0;
+    let lastError: string | null = null;
+    // After a successful mount, native Drive owns recovery and explicit
+    // unmount intent. JavaScript must not silently undo a user unmount.
+    let mountHandedToNative = false;
+
+    const recoverNativeDrive = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      pendingRecoveryTicks = 0;
+      try {
+        const status = validateNativeDriveMountStatus(await invoke<unknown>('cmd_drive_status'));
+        if (disposed) return;
+        if (!status.supported) {
+          // A confirmed unsupported provider is not a failed mount attempt.
+          // Clear an earlier transient probe/mount warning instead of leaving
+          // the dashboard reporting a failure on a platform with no provider.
+          lastError = null;
+          setState(current => current.nativeMountError === null
+            ? current : { ...current, nativeMountError: null });
+          return;
+        }
+        // Never race the native recovery worker. Once a mount has been
+        // handed to native, a later explicit unmount must remain respected.
+        // A successfully validated status also clears stale malformed-probe
+        // warnings even when the native worker is still recovering.
+        if (status.mounted || status.native_recovery || mountHandedToNative) {
+          mountHandedToNative = true;
+          lastError = null;
+          setState(current => current.nativeMountError === null
+            ? current : { ...current, nativeMountError: null });
+          return;
+        }
+        await invoke('cmd_drive_mount');
+        mountHandedToNative = true;
+        if (disposed && shouldDetachNativeDriveRef.current) {
+          await invoke('cmd_drive_unmount').catch(() => {});
+        }
+        if (!disposed) {
+          setState(current => current.nativeMountError === null
+            ? current : { ...current, nativeMountError: null });
+        }
+        lastError = null;
+      } catch (error) {
+        const message = String(error);
+        if (!disposed) {
+          setState(current => current.nativeMountError === message
+            ? current : { ...current, nativeMountError: message });
+          if (message !== lastError) {
+            console.warn('[Continuity] Native Drive recovery deferred:', error);
+            lastError = message;
+          }
+        }
+      } finally {
+        inFlight = false;
+        pendingRecoveryTicks = 0;
+      }
+    };
+
+    void recoverNativeDrive();
+    const timer = window.setInterval(() => {
+      // Do not race another mount/status command while native is still busy.
+      // After four 5-second ticks, surface the stall independently of cloud
+      // metadata sync; a late valid response may still safely clear it.
+      if (!disposed && inFlight && ++pendingRecoveryTicks === 4) {
+        const message = 'Native Drive recovery is taking longer than expected. TeraRelay is waiting for the current request.';
+        lastError = message;
+        setState(current => current.nativeMountError === message
+          ? current : { ...current, nativeMountError: message });
+      }
+      void recoverNativeDrive();
+    }, 5_000);
+    const onFocus = () => { void recoverNativeDrive(); };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [authenticated, isMobile]);
 
   useEffect(() => {
     if (!authenticated) {
@@ -71,12 +164,14 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
       setState(current => ({ ...current, phase: 'restoring', error: null, securityError: null }));
 
       let before: DriveSnapshotLike;
+      let initialSnapshotError: unknown = null;
       try {
-        before = await invoke<DriveSnapshotLike>('cmd_drive_get_snapshot');
+        before = validateDriveSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'));
         if (disposed) return;
         initialSnapshotRef.current = before;
       } catch (error) {
         if (disposed) return;
+        initialSnapshotError = error;
         setState(current => ({
           ...current,
           phase: 'degraded',
@@ -94,82 +189,77 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
         try {
           await invoke('cmd_drive_recover_pending');
         } catch (error) {
-          console.warn('[Continuity] Pending Drive recovery deferred:', error);
+          if (!disposed) console.warn('[Continuity] Pending Drive recovery deferred:', error);
         }
+        // A slow recovery command may have completed after sign-out. Do not
+        // start another account-bound Drive operation for the stale session.
+        if (disposed) return;
       }
 
       let syncResult: DriveSyncResultLike | null = null;
       let syncError: unknown = null;
       try {
-        syncResult = await invoke<DriveSyncResultLike>('cmd_drive_sync_metadata');
+        syncResult = validateDriveSyncResult(await invoke<unknown>('cmd_drive_sync_metadata'));
       } catch (error) {
         syncError = error;
-        console.warn('[Continuity] Initial Drive metadata sync deferred:', error);
+        if (!disposed) console.warn('[Continuity] Initial Drive metadata sync deferred:', error);
       }
+      if (disposed) return;
 
       let after = before;
+      let afterSnapshotError: unknown = null;
       try {
-        after = await invoke<DriveSnapshotLike>('cmd_drive_get_snapshot');
+        after = validateDriveSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'));
       } catch (error) {
-        console.warn('[Continuity] Could not refresh Drive snapshot:', error);
+        afterSnapshotError = error;
+        if (!disposed) console.warn('[Continuity] Could not refresh Drive snapshot:', error);
       }
+      if (disposed) return;
 
       let crypto: DriveCryptoStatusLike = { configured: false, unlocked: false };
       let securityError: string | null = null;
       try {
-        crypto = await invoke<DriveCryptoStatusLike>('cmd_drive_crypto_status');
+        crypto = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_status'));
         if (disposed) return;
         startupCryptoCheckPendingRef.current = false;
       } catch (error) {
         securityError = `Could not read Drive encryption status: ${String(error)}`;
-        console.warn('[Continuity] Could not read Drive encryption status:', error);
+        if (!disposed) console.warn('[Continuity] Could not read Drive encryption status:', error);
       }
 
       if (!disposed) {
-        if (syncResult) {
+        if (syncResult && !afterSnapshotError) {
           const assessment = classifyDeviceContinuity(before, syncResult, after, crypto);
           initialSnapshotRef.current = after;
-          setState({
-            phase: securityError ? 'degraded' : 'ready',
+          setState(current => ({
+            ...current,
+            phase: securityError || initialSnapshotError ? 'degraded' : 'ready',
             restoredFromRemote: assessment.restoredFromRemote,
             directoryCount: assessment.directoryCount,
             fileCount: assessment.fileCount,
             needsDriveUnlock: securityError ? false : assessment.needsDriveUnlock,
             syncSource: assessment.syncSource,
-            error: null,
+            error: initialSnapshotError ? `Could not validate initial Drive snapshot: ${String(initialSnapshotError)}` : null,
             securityError,
-          });
+          }));
         } else {
-          setState({
+          setState(current => ({
+            ...current,
             phase: 'degraded',
             restoredFromRemote: false,
             directoryCount: after.directories.length,
             fileCount: after.files.length,
             needsDriveUnlock: securityError ? false : crypto.configured && !crypto.unlocked,
             syncSource: null,
-            error: syncError ? String(syncError) : 'Drive metadata sync is unavailable',
+            error: afterSnapshotError ? `Could not validate refreshed Drive snapshot: ${String(afterSnapshotError)}`
+              : syncError ? String(syncError) : 'Drive metadata sync is unavailable',
             securityError,
-          });
+          }));
         }
       }
 
-      if (disposed) return;
-      if (!isMobile) {
-        try {
-          await invoke('cmd_drive_mount');
-          if (disposed) {
-            // If auth resolved to signed-out while the native mount was still
-            // starting, undo the late mount. A plain WebView teardown/reload is
-            // not an auth transition and must leave the native provider alive.
-            if (shouldDetachNativeDriveRef.current) {
-              await invoke('cmd_drive_unmount').catch(() => {});
-            }
-            return;
-          }
-        } catch (error) {
-          console.warn('[Continuity] Native Drive provider unavailable:', error);
-        }
-      }
+      // The independent recovery effect owns the initial mount request.
+      // A delayed metadata sync must not revive an explicitly unmounted Drive.
     };
 
     const runPeriodicSync = async () => {
@@ -179,24 +269,27 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
 
       periodicSyncInFlight = true;
       try {
-        const syncResult = await invoke<DriveSyncResultLike>('cmd_drive_sync_metadata');
-        const after = await invoke<DriveSnapshotLike>('cmd_drive_get_snapshot');
+        const syncResult = validateDriveSyncResult(await invoke<unknown>('cmd_drive_sync_metadata'));
+        if (disposed) return;
+        const after = validateDriveSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'));
+        if (disposed) return;
         let crypto: DriveCryptoStatusLike = { configured: false, unlocked: false };
         let securityError: string | null = null;
         let allowStartupUnlock = false;
         try {
-          crypto = await invoke<DriveCryptoStatusLike>('cmd_drive_crypto_status');
+          crypto = validateDriveCryptoStatus(await invoke<unknown>('cmd_drive_crypto_status'));
           if (disposed) return;
           allowStartupUnlock = startupCryptoCheckPendingRef.current;
           startupCryptoCheckPendingRef.current = false;
         } catch (error) {
           securityError = `Could not read Drive encryption status: ${String(error)}`;
-          console.warn('[Continuity] Could not read Drive encryption status:', error);
+          if (!disposed) console.warn('[Continuity] Could not read Drive encryption status:', error);
         }
         if (disposed) return;
         const assessment = classifyDeviceContinuity(before, syncResult, after, crypto);
         initialSnapshotRef.current = after;
         setState(current => ({
+          ...current,
           phase: securityError ? 'degraded' : 'ready',
           restoredFromRemote: current.restoredFromRemote || assessment.restoredFromRemote,
           directoryCount: assessment.directoryCount,

@@ -3,9 +3,87 @@ use crate::commands::TelegramState;
 use crate::db::DbConnection;
 use actix_web::{cookie::Cookie, get, post, web, HttpRequest, HttpResponse, Responder};
 use grammers_client::types::Media;
+use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const SHARE_AUTH_TTL_SECONDS: i64 = 30 * 60;
+const MAX_SHARE_AUTH_SESSIONS: usize = 4096;
+const SHARE_VERIFY_WINDOW_SECONDS: i64 = 60;
+const SHARE_VERIFY_MAX_ATTEMPTS: u32 = 8;
+const MAX_SHARE_VERIFY_WINDOWS: usize = 4096;
+
+struct ShareVerifyWindow {
+    started_at: i64,
+    attempts: u32,
+}
+
+static SHARE_VERIFY_WINDOWS: OnceLock<Mutex<HashMap<String, ShareVerifyWindow>>> = OnceLock::new();
+
+fn share_verify_windows() -> &'static Mutex<HashMap<String, ShareVerifyWindow>> {
+    SHARE_VERIFY_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ShareAuthSession {
+    token: String,
+    password_hash: String,
+    expires_at: i64,
+}
+
+static SHARE_AUTH_SESSIONS: OnceLock<Mutex<HashMap<String, ShareAuthSession>>> = OnceLock::new();
+
+fn share_auth_sessions() -> &'static Mutex<HashMap<String, ShareAuthSession>> {
+    SHARE_AUTH_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reserve a per-share attempt before executing expensive bcrypt verification.
+/// An immediate synchronous counter prevents simultaneous requests bypassing
+/// the limit while bcrypt runs. Errors fail closed rather than skipping it.
+fn admit_share_verification(token: &str, now: i64) -> Result<Option<i64>, String> {
+    let mut windows = share_verify_windows()
+        .lock()
+        .map_err(|_| "Share verification rate limit is unavailable".to_string())?;
+    Ok(admit_share_verification_in(&mut windows, token, now))
+}
+
+fn admit_share_verification_in(
+    windows: &mut HashMap<String, ShareVerifyWindow>,
+    token: &str,
+    now: i64,
+) -> Option<i64> {
+    windows.retain(|_, window| {
+        now >= window.started_at
+            && now.saturating_sub(window.started_at) < SHARE_VERIFY_WINDOW_SECONDS
+    });
+
+    if let Some(window) = windows.get_mut(token) {
+        if window.attempts >= SHARE_VERIFY_MAX_ATTEMPTS {
+            return Some(SHARE_VERIFY_WINDOW_SECONDS - now.saturating_sub(window.started_at));
+        }
+        window.attempts += 1;
+        return None;
+    }
+
+    if windows.len() >= MAX_SHARE_VERIFY_WINDOWS {
+        // Bound memory even when many independent share links are probed.
+        if let Some(oldest) = windows
+            .iter()
+            .min_by_key(|(_, window)| window.started_at)
+            .map(|(key, _)| key.clone())
+        {
+            windows.remove(&oldest);
+        }
+    }
+    windows.insert(
+        token.to_owned(),
+        ShareVerifyWindow {
+            started_at: now,
+            attempts: 1,
+        },
+    );
+    None
+}
 
 #[derive(Clone)]
 struct SharedLinkRow {
@@ -30,11 +108,78 @@ fn verify_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
 }
 
-fn generate_cookie_val(token: &str, password_hash: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hasher.update(password_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
+/// Issue an unpredictable bearer token and enforce its TTL on the server.
+/// Browser Max-Age alone cannot prevent replay of a copied expired cookie.
+fn issue_share_auth_session(token: &str, password_hash: &str, now: i64) -> Result<String, String> {
+    let expires_at = now
+        .checked_add(SHARE_AUTH_TTL_SECONDS)
+        .ok_or_else(|| "Share authentication expiry is out of range".to_string())?;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill(&mut bytes);
+    let session_key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut sessions = share_auth_sessions()
+        .lock()
+        .map_err(|_| "Share authentication store is unavailable".to_string())?;
+    sessions.retain(|_, session| session.expires_at > now);
+    if sessions.len() >= MAX_SHARE_AUTH_SESSIONS {
+        // Bound memory even if many valid share links are verified.
+        let oldest = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.expires_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            sessions.remove(&oldest);
+        }
+    }
+    sessions.insert(
+        session_key.clone(),
+        ShareAuthSession {
+            token: token.to_owned(),
+            password_hash: password_hash.to_owned(),
+            expires_at,
+        },
+    );
+    Ok(session_key)
+}
+
+fn share_auth_session_valid(token: &str, password_hash: &str, key: &str, now: i64) -> bool {
+    let Ok(sessions) = share_auth_sessions().lock() else {
+        return false;
+    };
+    sessions.get(key).is_some_and(|session| {
+        session.expires_at > now && session.token == token && session.password_hash == password_hash
+    })
+}
+
+/// Encode untrusted names and token text before inserting them into HTML.
+fn escape_share_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn share_has_expired(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_some_and(|expiry| expiry <= now)
+}
+
+/// Share downloads may contain sensitive data even when the link is not
+/// password protected. Previously retrieved content must not remain cacheable
+/// after a share has expired or been revoked.
+fn share_download_headers() -> Vec<(&'static str, String)> {
+    vec![
+        ("Cache-Control", "no-store".to_string()),
+        ("X-Content-Type-Options", "nosniff".to_string()),
+        ("Referrer-Policy", "no-referrer".to_string()),
+    ]
 }
 
 fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLinkRow>, String> {
@@ -50,26 +195,63 @@ fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLin
 
     if let sqlite::State::Row = stmt.next().map_err(|e| e.to_string())? {
         let id = stmt.read::<String, _>("id").map_err(|e| e.to_string())?;
-        let folder_id = stmt.read::<Option<i64>, _>("folder_id").ok().flatten();
-        let message_id = stmt
-            .read::<i64, _>("message_id")
-            .map_err(|e| e.to_string())? as i32;
+        let folder_id = match stmt
+            .read::<sqlite::Value, _>("folder_id")
+            .map_err(|e| format!("Invalid share folder ID: {e}"))?
+        {
+            sqlite::Value::Null => None,
+            sqlite::Value::Integer(id) => Some(id),
+            _ => return Err("Invalid share folder ID type".to_string()),
+        };
+        let message_id = match stmt
+            .read::<sqlite::Value, _>("message_id")
+            .map_err(|e| format!("Invalid share message ID: {e}"))?
+        {
+            sqlite::Value::Integer(id) => {
+                i32::try_from(id).map_err(|_| "Invalid share message ID range".to_string())?
+            }
+            _ => return Err("Invalid share message ID type".to_string()),
+        };
         let file_name = stmt
             .read::<String, _>("file_name")
             .map_err(|e| e.to_string())?;
         let file_size = stmt
             .read::<i64, _>("file_size")
             .map_err(|e| e.to_string())?;
-        let password_hash = stmt
-            .read::<Option<String>, _>("password_hash")
-            .ok()
-            .flatten();
-        let _password_salt = stmt
-            .read::<Option<String>, _>("password_salt")
-            .ok()
-            .flatten();
-        let expires_at = stmt.read::<Option<i64>, _>("expires_at").ok().flatten();
-        let revoked = stmt.read::<i64, _>("revoked").map_err(|e| e.to_string())? != 0;
+        // Never silently convert corrupt protection/expiry metadata into None:
+        // None explicitly means an unprotected or non-expiring share.
+        let password_hash = match stmt
+            .read::<sqlite::Value, _>("password_hash")
+            .map_err(|e| format!("Invalid share password metadata: {e}"))?
+        {
+            sqlite::Value::Null => None,
+            sqlite::Value::String(hash) => Some(hash),
+            _ => return Err("Invalid share password metadata type".to_string()),
+        };
+        let _password_salt = match stmt
+            .read::<sqlite::Value, _>("password_salt")
+            .map_err(|e| format!("Invalid share password salt metadata: {e}"))?
+        {
+            sqlite::Value::Null => None,
+            sqlite::Value::String(salt) => Some(salt),
+            _ => return Err("Invalid share password salt metadata type".to_string()),
+        };
+        let expires_at = match stmt
+            .read::<sqlite::Value, _>("expires_at")
+            .map_err(|e| format!("Invalid share expiration metadata: {e}"))?
+        {
+            sqlite::Value::Null => None,
+            sqlite::Value::Integer(expires_at) => Some(expires_at),
+            _ => return Err("Invalid share expiration metadata type".to_string()),
+        };
+        let revoked = match stmt
+            .read::<sqlite::Value, _>("revoked")
+            .map_err(|e| format!("Invalid share revocation state: {e}"))?
+        {
+            sqlite::Value::Integer(0) => false,
+            sqlite::Value::Integer(1) => true,
+            _ => return Err("Invalid share revocation state type/value".to_string()),
+        };
 
         Ok(Some(SharedLinkRow {
             _id: id,
@@ -89,16 +271,17 @@ fn get_share_by_token(db: &DbConnection, token: &str) -> Result<Option<SharedLin
 
 /// Renders the password entry form for protected share links.
 ///
-/// NOTE: This HTML contains an inline `<style>` block which requires
-/// `style-src 'unsafe-inline'` in the Tauri CSP (tauri.conf.json).
-/// This is acceptable because the page is served only over the local
-/// Actix streaming server on the loopback interface (127.0.0.1:14201), not the public internet,
-/// so the XSS attack surface is minimal.
+/// The local Actix HTTP page is separate from the Tauri WebView. Its own
+/// restrictive CSP permits only the page's inline CSS, not inline scripts.
+/// File names, tokens and error text must all be HTML-escaped regardless of
+/// the loopback binding: they are untrusted values embedded into HTML.
 fn render_password_form(file_name: &str, token: &str, error: Option<&str>) -> HttpResponse {
     let error_html = match error {
-        Some(err) => format!("<div class=\"error\">{}</div>", err),
-        None => "".to_string(),
+        Some(err) => format!("<div class=\"error\">{}</div>", escape_share_html(err)),
+        None => String::new(),
     };
+    let safe_file_name = escape_share_html(file_name);
+    let safe_token = escape_share_html(token);
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -185,10 +368,17 @@ fn render_password_form(file_name: &str, token: &str, error: Option<&str>) -> Ht
     </div>
 </body>
 </html>"#,
-        file_name, error_html, token
+        safe_file_name, error_html, safe_token
     );
 
     HttpResponse::Ok()
+        .insert_header(("Cache-Control", "no-store"))
+        .insert_header(("X-Content-Type-Options", "nosniff"))
+        .insert_header(("Referrer-Policy", "no-referrer"))
+        .insert_header((
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ))
         .content_type("text/html; charset=utf-8")
         .body(html)
 }
@@ -216,19 +406,20 @@ async fn get_shared_file(
         return HttpResponse::NotFound().body("This shared link has been revoked");
     }
 
-    if let Some(expiry) = row.expires_at {
-        let now = chrono::Utc::now().timestamp();
-        if expiry < now {
-            return HttpResponse::Gone().body("This shared link has expired");
-        }
+    if share_has_expired(row.expires_at, chrono::Utc::now().timestamp()) {
+        return HttpResponse::Gone().body("This shared link has expired");
     }
 
     // Check password protection
     if let Some(hash) = &row.password_hash {
         let mut authenticated = false;
         if let Some(cookie) = req.cookie(&format!("share_auth_{}", token)) {
-            let expected = generate_cookie_val(&token, hash);
-            if cookie.value() == expected {
+            if share_auth_session_valid(
+                &token,
+                hash,
+                cookie.value(),
+                chrono::Utc::now().timestamp(),
+            ) {
                 authenticated = true;
             }
         }
@@ -274,7 +465,7 @@ async fn get_shared_file(
                         &mime,
                         Some(filename),
                         crate::server::StreamingExtras {
-                            extra_headers: vec![],
+                            extra_headers: share_download_headers(),
                             log_label: "Share download",
                         },
                     );
@@ -310,22 +501,47 @@ async fn verify_shared_file_password(
         return HttpResponse::NotFound().body("This shared link has been revoked");
     }
 
+    // The verification endpoint must enforce the same expiry as downloads.
+    if share_has_expired(row.expires_at, chrono::Utc::now().timestamp()) {
+        return HttpResponse::Gone().body("This shared link has expired");
+    }
+
     let hash = match &row.password_hash {
         Some(h) => h,
         None => return HttpResponse::BadRequest().body("No password required for this link"),
     };
 
+    match admit_share_verification(&token, chrono::Utc::now().timestamp()) {
+        Ok(Some(retry_after)) => {
+            return HttpResponse::TooManyRequests()
+                .insert_header(("Retry-After", retry_after.to_string()))
+                .body("Too many verification attempts. Please retry later.");
+        }
+        Ok(None) => {}
+        Err(err) => {
+            log::error!("Unable to enforce share verification rate limit: {err}");
+            return HttpResponse::InternalServerError().body("Internal server error");
+        }
+    }
+
     if verify_password(&form.password, hash) {
-        // Set session cookie (30 min).
-        // The streaming share server is loopback-only and uses plain HTTP, so the
-        // cookie cannot use `.secure(true)` without becoming unusable. It remains
-        // protected by `.http_only(true)` and `.same_site(Strict)`.
-        let val = generate_cookie_val(&token, hash);
+        // Issue a random per-verification session. Its expiry is checked
+        // server-side, not merely by the browser's cookie Max-Age.
+        // The loopback-only plain HTTP server cannot use Secure cookies.
+        let val = match issue_share_auth_session(&token, hash, chrono::Utc::now().timestamp()) {
+            Ok(val) => val,
+            Err(err) => {
+                log::error!("Unable to issue share authentication session: {err}");
+                return HttpResponse::InternalServerError().body("Internal server error");
+            }
+        };
         let cookie = Cookie::build(format!("share_auth_{}", token), val)
             .path(format!("/d/{}", token))
             .http_only(true)
             .same_site(actix_web::cookie::SameSite::Strict)
-            .max_age(actix_web::cookie::time::Duration::minutes(30))
+            .max_age(actix_web::cookie::time::Duration::seconds(
+                SHARE_AUTH_TTL_SECONDS,
+            ))
             .finish();
 
         HttpResponse::Found()
@@ -344,4 +560,425 @@ async fn verify_shared_file_password(
 pub fn configure_share_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(get_shared_file)
         .service(verify_shared_file_password);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test as web_test;
+    use actix_web::{body::to_bytes, http::StatusCode, App};
+    use std::sync::Mutex;
+
+    #[actix_web::test]
+    async fn password_form_escapes_untrusted_values_and_disables_active_content() {
+        let response = render_password_form(
+            "<img src=x onerror=alert(1)> & \"' ",
+            "test\" onmouseover=\"alert(1)",
+            Some("<script>alert(1)</script>"),
+        );
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("Cache-Control").unwrap().to_str().unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            headers
+                .get("X-Content-Type-Options")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            headers.get("Referrer-Policy").unwrap().to_str().unwrap(),
+            "no-referrer"
+        );
+        let csp = headers
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("form-action 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("script-src 'unsafe-inline'"));
+
+        let bytes = to_bytes(response.into_body()).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("&lt;img src=x onerror=alert(1)&gt; &amp; &quot;&#39;"));
+        assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(body.contains("action=\"/d/test&quot; onmouseover=&quot;alert(1)/verify\""));
+        assert!(!body.contains("<img src=x"));
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(!body.contains("onmouseover=\"alert(1)"));
+    }
+
+    #[test]
+    fn malformed_share_protection_metadata_never_downgrades_to_none() {
+        // SQLite is dynamically typed even when columns declare TEXT/INTEGER.
+        // Use incompatible BLOB/TEXT values that must never become None or 0.
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE shared_links (
+                id TEXT PRIMARY KEY, folder_id INTEGER, message_id INTEGER,
+                file_name TEXT, file_size INTEGER, password_hash TEXT,
+                password_salt TEXT, expires_at INTEGER, revoked INTEGER
+             );
+             INSERT INTO shared_links VALUES
+                ('qa-metadata', NULL, 1, 'safe.txt', 42, 'hash', NULL, 100, 0);",
+        )
+        .unwrap();
+        let db: DbConnection = Arc::new(Mutex::new(conn));
+        let good = get_share_by_token(&db, "qa-metadata").unwrap().unwrap();
+        assert_eq!(good.password_hash.as_deref(), Some("hash"));
+        assert_eq!(good.expires_at, Some(100));
+        assert_eq!(good.folder_id, None);
+
+        for (column, update) in [
+            (
+                "password_hash",
+                "UPDATE shared_links SET password_hash = X'FF'",
+            ),
+            (
+                "password_salt",
+                "UPDATE shared_links SET password_salt = X'FF'",
+            ),
+            (
+                "expires_at",
+                "UPDATE shared_links SET expires_at = 'invalid-hours'",
+            ),
+            ("folder_id", "UPDATE shared_links SET folder_id = X'FF'"),
+            (
+                "message_id",
+                "UPDATE shared_links SET message_id = 2147483648",
+            ),
+            (
+                "revoked",
+                "UPDATE shared_links SET revoked = 'invalid-revocation'",
+            ),
+            (
+                "message_id_type",
+                "UPDATE shared_links SET message_id = X'FF'",
+            ),
+        ] {
+            {
+                let locked = db.lock().unwrap();
+                locked
+                    .execute(
+                        "UPDATE shared_links SET folder_id = NULL, message_id = 1,
+                         password_hash = 'hash', password_salt = NULL,
+                         expires_at = 100, revoked = 0",
+                    )
+                    .unwrap();
+                locked.execute(update).unwrap();
+            }
+            assert!(
+                get_share_by_token(&db, "qa-metadata").is_err(),
+                "Corrupt {column} must never be interpreted as no protection"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn corrupt_password_metadata_returns_server_error_not_cookie() {
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE shared_links (
+                id TEXT PRIMARY KEY, folder_id INTEGER, message_id INTEGER,
+                file_name TEXT, file_size INTEGER, password_hash TEXT,
+                password_salt TEXT, expires_at INTEGER, revoked INTEGER
+             );
+             INSERT INTO shared_links VALUES
+                ('qa-corrupt', NULL, 1, 'private.txt', 42, X'FF', NULL, NULL, 0);",
+        )
+        .unwrap();
+        let db: DbConnection = Arc::new(Mutex::new(conn));
+        let app = web_test::init_service(
+            App::new()
+                .app_data(web::Data::new(db))
+                .configure(configure_share_routes),
+        )
+        .await;
+        let request = web_test::TestRequest::post()
+            .uri("/d/qa-corrupt/verify")
+            .set_form([("password", "qa-only-password")])
+            .to_request();
+        let response = web_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get("Set-Cookie").is_none());
+    }
+
+    #[test]
+    fn share_download_headers_prevent_cached_protected_content() {
+        let headers = share_download_headers();
+        assert_eq!(headers.len(), 3);
+        for (key, expected) in [
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, val)| val.as_str()),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn share_verify_attempts_limit_retries_and_recover_at_window_boundary() {
+        let mut windows = HashMap::new();
+        for _ in 0..SHARE_VERIFY_MAX_ATTEMPTS {
+            assert_eq!(
+                admit_share_verification_in(&mut windows, "qa-attempt-window-a", 1_000),
+                None
+            );
+        }
+        assert_eq!(
+            admit_share_verification_in(&mut windows, "qa-attempt-window-a", 1_000),
+            Some(SHARE_VERIFY_WINDOW_SECONDS)
+        );
+        assert_eq!(
+            admit_share_verification_in(&mut windows, "qa-attempt-window-a", 1_059),
+            Some(1)
+        );
+        assert_eq!(
+            admit_share_verification_in(&mut windows, "qa-attempt-window-b", 1_059),
+            None,
+            "one share's guesses must not consume another share's allowance"
+        );
+        assert_eq!(
+            admit_share_verification_in(&mut windows, "qa-attempt-window-a", 1_060),
+            None,
+            "the exact sixty-second boundary must admit a new request"
+        );
+        assert_eq!(
+            admit_share_verification_in(&mut windows, "qa-attempt-window-a", 1_000),
+            None,
+            "a backwards system clock must not permanently lock a share"
+        );
+    }
+
+    #[test]
+    fn share_verify_attempt_windows_have_bounded_memory() {
+        let mut windows = HashMap::new();
+        for i in 0..=MAX_SHARE_VERIFY_WINDOWS {
+            let token = format!("qa-bounded-share-{i}");
+            assert_eq!(
+                admit_share_verification_in(&mut windows, &token, 1_000),
+                None
+            );
+        }
+        assert_eq!(windows.len(), MAX_SHARE_VERIFY_WINDOWS);
+    }
+
+    #[actix_web::test]
+    async fn share_verify_http_rate_limit_rejects_ninth_attempt_without_cookie() {
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE shared_links (
+                id TEXT PRIMARY KEY, folder_id INTEGER, message_id INTEGER,
+                file_name TEXT, file_size INTEGER, password_hash TEXT,
+                password_salt TEXT, expires_at INTEGER, revoked INTEGER
+             );
+             INSERT INTO shared_links VALUES
+                ('qa-throttle', NULL, 1, 'safe.txt', 42,
+                 'invalid-synthetic-bcrypt-hash', NULL, NULL, 0);",
+        )
+        .unwrap();
+        let db: DbConnection = Arc::new(Mutex::new(conn));
+        let app = web_test::init_service(
+            App::new()
+                .app_data(web::Data::new(db))
+                .configure(configure_share_routes),
+        )
+        .await;
+
+        for attempt in 1..=SHARE_VERIFY_MAX_ATTEMPTS + 1 {
+            let request = web_test::TestRequest::post()
+                .uri("/d/qa-throttle/verify")
+                .set_form([("password", "qa-invalid-attempt")])
+                .to_request();
+            let response = web_test::call_service(&app, request).await;
+            assert!(response.headers().get("Set-Cookie").is_none());
+            if attempt <= SHARE_VERIFY_MAX_ATTEMPTS {
+                assert_eq!(response.status(), StatusCode::OK);
+            } else {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                let seconds: i64 = response
+                    .headers()
+                    .get("Retry-After")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!((1..=SHARE_VERIFY_WINDOW_SECONDS).contains(&seconds));
+            }
+        }
+    }
+
+    #[test]
+    fn share_auth_cookie_is_random_scoped_and_expires_on_server() {
+        let now = 1_000_i64;
+        let first = issue_share_auth_session("qa-link-a", "qa-hash-a", now).unwrap();
+        let second = issue_share_auth_session("qa-link-a", "qa-hash-a", now).unwrap();
+        assert_ne!(
+            first, second,
+            "each login must receive a unique bearer token"
+        );
+        assert_eq!(first.len(), 64, "32 random bytes, hex encoded");
+        assert!(share_auth_session_valid(
+            "qa-link-a",
+            "qa-hash-a",
+            &first,
+            now
+        ));
+        assert!(share_auth_session_valid(
+            "qa-link-a",
+            "qa-hash-a",
+            &first,
+            now + SHARE_AUTH_TTL_SECONDS - 1,
+        ));
+        assert!(!share_auth_session_valid(
+            "qa-link-a",
+            "qa-hash-a",
+            &first,
+            now + SHARE_AUTH_TTL_SECONDS,
+        ));
+        assert!(!share_auth_session_valid(
+            "qa-link-b",
+            "qa-hash-a",
+            &first,
+            now
+        ));
+        assert!(!share_auth_session_valid(
+            "qa-link-a",
+            "qa-hash-b",
+            &first,
+            now
+        ));
+        assert!(!share_auth_session_valid(
+            "qa-link-a",
+            "qa-hash-a",
+            "forged",
+            now
+        ));
+        assert!(issue_share_auth_session("qa-link-a", "qa-hash-a", i64::MAX).is_err());
+    }
+
+    #[actix_web::test]
+    async fn verification_issues_http_only_cookie_with_server_enforced_ttl() {
+        let qa_phrase = ["synthetic", "only", "share"].join("-");
+        let hash = bcrypt::hash(&qa_phrase, 4).unwrap();
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE shared_links (
+                id TEXT PRIMARY KEY, folder_id INTEGER, message_id INTEGER,
+                file_name TEXT, file_size INTEGER, password_hash TEXT,
+                password_salt TEXT, expires_at INTEGER, revoked INTEGER
+            );",
+        )
+        .unwrap();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO shared_links
+                    (id, folder_id, message_id, file_name, file_size,
+                     password_hash, password_salt, expires_at, revoked)
+                 VALUES ('qa-session', NULL, 1, 'private.txt', 42, ?, NULL, NULL, 0)",
+            )
+            .unwrap();
+        insert.bind((1, hash.as_str())).unwrap();
+        insert.next().unwrap();
+        drop(insert);
+        let db: DbConnection = Arc::new(Mutex::new(conn));
+        let app = web_test::init_service(
+            App::new()
+                .app_data(web::Data::new(db))
+                .configure(configure_share_routes),
+        )
+        .await;
+
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let request = web_test::TestRequest::post()
+                .uri("/d/qa-session/verify")
+                .set_form([("password", qa_phrase.as_str())])
+                .to_request();
+            let response = web_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::FOUND);
+            let cookie = response
+                .response()
+                .cookies()
+                .next()
+                .expect("successful verification must issue a cookie");
+            assert_eq!(cookie.name(), "share_auth_qa-session");
+            assert!(cookie.http_only().unwrap_or(false));
+            assert_eq!(
+                cookie.same_site(),
+                Some(actix_web::cookie::SameSite::Strict)
+            );
+            assert_eq!(
+                cookie.max_age().unwrap().whole_seconds(),
+                SHARE_AUTH_TTL_SECONDS
+            );
+            let key = cookie.value().to_owned();
+            assert!(share_auth_session_valid(
+                "qa-session",
+                &hash,
+                &key,
+                chrono::Utc::now().timestamp()
+            ));
+            keys.push(key);
+        }
+        assert_ne!(keys[0], keys[1], "separate logins must not share a cookie");
+    }
+
+    #[test]
+    fn expiry_is_enforced_at_the_exact_boundary_and_on_both_paths() {
+        assert!(!share_has_expired(None, 500));
+        assert!(!share_has_expired(Some(501), 500));
+        assert!(share_has_expired(Some(500), 500));
+        assert!(share_has_expired(Some(499), 500));
+    }
+
+    #[actix_web::test]
+    async fn password_verification_rejects_expired_share_without_setting_cookie() {
+        // Entirely in memory; no Telegram connection, client, or shared profile.
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE shared_links (
+                id TEXT PRIMARY KEY,
+                folder_id INTEGER,
+                message_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                password_hash TEXT,
+                password_salt TEXT,
+                expires_at INTEGER,
+                revoked INTEGER NOT NULL
+            );
+            INSERT INTO shared_links
+                (id, folder_id, message_id, file_name, file_size,
+                 password_hash, password_salt, expires_at, revoked)
+            VALUES ('qa-expired', NULL, 1, 'private.txt', 42, 'qa-hash', NULL, 1, 0);",
+        )
+        .unwrap();
+        let db: DbConnection = Arc::new(Mutex::new(conn));
+        let app = web_test::init_service(
+            App::new()
+                .app_data(web::Data::new(db))
+                .configure(configure_share_routes),
+        )
+        .await;
+        let request = web_test::TestRequest::post()
+            .uri("/d/qa-expired/verify")
+            .set_form([("password", "synthetic-password")])
+            .to_request();
+        let response = web_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert!(response.headers().get("Set-Cookie").is_none());
+    }
 }

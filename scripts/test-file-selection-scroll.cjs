@@ -48,7 +48,7 @@ function mount(name, imports = {}) {
   const primitive = new Proxy({}, { get: (_, key) => props => element(key, props) });
   const source = fs.readFileSync(path.join(__dirname, '../app/src/components/desktop/dashboard', name + '.tsx'), 'utf8');
   const module = { exports: {} };
-  const window = { innerWidth: 1200, innerHeight: 800, addEventListener() {}, removeEventListener() {} };
+  const window = { innerWidth: 1200, innerHeight: 800, addEventListener() {}, removeEventListener() {}, setInterval() { return 1; }, clearInterval() {} };
   class ResizeObserver {
     constructor(callback) { this.callback = callback; observers.push(this); }
     observe() {}
@@ -56,6 +56,18 @@ function mount(name, imports = {}) {
   }
   const dependencies = {
     react, 'react/jsx-runtime': { jsx: element, jsxs: element, Fragment: 'Fragment' },
+    '@tanstack/react-virtual': { useVirtualizer: options => ({
+      getTotalSize: () => options.count * 76,
+      getVirtualItems: () => {
+        const count = Math.min(options.count, 12);
+        const start = options.count > 12 && scrollTop > 500 ? options.count - count : 0;
+        return Array.from({ length: count }, (_, offset) => {
+          const index = start + offset;
+          return { index, key: options.getItemKey?.(index) ?? index, start: index * 76 };
+        });
+      },
+      measureElement() {},
+    }) },
     'lucide-react': primitive, 'framer-motion': { motion: primitive },
     'react-i18next': { useTranslation: () => ({ t: key => key === 'files.select_all' ? 'Select All' : key }) },
     '@tauri-apps/api/core': { invoke: async () => ({ members: [] }) },
@@ -168,6 +180,37 @@ test('returning to the bottom resumes following new files', () => {
   harness.scroller.scrollHeight = 1400; harness.render({ ...props, files: [file, { ...file, id: 3 }] });
   assert.equal(harness.scroller.scrollTop, 1200);
 });
+test('large channels render a bounded number of file rows while preserving access to the newest items', () => {
+  const manyFiles = Array.from({ length: 3000 }, (_, i) => ({
+    ...file, id: i + 1, name: `file-${i + 1}.pdf`,
+    created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+  }));
+  const harness = mount('ChannelFeed');
+  const first = harness.render({ ...props, files: manyFiles });
+  assert.ok(byClass(first, 'tr-file-row').length <= 12, 'initial viewport should not mount all file rows');
+  assert.ok(byClass(first, 'tr-file-row').length > 0);
+  const latest = harness.render({ ...props, files: manyFiles });
+  assert.ok(byClass(latest, 'tr-file-row').length <= 12, 'latest viewport should stay bounded');
+  assert.ok(nodes(latest, node => node.props['aria-label'] === 'More actions for file-3000.pdf').length,
+    'the newest file should remain reachable after initial auto-scroll');
+});
+
+test('virtual channel row keys stay unique for single-version files sharing a stack id', () => {
+  const channelFiles = [
+    { ...file, id: 21, name: 'first.pdf', stack_id: 'shared-stack', stack_version_count: 1 },
+    { ...file, id: 22, name: 'second.pdf', stack_id: 'shared-stack', stack_version_count: 1 },
+  ];
+  const harness = mount('ChannelFeed');
+  const firstChannel = harness.render({ ...props, files: channelFiles });
+  const rows = nodes(firstChannel, node => node.props['data-index'] !== undefined);
+  assert.equal(rows.length, 2);
+  assert.equal(new Set(rows.map(row => row.key)).size, 2, 'single-version files must have distinct keys');
+
+  const nextChannel = harness.render({ ...props, files: channelFiles, activeFolderId: 20 });
+  const nextRows = nodes(nextChannel, node => node.props['data-index'] !== undefined);
+  assert.notEqual(rows[0].key, nextRows[0].key, 'channel switches must not reuse row keys');
+});
+
 test('channel three-dot menu routes Select to the file and closes', () => {
   const toggled = [];
   const harness = mount('ChannelFeed'), input = { ...props, onToggleSelection: id => toggled.push(id) };

@@ -7,10 +7,11 @@
 // Cache layout:
 //   $APPDATA/streaming/fmp4/{folder_id}_{message_id}/output.mp4
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::Mutex;
 
@@ -23,6 +24,107 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
 /// Subdirectory under the streaming cache root for fMP4 outputs.
 const FMP4_DIR: &str = "fmp4";
+// Completed videos remain reusable for a week, unless old idle windows exceed
+// the soft cache budget. Recent playback windows are never evicted merely
+// because a large video is being remuxed.
+const FMP4_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+const FMP4_REUSE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const FMP4_BUDGET_IDLE_AGE: Duration = Duration::from_secs(48 * 60 * 60);
+const FMP4_ORPHAN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Prune only unreferenced fMP4 output directories owned by this module.
+/// An unknown path, symlink, or unexpected content is NEVER deletion evidence.
+/// No Telegram payload, Drive staging, or authentication directory is traversed.
+fn prune_inactive_fmp4_cache(
+    root: &Path,
+    protected: &HashSet<String>,
+    now: SystemTime,
+) -> Result<u64, String> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(format!("Cannot inspect fMP4 cache: {err}")),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Refusing to prune an unsafe fMP4 cache root".into());
+    }
+    let mut candidates = Vec::new();
+    let mut total_bytes = 0u64;
+    for folder in
+        std::fs::read_dir(root).map_err(|err| format!("Cannot list private fMP4 cache: {err}"))?
+    {
+        let folder = folder.map_err(|err| err.to_string())?;
+        let Some(key) = folder.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !key.contains("_job_") || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let folder_path = folder.path();
+        let folder_meta = std::fs::symlink_metadata(&folder_path).map_err(|err| err.to_string())?;
+        if !folder_meta.is_dir() || folder_meta.file_type().is_symlink() {
+            continue;
+        }
+        let mut bytes = 0u64;
+        let mut newest = folder_meta.modified().unwrap_or(now);
+        let mut partial = false;
+        let mut completed = false;
+        let mut unknown = false;
+        for item in std::fs::read_dir(&folder_path).map_err(|err| err.to_string())? {
+            let item = item.map_err(|err| err.to_string())?;
+            let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+                unknown = true;
+                break;
+            };
+            if name != "output.mp4" && name != "output.mp4.part" {
+                unknown = true;
+                break;
+            }
+            let meta = std::fs::symlink_metadata(item.path()).map_err(|err| err.to_string())?;
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                unknown = true;
+                break;
+            }
+            bytes = bytes.saturating_add(meta.len());
+            newest = newest.max(meta.modified().unwrap_or(now));
+            partial |= name == "output.mp4.part";
+            completed |= name == "output.mp4";
+        }
+        // Never remove unexpected, ambiguous, empty, or externally altered trees.
+        if unknown || (partial == completed) {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(bytes);
+        let age = now.duration_since(newest).unwrap_or_default();
+        candidates.push((folder_path, key, bytes, age, partial));
+    }
+    // Do not use filesystem pressure as permission to delete recent playback.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.3));
+    let mut removed = 0u64;
+    for (path, key, bytes, age, partial) in candidates {
+        if protected.contains(&key) {
+            continue;
+        }
+        let stale = if partial {
+            age >= FMP4_ORPHAN_AGE
+        } else {
+            age >= FMP4_REUSE_AGE
+                || (total_bytes > FMP4_CACHE_BUDGET_BYTES && age >= FMP4_BUDGET_IDLE_AGE)
+        };
+        if !stale {
+            continue;
+        }
+        std::fs::remove_dir_all(&path).map_err(|err| {
+            format!(
+                "Could not prune owned fMP4 window {}: {err}",
+                path.display()
+            )
+        })?;
+        removed = removed.saturating_add(bytes);
+        total_bytes = total_bytes.saturating_sub(bytes);
+    }
+    Ok(removed)
+}
 #[path = "fmp4_seek.rs"]
 mod seek;
 use seek::{probe_seek_anchor, SeekAnchor};
@@ -54,6 +156,49 @@ pub struct Fmp4RemuxState {
     /// Some(Some(err)) = failed with error. Absent + output exists = ready.
     jobs: Arc<Mutex<HashMap<String, Option<String>>>>,
     active_sources: Arc<Mutex<HashMap<String, ActiveSource>>>,
+    // An HTTP response can continue using an old window after UI cancellation.
+    // Keep its path protected until the actual ranged/chunked body is dropped.
+    http_readers: Arc<SyncMutex<HashMap<String, usize>>>,
+}
+
+struct HttpReadLease {
+    key: String,
+    readers: Arc<SyncMutex<HashMap<String, usize>>>,
+}
+
+impl Drop for HttpReadLease {
+    fn drop(&mut self) {
+        if let Ok(mut readers) = self.readers.lock() {
+            if let Some(count) = readers.get_mut(&self.key) {
+                *count -= 1;
+                if *count == 0 {
+                    readers.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+/// Hold an HTTP media lease for the lifetime of the Actix response body, not
+/// merely until the handler returns (the response can outlive the handler).
+struct HttpLeaseBody<B> {
+    inner: std::pin::Pin<Box<B>>,
+    _lease: HttpReadLease,
+}
+
+impl<B: actix_web::body::MessageBody> actix_web::body::MessageBody for HttpLeaseBody<B> {
+    type Error = B::Error;
+
+    fn size(&self) -> actix_web::body::BodySize {
+        self.inner.size()
+    }
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<web::Bytes, Self::Error>>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
 }
 
 #[derive(Default)]
@@ -68,7 +213,14 @@ impl Fmp4RemuxState {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             active_sources: Arc::new(Mutex::new(HashMap::new())),
+            http_readers: Arc::new(SyncMutex::new(HashMap::new())),
         }
+    }
+}
+
+impl Default for Fmp4RemuxState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -395,7 +547,58 @@ fn growing_mp4_with_eof(
 /// Returns immediately with `status: "ready"` if the fMP4 is cached, or
 /// `status: "processing"` after spawning the remux in the background.
 /// The frontend polls until a complete media fragment can be played.
+fn protected_fmp4_windows(
+    active: &HashMap<String, ActiveSource>,
+    jobs: &HashMap<String, Option<String>>,
+) -> HashSet<String> {
+    // A terminal failed/cancelled job no longer owns its temporary file.
+    // Protect running jobs and actual playback references only; otherwise
+    // old error records permanently prevent orphan-partial cleanup.
+    let mut protected: HashSet<String> = jobs
+        .iter()
+        .filter_map(|(key, status)| status.is_none().then_some(key.clone()))
+        .collect();
+    protected.extend(active.values().filter_map(|entry| entry.key.clone()));
+    protected
+}
+
 impl Fmp4RemuxState {
+    fn begin_http_read(&self, key: &str) -> Result<HttpReadLease, String> {
+        let mut readers = self
+            .http_readers
+            .lock()
+            .map_err(|_| "fMP4 HTTP reader registry is unavailable".to_string())?;
+        let count = readers.entry(key.to_owned()).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or("Too many simultaneous readers for one fMP4 window")?;
+        Ok(HttpReadLease {
+            key: key.to_owned(),
+            readers: self.http_readers.clone(),
+        })
+    }
+
+    pub(crate) async fn prune_idle_cache(&self, root: &Path) {
+        // Hold both registry locks while selecting and deleting candidates so
+        // no prepare/cancel can claim a window halfway through eviction.
+        let active = self.active_sources.lock().await;
+        let jobs = self.jobs.lock().await;
+        let readers = match self.http_readers.lock() {
+            Ok(readers) => readers,
+            Err(_) => {
+                log::warn!("Deferred fMP4 cache cleanup: HTTP reader registry is unavailable");
+                return;
+            }
+        };
+        let mut protected = protected_fmp4_windows(&active, &jobs);
+        protected.extend(readers.keys().cloned());
+        match prune_inactive_fmp4_cache(root, &protected, SystemTime::now()) {
+            Ok(bytes) if bytes > 0 => log::info!("Pruned {bytes} bytes of inactive fMP4 cache"),
+            Err(error) => log::warn!("Deferred safe fMP4 cache cleanup: {error}"),
+            _ => {}
+        }
+    }
+
     async fn reserve_source(&self, source: &str) -> u64 {
         let mut active = self.active_sources.lock().await;
         let entry = active.entry(source.to_string()).or_default();
@@ -415,12 +618,42 @@ impl Fmp4RemuxState {
         if entry.generation != generation {
             return Err("Video source changed".to_string());
         }
+        Self::replace_source_job(entry, file_key, cancel);
+        Ok(())
+    }
+
+    fn replace_source_job(
+        entry: &mut ActiveSource,
+        file_key: &str,
+        cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
         if let Some(previous) = entry.cancel.take() {
             let _ = previous.send(());
         }
         entry.key = Some(file_key.to_string());
         entry.cancel = cancel;
-        Ok(())
+    }
+
+    async fn claim_cached_window(
+        &self,
+        source: &str,
+        generation: u64,
+        root: &Path,
+        stem: &str,
+    ) -> Result<Option<String>, String> {
+        // Reserve the cached directory while holding the same locks used by
+        // cleanup; it cannot be pruned between lookup and playback claim.
+        let mut active = self.active_sources.lock().await;
+        let _jobs = self.jobs.lock().await;
+        let entry = active.get_mut(source).ok_or("Video source changed")?;
+        if entry.generation != generation {
+            return Err("Video source changed".to_string());
+        }
+        let cached = cached_window_key(root, stem);
+        if let Some(ref key) = cached {
+            Self::replace_source_job(entry, key, None);
+        }
+        Ok(cached)
     }
 
     async fn cancel_key(&self, file_key: &str) -> bool {
@@ -506,10 +739,11 @@ pub async fn cmd_prepare_fmp4_stream(
         (window_start * 1000.0).round() as u64
     );
     let root = manager.cache_root.join(FMP4_DIR);
-    if let Some(file_key) = cached_window_key(&root, &stem) {
-        remux_state
-            .install_job(&source_key, generation, &file_key, None)
-            .await?;
+    remux_state.prune_idle_cache(&root).await;
+    if let Some(file_key) = remux_state
+        .claim_cached_window(&source_key, generation, &root, &stem)
+        .await?
+    {
         return Ok(Fmp4StreamInfo {
             url: format!("/fmp4/{file_key}/output.mp4"),
             output_file_key: file_key,
@@ -578,9 +812,16 @@ pub async fn cmd_prepare_fmp4_stream(
 #[tauri::command]
 pub async fn cmd_cancel_fmp4_stream(
     file_key: String,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
     remux_state: tauri::State<'_, Fmp4RemuxState>,
 ) -> Result<bool, String> {
-    Ok(remux_state.cancel_key(&file_key).await)
+    let cancelled = remux_state.cancel_key(&file_key).await;
+    // This is the ordinary playback-stop/seek-change event. Only old,
+    // unreferenced, safely reusable cache candidates are eligible for pruning.
+    remux_state
+        .prune_idle_cache(&manager.cache_root.join(FMP4_DIR))
+        .await;
+    Ok(cancelled)
 }
 
 fn playable_output_status(output_dir: &Path, allow_partial: bool) -> Option<Fmp4StatusResult> {
@@ -641,6 +882,46 @@ struct Fmp4Query {
     token: Option<String>,
 }
 
+/// Revision aliases share one canonical remote window. Their purpose is to
+/// make WebKit/GStreamer's native URI cache distinguish a growing partial
+/// media response from a finished, independently ranged media response.
+fn canonical_fmp4_file_key(requested_key: &str) -> &str {
+    match requested_key.rsplit_once("__refresh_") {
+        Some((base, revision))
+            if !base.is_empty()
+                && !revision.is_empty()
+                && revision.len() <= 10
+                && revision.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => requested_key,
+    }
+}
+
+#[cfg(test)]
+mod revision_url_tests {
+    use super::canonical_fmp4_file_key;
+
+    #[test]
+    fn native_media_path_revisions_keep_exact_canonical_window_identity() {
+        assert_eq!(canonical_fmp4_file_key("folder_12"), "folder_12");
+        assert_eq!(canonical_fmp4_file_key("folder_12__refresh_2"), "folder_12");
+        assert_eq!(
+            canonical_fmp4_file_key("folder_12__refresh_2345678901"),
+            "folder_12"
+        );
+        for invalid in [
+            "folder_12__refresh_",
+            "folder_12__refresh_malicious",
+            "folder_12__refresh_12345678901",
+            "__refresh_1",
+        ] {
+            assert_eq!(canonical_fmp4_file_key(invalid), invalid);
+        }
+    }
+}
+
 /// GET /fmp4/{file_key}/output.mp4
 ///
 /// Serves a pre-remuxed fragmented MP4 file. Token validation matches the
@@ -652,8 +933,14 @@ async fn serve_fmp4(
     query: web::Query<Fmp4Query>,
     manager: web::Data<std::sync::Arc<TranscodeManager>>,
     token_data: web::Data<StreamTokenData>,
+    remux_state: web::Data<Fmp4RemuxState>,
 ) -> impl Responder {
-    let file_key = path.into_inner();
+    let requested_key = path.into_inner();
+    // A new URL *path* (not just a changed query) is required when
+    // switching WebKit/GStreamer from the growing response to the completed
+    // ranged file. Map these bounded revision aliases back to the exact same
+    // cache object, reader lease, authorization and containment checks.
+    let file_key = canonical_fmp4_file_key(&requested_key).to_string();
 
     // Validate token
     match &query.token {
@@ -668,6 +955,16 @@ async fn serve_fmp4(
     {
         return HttpResponse::BadRequest().body("Invalid file key");
     }
+
+    // Reserve this window before filesystem probes so age-based cleanup
+    // cannot unlink it between path validation and an HTTP range/open.
+    let reader_lease = match remux_state.begin_http_read(&file_key) {
+        Ok(lease) => lease,
+        Err(error) => {
+            log::warn!("Could not protect an active fMP4 response: {error}");
+            return HttpResponse::ServiceUnavailable().body("Media temporarily unavailable");
+        }
+    };
 
     // Build path and validate it stays within the cache root
     let fmp4_root = manager.cache_root.join(FMP4_DIR);
@@ -719,7 +1016,12 @@ async fn serve_fmp4(
                 safe_path,
                 finished,
                 std::time::Duration::from_secs(120),
-            ));
+            ))
+            .map_body(|_, body| HttpLeaseBody {
+                inner: Box::pin(body),
+                _lease: reader_lease,
+            })
+            .map_into_boxed_body();
     }
 
     // Use NamedFile for automatic Range/Content-Range support and
@@ -727,11 +1029,213 @@ async fn serve_fmp4(
     match actix_files::NamedFile::open_async(&safe_path).await {
         Ok(f) => f
             .set_content_type("video/mp4".parse().unwrap())
-            .into_response(&_req),
+            .into_response(&_req)
+            .map_body(|_, body| HttpLeaseBody {
+                inner: Box::pin(body),
+                _lease: reader_lease,
+            })
+            .map_into_boxed_body(),
         Err(e) => {
             log::error!("Failed to open fMP4 file {:?}: {}", safe_path, e);
             HttpResponse::InternalServerError().body("Failed to read file")
         }
+    }
+}
+
+#[cfg(test)]
+mod fmp4_cache_lifecycle_tests {
+    use super::*;
+    use std::fs;
+
+    fn cache_fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-fmp4-prune-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn window(root: &Path, key: &str, name: &str, size: u64) -> std::path::PathBuf {
+        let path = root.join(key);
+        fs::create_dir(&path).unwrap();
+        let file = fs::File::create(path.join(name)).unwrap();
+        file.set_len(size).unwrap();
+        path
+    }
+
+    #[test]
+    fn terminal_errors_do_not_pin_abandoned_windows_but_active_players_do() {
+        let mut jobs = HashMap::new();
+        jobs.insert("working_job_111".to_string(), None);
+        jobs.insert("failed_job_222".to_string(), Some("ffmpeg stopped".into()));
+        let active = HashMap::from([(
+            "source".to_string(),
+            ActiveSource {
+                generation: 1,
+                key: Some("viewing_job_333".into()),
+                cancel: None,
+            },
+        )]);
+        let protected = protected_fmp4_windows(&active, &jobs);
+        assert!(protected.contains("working_job_111"));
+        assert!(protected.contains("viewing_job_333"));
+        assert!(!protected.contains("failed_job_222"));
+    }
+
+    #[test]
+    fn http_response_body_lease_survives_handler_and_prevents_cache_eviction() {
+        let root = cache_fixture();
+        let key = "http_job_abc";
+        let path = window(&root, key, "output.mp4", 51);
+        let remux = Fmp4RemuxState::new();
+        let lease = remux.begin_http_read(key).unwrap();
+        let response = HttpResponse::Ok()
+            .body("media")
+            .map_body(|_, body| HttpLeaseBody {
+                inner: Box::pin(body),
+                _lease: lease,
+            })
+            .map_into_boxed_body();
+        let future = SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60);
+        let protected: HashSet<String> =
+            remux.http_readers.lock().unwrap().keys().cloned().collect();
+        assert!(protected.contains(key));
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, future).unwrap(),
+            0
+        );
+        assert!(path.exists());
+        drop(response);
+        assert!(remux.http_readers.lock().unwrap().is_empty());
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &HashSet::new(), future).unwrap(),
+            51
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_window_is_claimed_before_pruning_and_released_after_cancel() {
+        let root = cache_fixture();
+        let key = "preview_job_abc";
+        let path = window(&root, key, "output.mp4", 42);
+        let state = Fmp4RemuxState::new();
+        let generation = state.reserve_source("source").await;
+        assert_eq!(
+            state
+                .claim_cached_window("source", generation, &root, "preview")
+                .await
+                .unwrap(),
+            Some(key.to_owned())
+        );
+        let future = SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60);
+        let protected = {
+            let active = state.active_sources.lock().await;
+            let jobs = state.jobs.lock().await;
+            protected_fmp4_windows(&active, &jobs)
+        };
+        assert!(protected.contains(key));
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, future).unwrap(),
+            0,
+            "active cached playback must not be evicted"
+        );
+        assert!(path.exists());
+        assert!(state.cancel_key(key).await);
+        let protected = {
+            let active = state.active_sources.lock().await;
+            let jobs = state.jobs.lock().await;
+            protected_fmp4_windows(&active, &jobs)
+        };
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, future).unwrap(),
+            42
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inactive_window_pruning_preserves_recent_active_and_unknown_files() {
+        let root = cache_fixture();
+        let completed = window(&root, "complete_job_abc", "output.mp4", 17);
+        let active = window(&root, "active_job_123", "output.mp4", 23);
+        let partial = window(&root, "partial_job_def", "output.mp4.part", 11);
+        let unknown = window(&root, "unknown_job_ghi", "user-data.txt", 9);
+        let now = SystemTime::now();
+        let protected = HashSet::from(["active_job_123".to_string()]);
+
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, now).unwrap(),
+            0,
+            "recent reusable data and active media must remain"
+        );
+        let after_two_days = now + Duration::from_secs(2 * 24 * 60 * 60);
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, after_two_days).unwrap(),
+            11
+        );
+        assert!(!partial.exists(), "crash-abandoned partial is recovered");
+        assert!(completed.exists(), "recent completed remux is reusable");
+        assert!(active.exists(), "active source is never evicted");
+        assert!(unknown.join("user-data.txt").exists());
+
+        let after_eight_days = now + Duration::from_secs(8 * 24 * 60 * 60);
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &protected, after_eight_days).unwrap(),
+            17
+        );
+        assert!(!completed.exists());
+        assert!(active.exists());
+        assert_eq!(fs::read(unknown.join("user-data.txt")).unwrap().len(), 9);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_budget_evicts_only_old_unreferenced_completed_windows() {
+        let root = cache_fixture();
+        let first = window(&root, "large_job_123", "output.mp4", 140 * 1024 * 1024);
+        let second = window(&root, "large_job_456", "output.mp4", 140 * 1024 * 1024);
+        let now = SystemTime::now();
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &HashSet::new(), now).unwrap(),
+            0,
+            "even large outputs must not be evicted while recent"
+        );
+        let later = now + Duration::from_secs(3 * 24 * 60 * 60);
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &HashSet::new(), later).unwrap(),
+            140 * 1024 * 1024
+        );
+        assert_ne!(first.exists(), second.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmp4_cleanup_never_traverses_cache_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = cache_fixture();
+        let external = cache_fixture();
+        fs::write(external.join("untouched.bin"), b"private").unwrap();
+        symlink(&external, root.join("external_job_111")).unwrap();
+        let now = SystemTime::now() + Duration::from_secs(15 * 24 * 60 * 60);
+        assert_eq!(
+            prune_inactive_fmp4_cache(&root, &HashSet::new(), now).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs::read(external.join("untouched.bin")).unwrap(),
+            b"private"
+        );
+        let link_root = cache_fixture();
+        symlink(&root, link_root.join("fmp4")).unwrap();
+        assert!(prune_inactive_fmp4_cache(&link_root.join("fmp4"), &HashSet::new(), now).is_err());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&external).unwrap();
+        fs::remove_dir_all(&link_root).unwrap();
     }
 }
 

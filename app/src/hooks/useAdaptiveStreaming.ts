@@ -72,14 +72,25 @@ const debugLog = (..._args: unknown[]) => {};
 // populate the browser's HTTP cache. When the native player requests the
 // same range moments later, it's a cache hit and playback initializes
 // almost instantly.
-function warmProgressiveMoovCache(streamUrl: string, fileSize: number): void {
-    const warmBytes = Math.min(PROGRESSIVE_CACHE_WARM_BYTES, fileSize);
-    const tailStart = Math.max(0, fileSize - warmBytes);
+export function progressiveMoovWarmRange(fileSize: number): string | null {
+    // On small MP4s the speculative tail download would fetch nearly the
+    // whole movie at the same time the native WebKit decoder issues its own
+    // ranges. Avoid racing that decoder and duplicating loopback/Telegram IO.
+    // Large moov-at-end files still benefit from the bounded 3 MiB cache warm.
+    if (!Number.isSafeInteger(fileSize) || fileSize <= PROGRESSIVE_CACHE_WARM_BYTES * 2) {
+        return null;
+    }
+    return `bytes=${fileSize - PROGRESSIVE_CACHE_WARM_BYTES}-`;
+}
 
-    debugLog('[AdaptiveStreaming] 🔥 warmProgressiveMoovCache: pre-fetching last', warmBytes, 'bytes from offset', tailStart);
+function warmProgressiveMoovCache(streamUrl: string, fileSize: number): void {
+    const range = progressiveMoovWarmRange(fileSize);
+    if (!range) return;
+
+    debugLog('[AdaptiveStreaming] warmProgressiveMoovCache: pre-fetching', range);
 
     fetch(streamUrl, {
-        headers: { Range: `bytes=${tailStart}-` },
+        headers: { Range: range },
         // Fire-and-forget: we don't need the result — only need the
         // browser's HTTP cache to be populated for the native <video>
         // element that will mount moments later.

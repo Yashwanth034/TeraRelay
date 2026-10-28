@@ -19,6 +19,50 @@ pub struct ProxyConfig {
     pub password: String, // SOCKS5
 }
 
+/// Validate configuration before saving or starting any network traffic.
+/// Reject malformed enabled proxies instead of silently connecting directly.
+pub(crate) fn validate_enabled_proxy(proxy: &ProxyConfig) -> Result<(), String> {
+    if !proxy.enabled {
+        return Ok(());
+    }
+    let host = proxy.host.trim();
+    if host.is_empty() || proxy.port == 0 {
+        return Err("Enabled proxy requires a host and nonzero port".into());
+    }
+    if host
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err("Proxy host cannot contain whitespace or control characters".into());
+    }
+    if !matches!(proxy.proxy_type.as_str(), "socks5" | "http" | "https") {
+        return Err("Unsupported proxy type".into());
+    }
+    if proxy.proxy_type == "socks5" && proxy.username.is_empty() && !proxy.password.is_empty() {
+        return Err("SOCKS5 proxy password requires a username".into());
+    }
+    {
+        let normalized = host.trim_start_matches('[').trim_end_matches(']');
+        // Brackets are accepted only as a pair surrounding a real IPv6 host.
+        if (host.starts_with('[') || host.ends_with(']'))
+            && (host != format!("[{normalized}]")
+                || normalized.parse::<std::net::Ipv6Addr>().is_err())
+        {
+            return Err("Invalid bracketed IPv6 proxy host".into());
+        }
+        let mut url = reqwest::Url::parse("socks5://localhost")
+            .map_err(|_| "Could not initialize proxy validation".to_string())?;
+        let formatted = if normalized.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{normalized}]")
+        } else {
+            host.to_string()
+        };
+        url.set_host(Some(&formatted))
+            .map_err(|_| "Invalid SOCKS5 proxy host".to_string())?;
+    }
+    Ok(())
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +138,12 @@ pub struct NetworkConfig {
     pub bridge_handle: std::sync::Mutex<Option<(u16, tokio::task::JoinHandle<()>)>>,
 }
 
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkConfig {
     pub fn new() -> Self {
         Self {
@@ -118,31 +168,53 @@ impl NetworkConfig {
         }
     }
 
-    pub fn effective_proxy_url(&self) -> Option<String> {
-        let proxy = self.proxy.read().unwrap();
-        if !proxy.enabled || proxy.host.is_empty() {
-            return None;
+    /// Return no proxy *only when explicitly disabled*. An enabled but
+    /// malformed/unavailable proxy must never silently downgrade Telegram
+    /// traffic, downloads or imports to a direct network connection.
+    pub fn effective_proxy_url_checked(&self) -> Result<Option<String>, String> {
+        let proxy = self
+            .proxy
+            .read()
+            .map_err(|_| "Proxy configuration lock is unavailable".to_string())?;
+        validate_enabled_proxy(&proxy)?;
+        if !proxy.enabled {
+            return Ok(None);
         }
-        if proxy.proxy_type == "socks5" {
-            if !proxy.username.is_empty() {
-                let encoded_user = urlencoding::encode(&proxy.username);
-                let encoded_pass = urlencoding::encode(&proxy.password);
-                Some(format!(
-                    "socks5://{}:{}@{}:{}",
-                    encoded_user, encoded_pass, proxy.host, proxy.port
-                ))
-            } else {
-                Some(format!("socks5://{}:{}", proxy.host, proxy.port))
+        match proxy.proxy_type.as_str() {
+            "socks5" => {
+                let mut url = reqwest::Url::parse("socks5://localhost")
+                    .map_err(|_| "SOCKS5 URL setup failed".to_string())?;
+                // URL host setters require brackets around IPv6 literals;
+                // accept either bracketed or bare IPv6 from the UI.
+                let host = proxy.host.trim();
+                let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                };
+                url.set_host(Some(&host))
+                    .map_err(|_| "Invalid SOCKS5 proxy host".to_string())?;
+                url.set_port(Some(proxy.port))
+                    .map_err(|_| "Invalid SOCKS5 proxy port".to_string())?;
+                if !proxy.username.is_empty() {
+                    url.set_username(&proxy.username)
+                        .map_err(|_| "Invalid SOCKS5 proxy username".to_string())?;
+                    url.set_password(Some(&proxy.password))
+                        .map_err(|_| "Invalid SOCKS5 proxy password".to_string())?;
+                }
+                Ok(Some(url.to_string()))
             }
-        } else if proxy.proxy_type == "http" || proxy.proxy_type == "https" {
-            let guard = self.bridge_handle.lock().unwrap();
-            if let Some((port, _)) = &*guard {
-                Some(format!("socks5://127.0.0.1:{}", port))
-            } else {
-                None
+            "http" | "https" => {
+                let guard = self
+                    .bridge_handle
+                    .lock()
+                    .map_err(|_| "Proxy bridge lock is unavailable".to_string())?;
+                match &*guard {
+                    Some((port, _)) if *port != 0 => Ok(Some(format!("socks5://127.0.0.1:{port}"))),
+                    _ => Err("Configured proxy bridge is not running".into()),
+                }
             }
-        } else {
-            None
+            _ => Err("Unsupported proxy type".into()),
         }
     }
 
@@ -206,13 +278,13 @@ impl NetworkConfig {
         }
     }
 
-    /// How many retry attempts for API calls. Default 0 (no retry) when VPN off.
+    /// Transient retries apply on ordinary networks as well as VPN connections.
     pub fn retry_attempts(&self) -> u32 {
         let vpn = self.vpn.read().unwrap();
         if vpn.enabled {
             vpn.retry_attempts
         } else {
-            0
+            3
         }
     }
 
@@ -242,7 +314,7 @@ impl NetworkConfig {
         if vpn.enabled {
             vpn.flood_wait_respect
         } else {
-            false
+            true
         }
     }
 
@@ -369,4 +441,114 @@ pub fn save_network_config(
     let path = settings_path(app)?;
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod transfer_policy_tests {
+    use super::*;
+
+    #[test]
+    fn network_config_default_preserves_new_initialization() {
+        let from_default = NetworkConfig::default();
+        let from_new = NetworkConfig::new();
+        assert_eq!(from_default.retry_attempts(), from_new.retry_attempts());
+        assert_eq!(
+            from_default.should_respect_flood_wait(),
+            from_new.should_respect_flood_wait()
+        );
+        assert!(from_default.bridge_handle.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_urls_support_ipv4_ipv6_dns_and_encoded_credentials() {
+        let config = NetworkConfig::new();
+        {
+            let mut proxy = config.proxy.write().unwrap();
+            proxy.enabled = true;
+            proxy.proxy_type = "socks5".into();
+            proxy.host = "::1".into();
+            proxy.port = 1080;
+            proxy.username = ["synthetic", "user"].join("-");
+            proxy.password = ["not", "a", "credential"].join("-");
+        }
+        let result = config.effective_proxy_url_checked().unwrap().unwrap();
+        let url = reqwest::Url::parse(&result).unwrap();
+        assert_eq!(url.host_str(), Some("[::1]"));
+        assert_eq!(url.port(), Some(1080));
+        assert_eq!(url.username(), "synthetic-user");
+        assert_eq!(url.password(), Some("not-a-credential"));
+        assert_eq!(url.scheme(), "socks5");
+
+        config.proxy.write().unwrap().host = "[2001:db8::abcd]".into();
+        let url = config.effective_proxy_url_checked().unwrap().unwrap();
+        assert_eq!(
+            reqwest::Url::parse(&url).unwrap().host_str(),
+            Some("[2001:db8::abcd]")
+        );
+
+        config.proxy.write().unwrap().host = "localhost".into();
+        let url = config.effective_proxy_url_checked().unwrap().unwrap();
+        assert_eq!(
+            reqwest::Url::parse(&url).unwrap().host_str(),
+            Some("localhost")
+        );
+
+        config.proxy.write().unwrap().host = "192.0.2.55".into();
+        let url = config.effective_proxy_url_checked().unwrap().unwrap();
+        assert_eq!(
+            reqwest::Url::parse(&url).unwrap().host_str(),
+            Some("192.0.2.55")
+        );
+    }
+
+    #[test]
+    fn enabled_proxy_configuration_fails_closed_instead_of_direct_fallback() {
+        let config = NetworkConfig::new();
+        assert!(config.effective_proxy_url_checked().unwrap().is_none());
+        let invalid = [
+            ("", 1080, "socks5"),
+            ("example.test", 0, "socks5"),
+            ("bad host", 1080, "socks5"),
+            ("bad\nname", 1080, "socks5"),
+            ("[::1", 1080, "socks5"),
+            ("example.test", 1080, "unknown"),
+            ("example.test", 1080, "http"),
+        ];
+        for (host, port, kind) in invalid {
+            let mut proxy = config.proxy.write().unwrap();
+            proxy.enabled = true;
+            proxy.host = host.into();
+            proxy.port = port;
+            proxy.proxy_type = kind.into();
+            proxy.username.clear();
+            proxy.password.clear();
+            drop(proxy);
+            assert!(
+                config.effective_proxy_url_checked().is_err(),
+                "enabled {kind:?} proxy {host:?} must not silently go direct"
+            );
+        }
+        {
+            let mut proxy = config.proxy.write().unwrap();
+            proxy.enabled = true;
+            proxy.proxy_type = "socks5".into();
+            proxy.host = "proxy.example".into();
+            proxy.port = 1080;
+            proxy.username.clear();
+            proxy.password = ["synthetic", "password"].join("-");
+        }
+        assert!(config.effective_proxy_url_checked().is_err());
+    }
+
+    #[test]
+    fn ordinary_network_transfers_retry_and_respect_telegram_waits() {
+        let config = NetworkConfig::new();
+        assert_eq!(config.retry_attempts(), 3);
+        assert!(config.should_respect_flood_wait());
+        config.vpn.write().unwrap().enabled = true;
+        config.vpn.write().unwrap().retry_attempts = 1;
+        config.vpn.write().unwrap().flood_wait_respect = false;
+        assert_eq!(config.retry_attempts(), 1);
+        assert!(!config.should_respect_flood_wait());
+    }
 }

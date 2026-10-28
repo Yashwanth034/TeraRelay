@@ -98,6 +98,7 @@ class DownloadTimeoutTests(unittest.TestCase):
             def destination_chat(self, destination):
                 return 1
         worker = Worker()
+        worker.files_dir = root / "tdlib-cache"
         worker.td = TimedTD(root, clock, interval, progress_steps, cached, unrelated)
         return worker, events
 

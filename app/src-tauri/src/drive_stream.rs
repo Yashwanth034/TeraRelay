@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tauri::{AppHandle, Manager};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 pub const DRIVE_DATA_FILE_PREFIX: &str = ".terarelay-drive-data-";
 pub const DRIVE_DATA_CAPTION_PREFIX: &str = "TRD2:data:";
@@ -80,6 +80,23 @@ pub fn ready_remote_parts(logical_size: u64, closed: bool) -> Vec<(u64, u64, u64
                 .map(|(first, end)| (part_index, first, end))
         })
         .collect()
+}
+
+/// Own only the encoded scratch file, leaving resumable source chunks intact.
+struct EncodedUploadTemp(PathBuf);
+
+impl Drop for EncodedUploadTemp {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "Could not remove encoded Drive upload scratch file {}: {}",
+                    self.0.display(),
+                    error
+                );
+            }
+        }
+    }
 }
 
 struct EncodedPartReader<'a> {
@@ -155,6 +172,90 @@ fn staging_dir(pending: &DrivePendingRecord) -> PathBuf {
         .to_path_buf()
 }
 
+// Pending staging paths come from persistent SQLite metadata, which may be
+// corrupted. A finalized upload must never recursively remove a directory
+// outside this app's dedicated staging root (or follow a substituted symlink).
+pub(crate) fn owned_finalized_staging_dir(
+    cache_root: &Path,
+    pending: &DrivePendingRecord,
+) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+    let mut components = Path::new(&pending.id).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("invalid pending staging identity");
+    }
+    let drive = cache_root.join("drive");
+    let root = drive.join("staging");
+    let owned = root.join(&pending.id);
+    if Path::new(&pending.staging_path).parent() != Some(owned.as_path()) {
+        return Err("pending staging path is outside the owned directory");
+    }
+    // Every app-owned ancestor must be a real directory. Checking only the
+    // staging leaf lets a symlink at `drive` redirect cleanup out of cache.
+    for directory in [cache_root, drive.as_path(), root.as_path(), owned.as_path()] {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|_| "pending staging directory is unavailable")?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("pending staging directory is not a real directory");
+        }
+    }
+    Ok(owned)
+}
+
+// Cancellation must also prove that the just-deleted database record is the
+// same pending write previously loaded by FUSE. A stale/forged DB row may not
+// authorize recursive removal from its supplied path.
+pub(crate) fn owned_cancelled_staging_dir(
+    cache_root: &Path,
+    pending: &DrivePendingRecord,
+    deleted_path: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    if deleted_path != Some(pending.staging_path.as_str()) {
+        return Err("Cancelled Drive staging metadata changed or was missing");
+    }
+    owned_finalized_staging_dir(cache_root, pending)
+}
+
+// An upload scratch file is transient, but writing it outside this exact
+// private pending directory can overwrite unrelated local data. Unlike
+// creating a new pending write, an upload must NOT recreate a missing stage.
+fn owned_legacy_upload_scratch_dir(
+    cache_root: &Path,
+    pending: &DrivePendingRecord,
+) -> Result<PathBuf, &'static str> {
+    owned_finalized_staging_dir(cache_root, pending)
+}
+
+fn create_private_upload_scratch(path: &Path) -> Result<std::fs::File, String> {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    open.open(path)
+        .map_err(|e| format!("Could not create Drive upload scratch file: {e}"))
+}
+
+async fn cleanup_finalized_staging_dir(app: &AppHandle, pending: &DrivePendingRecord) {
+    let result = app
+        .path()
+        .app_cache_dir()
+        .map_err(|_| "Drive cache directory is unavailable")
+        .and_then(|root| owned_finalized_staging_dir(&root, pending));
+    match result {
+        Ok(owned) => {
+            if let Err(error) = tokio::fs::remove_dir_all(owned).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("Could not clean finalized Drive staging directory: {error}");
+                }
+            }
+        }
+        Err(error) => log::warn!("Skipped unsafe finalized Drive staging cleanup: {error}"),
+    }
+}
+
 pub fn local_chunk_path(pending: &DrivePendingRecord, chunk_index: u64) -> PathBuf {
     staging_dir(pending).join(format!("plain-{chunk_index:016x}.part"))
 }
@@ -187,7 +288,7 @@ pub fn encode_pending_plaintext_block(
             .crypto_id
             .as_deref()
             .ok_or_else(|| "Encrypted Drive write is missing its crypto identity".to_string())?;
-        crate::drive_crypto::encrypt_chunk(&*key, crypto_id, chunk_index, &plaintext)?
+        crate::drive_crypto::encrypt_chunk(&key, crypto_id, chunk_index, &plaintext)?
     } else if pending.encryption_version == 0 {
         if plaintext.is_empty() {
             vec![0u8]
@@ -273,6 +374,19 @@ pub async fn upload_plaintext_chunk(
     chunk_index: u64,
     plaintext: Vec<u8>,
 ) -> Result<DrivePendingChunkRecord, String> {
+    // A damaged SQLite staging path must not cause even a storage-channel
+    // allocation before we discover that it belongs outside this app. The
+    // second validation below covers an updated DB row across this await.
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|_| "Drive cache directory is unavailable".to_string())?;
+    let initial_pending = {
+        let conn = db.lock().map_err(|_| "DB poisoned".to_string())?;
+        drive_pending_by_id(&conn, pending_id)?
+            .ok_or_else(|| "Drive pending write no longer exists".to_string())?
+    };
+    owned_legacy_upload_scratch_dir(&cache_root, &initial_pending).map_err(str::to_string)?;
     let pending = ensure_pending_storage(app, state, db, pending_id).await?;
 
     let plaintext_sha256 = hex_sha256(&plaintext);
@@ -300,7 +414,7 @@ pub async fn upload_plaintext_chunk(
             .crypto_id
             .as_deref()
             .ok_or_else(|| "Encrypted Drive write is missing its crypto identity".to_string())?;
-        crate::drive_crypto::encrypt_chunk(&*key, crypto_id, chunk_index, &plaintext)?
+        crate::drive_crypto::encrypt_chunk(&key, crypto_id, chunk_index, &plaintext)?
     } else if pending.encryption_version == 0 {
         // Telegram/logical manifests need a non-empty backing document.
         // The Drive entry keeps plaintext_size=0, so this one-byte sentinel is
@@ -318,14 +432,24 @@ pub async fn upload_plaintext_chunk(
     };
 
     let encoded_sha256 = hex_sha256(&encoded);
-    let temp_dir = staging_dir(&pending);
-    tokio::fs::create_dir_all(&temp_dir)
-        .await
-        .map_err(|e| format!("Could not create Drive staging directory: {e}"))?;
-    let temp_path = temp_dir.join(format!("remote-{chunk_index:016x}.upload"));
-    tokio::fs::write(&temp_path, &encoded)
+    let temp_dir =
+        owned_legacy_upload_scratch_dir(&cache_root, &pending).map_err(str::to_string)?;
+    let temp_path = temp_dir.join(format!(
+        "remote-{chunk_index:016x}-{:032x}.upload",
+        rand::random::<u128>()
+    ));
+    // Create the handle before the first await so cancellation cannot race a
+    // background path-based open and recreate the file after guard cleanup.
+    let file = create_private_upload_scratch(&temp_path)?;
+    let _owned_upload = EncodedUploadTemp(temp_path.clone());
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(&encoded)
         .await
         .map_err(|e| format!("Could not stage Drive chunk for upload: {e}"))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Could not flush staged Drive chunk: {e}"))?;
+    drop(file);
 
     let client = client_for_state(state).await?;
     let peer = resolve_peer(&client, Some(pending.backing_channel_id), &state.peer_cache).await?;
@@ -693,7 +817,7 @@ pub async fn finalize_pending_v2(
                 "TeraRelay Drive is locked. Unlock Drive encryption before finalizing this file."
                     .to_string()
             })?;
-            crate::drive_crypto::keyed_content_fingerprint(&*key, pending.size, &plaintext_hashes)?
+            crate::drive_crypto::keyed_content_fingerprint(&key, pending.size, &plaintext_hashes)?
         } else if pending.encryption_version == 0 {
             crate::drive_crypto::public_content_fingerprint(pending.size, &plaintext_hashes)
         } else {
@@ -724,7 +848,7 @@ pub async fn finalize_pending_v2(
         }
     }
 
-    let _ = tokio::fs::remove_dir_all(staging_dir(&pending)).await;
+    cleanup_finalized_staging_dir(app, &pending).await;
     Ok(finalized.object_id)
 }
 
@@ -783,7 +907,7 @@ pub async fn finalize_pending(
                     .to_string()
             })?;
             Some(crate::drive_crypto::keyed_content_fingerprint(
-                &*key,
+                &key,
                 pending.size,
                 &plaintext_hashes,
             )?)
@@ -826,7 +950,7 @@ pub async fn finalize_pending(
                 .filter_map(|chunk| i32::try_from(chunk.message_id).ok())
                 .collect();
             delete_messages_best_effort(state, pending.backing_channel_id, &ids).await;
-            let _ = tokio::fs::remove_dir_all(staging_dir(&pending)).await;
+            cleanup_finalized_staging_dir(app, &pending).await;
             return Ok(existing.file_id);
         }
     }
@@ -880,7 +1004,7 @@ pub async fn finalize_pending(
             None,
         )?;
     }
-    let _ = tokio::fs::remove_dir_all(staging_dir(&pending)).await;
+    cleanup_finalized_staging_dir(app, &pending).await;
     Ok(file_id)
 }
 
@@ -958,8 +1082,233 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_upload_scratch_cannot_escape_private_pending_directory() {
+        let cache = std::env::temp_dir().join(format!(
+            "terarelay-legacy-upload-stage-{}",
+            rand::random::<u128>()
+        ));
+        let stage_root = cache.join("drive").join("staging");
+        std::fs::create_dir_all(&stage_root).unwrap();
+        let owned = stage_root.join("pending-upload");
+        std::fs::create_dir(&owned).unwrap();
+        let mut pending = DrivePendingRecord {
+            id: "pending-upload".into(),
+            directory_id: None,
+            display_name: "test.bin".into(),
+            staging_path: owned.join(".pending").to_string_lossy().into_owned(),
+            size: 0,
+            format_version: 1,
+            backing_channel_id: 101,
+            base_entry_id: None,
+            encryption_version: 0,
+            crypto_id: None,
+            closed_at: Some(1),
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert_eq!(
+            owned_legacy_upload_scratch_dir(&cache, &pending).unwrap(),
+            owned
+        );
+        let scratch = owned.join("remote-0000000000000000-fixture.upload");
+        let file = create_private_upload_scratch(&scratch).unwrap();
+        assert!(
+            create_private_upload_scratch(&scratch).is_err(),
+            "scratch must be exclusive"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(file);
+        std::fs::remove_file(&scratch).unwrap();
+        let outside = cache.join("unrelated-user-directory");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"preserve").unwrap();
+        pending.staging_path = outside.join(".pending").to_string_lossy().into_owned();
+        assert!(owned_legacy_upload_scratch_dir(&cache, &pending).is_err());
+        pending.id = "../unrelated-user-directory".into();
+        assert!(owned_legacy_upload_scratch_dir(&cache, &pending).is_err());
+        #[cfg(unix)]
+        {
+            let link = stage_root.join("link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            pending.id = "link".into();
+            pending.staging_path = link.join(".pending").to_string_lossy().into_owned();
+            assert!(owned_legacy_upload_scratch_dir(&cache, &pending).is_err());
+            let symlink_file = owned.join("remote-0000000000000000-linked.upload");
+            std::os::unix::fs::symlink(outside.join("sentinel"), &symlink_file).unwrap();
+            assert!(create_private_upload_scratch(&symlink_file).is_err());
+        }
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        let source = include_str!("drive_stream.rs");
+        let upload = source
+            .split_once("pub async fn upload_plaintext_chunk(")
+            .unwrap()
+            .1
+            .split_once("async fn send_encoded_part_once(")
+            .unwrap()
+            .0;
+        let validate_before_channel = upload
+            .find("owned_legacy_upload_scratch_dir(&cache_root, &initial_pending)")
+            .unwrap();
+        let ensure_channel = upload
+            .find("ensure_pending_storage(app, state, db, pending_id)")
+            .unwrap();
+        let validate_after_channel = upload
+            .find("owned_legacy_upload_scratch_dir(&cache_root, &pending)")
+            .unwrap();
+        let create = upload
+            .find("create_private_upload_scratch(&temp_path)")
+            .unwrap();
+        assert!(validate_before_channel < ensure_channel);
+        assert!(ensure_channel < validate_after_channel && validate_after_channel < create);
+        assert!(!upload.contains("create_dir_all(&temp_dir)"));
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn finalized_cleanup_owns_only_exact_private_staging_subdirectories() {
+        let cache = std::env::temp_dir().join(format!(
+            "terarelay-final-cleanup-{}",
+            rand::random::<u128>()
+        ));
+        let stage_root = cache.join("drive").join("staging");
+        std::fs::create_dir_all(&stage_root).unwrap();
+        let owned = stage_root.join("pending-1");
+        std::fs::create_dir(&owned).unwrap();
+        let mut pending = DrivePendingRecord {
+            id: "pending-1".into(),
+            directory_id: None,
+            display_name: "test.bin".into(),
+            staging_path: owned.join(".pending").to_string_lossy().into_owned(),
+            size: 0,
+            format_version: 2,
+            backing_channel_id: -100123,
+            base_entry_id: None,
+            encryption_version: 0,
+            crypto_id: None,
+            closed_at: Some(1),
+            created_at: 0,
+            updated_at: 1,
+        };
+        assert_eq!(
+            owned_finalized_staging_dir(&cache, &pending).unwrap(),
+            owned
+        );
+        assert_eq!(
+            owned_cancelled_staging_dir(&cache, &pending, Some(&pending.staging_path)).unwrap(),
+            owned
+        );
+        assert!(owned_cancelled_staging_dir(&cache, &pending, None).is_err());
+        assert!(owned_cancelled_staging_dir(&cache, &pending, Some("/forged/other")).is_err());
+        let victim = cache.join("PersonalDocuments");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("must-stay"), b"keep").unwrap();
+        pending.staging_path = victim.join(".pending").to_string_lossy().into_owned();
+        assert!(owned_finalized_staging_dir(&cache, &pending).is_err());
+        pending.id = "../PersonalDocuments".into();
+        assert!(owned_finalized_staging_dir(&cache, &pending).is_err());
+        pending.id = "pending-1".into();
+        pending.staging_path = owned.join(".pending").to_string_lossy().into_owned();
+        #[cfg(unix)]
+        {
+            let link = stage_root.join("linked");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            pending.id = "linked".into();
+            pending.staging_path = link.join(".pending").to_string_lossy().into_owned();
+            assert!(owned_finalized_staging_dir(&cache, &pending).is_err());
+
+            // A forged intermediate `drive` symlink bypasses a leaf-only
+            // symlink check. Even real-looking staging/ID directories under
+            // the target must never become eligible for recursive cleanup.
+            let external_stage = victim.join("staging").join("pending-1");
+            std::fs::create_dir_all(&external_stage).unwrap();
+            std::fs::write(external_stage.join("must-stay"), b"external").unwrap();
+            let forged_cache = cache.join("forged-cache");
+            std::fs::create_dir(&forged_cache).unwrap();
+            std::os::unix::fs::symlink(&victim, forged_cache.join("drive")).unwrap();
+            pending.id = "pending-1".into();
+            pending.staging_path = forged_cache
+                .join("drive/staging/pending-1/.pending")
+                .to_string_lossy()
+                .into_owned();
+            assert!(owned_finalized_staging_dir(&forged_cache, &pending).is_err());
+            assert_eq!(
+                std::fs::read(external_stage.join("must-stay")).unwrap(),
+                b"external"
+            );
+
+            let alias = cache.join("cache-alias");
+            std::os::unix::fs::symlink(&forged_cache, &alias).unwrap();
+            pending.staging_path = alias
+                .join("drive/staging/pending-1/.pending")
+                .to_string_lossy()
+                .into_owned();
+            assert!(owned_finalized_staging_dir(&alias, &pending).is_err());
+        }
+        assert_eq!(std::fs::read(victim.join("must-stay")).unwrap(), b"keep");
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn encoded_upload_temp_is_removed_on_early_error_without_removing_pending_data() {
+        let root =
+            std::env::temp_dir().join(format!("terarelay-upload-guard-{}", rand::random::<u128>()));
+        std::fs::create_dir(&root).unwrap();
+        let pending = root.join("local-0001.chunk");
+        let temporary = root.join("remote-0001.upload");
+        std::fs::write(&pending, b"pending source").unwrap();
+        std::fs::write(&temporary, b"encoded scratch").unwrap();
+        let result: Result<(), String> = {
+            let _owned_upload = EncodedUploadTemp(temporary.clone());
+            Err("Telegram connection unavailable".to_string())
+        };
+        assert!(result.is_err());
+        assert!(
+            !temporary.exists(),
+            "Encoded scratch leaked on early return"
+        );
+        assert_eq!(std::fs::read(pending).unwrap(), b"pending source");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn encoded_upload_temp_is_removed_when_the_upload_task_is_cancelled() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-upload-cancel-{}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let pending = root.join("local-0001.chunk");
+        let temporary = root.join("remote-0001.upload");
+        std::fs::write(&pending, b"pending source").unwrap();
+        std::fs::write(&temporary, b"encoded scratch").unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let owned_path = temporary.clone();
+        let task = tokio::spawn(async move {
+            let _owned_upload = EncodedUploadTemp(owned_path);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !temporary.exists(),
+            "Encoded scratch leaked on cancellation"
+        );
+        assert_eq!(std::fs::read(pending).unwrap(), b"pending source");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn remote_part_plan_coalesces_crypto_blocks_within_staging_budget() {
-        assert!(DRIVE_REMOTE_PART_MAX_BLOCKS > 1);
+        const { assert!(DRIVE_REMOTE_PART_MAX_BLOCKS > 1) };
         let max_encoded = DRIVE_REMOTE_PART_MAX_BLOCKS
             * (crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE + DRIVE_ENCRYPTED_CHUNK_OVERHEAD);
         assert!(max_encoded < 256 * 1024 * 1024);

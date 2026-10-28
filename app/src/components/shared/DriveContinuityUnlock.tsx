@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Cloud, KeyRound, Loader2, LockKeyhole } from 'lucide-react';
 import { toast } from 'sonner';
-import type { DriveCryptoStatusLike } from '../../deviceContinuity';
+import { validateDriveCryptoStatus } from '../../deviceContinuity';
 
 interface DriveContinuityUnlockProps {
   open: boolean;
@@ -24,45 +24,82 @@ export function DriveContinuityUnlock({
   const [passphrase, setPassphrase] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+  const inFlightRef = useRef(false);
+  const dismissedRef = useRef(false);
+  const openRef = useRef(open);
+  openRef.current = open;
 
   useEffect(() => {
+    // Dismissal, sign-out and remount invalidate any older unlock response.
+    requestGenerationRef.current += 1;
+    if (open) {
+      dismissedRef.current = false;
+      // An earlier native unlock may still be running after dismissal.
+      // Keep it single-flight until its promise really settles.
+      setBusy(inFlightRef.current);
+    }
     if (!open) {
       setPassphrase('');
       setError(null);
       setBusy(false);
     }
+    return () => { requestGenerationRef.current += 1; };
   }, [open]);
 
   if (!open) return null;
 
   const dismiss = () => {
-    if (busy) return;
+    if (dismissedRef.current) return;
+    dismissedRef.current = true;
+    // Native unlock cannot be cancelled. Invalidate its UI result right now
+    // (before React rerenders), including when the native request is stuck.
+    ++requestGenerationRef.current;
+    // Preserve native in-flight ownership even after UI dismissal, so a
+    // reopened prompt cannot dispatch another overlapping native unlock.
     setPassphrase('');
     setError(null);
+    setBusy(false);
     onDismiss();
   };
 
   const unlock = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!passphrase || busy) return;
+    if (dismissedRef.current || !passphrase || busy || inFlightRef.current) return;
 
+    const generation = ++requestGenerationRef.current;
+    inFlightRef.current = true;
+    const submittedPassphrase = passphrase;
+    // Clear the input immediately; the native request holds the submitted value.
+    setPassphrase('');
     setBusy(true);
     setError(null);
     try {
-      const status = await invoke<DriveCryptoStatusLike>('cmd_drive_crypto_unlock', {
-        passphrase,
+      const response = await invoke<unknown>('cmd_drive_crypto_unlock', {
+        passphrase: submittedPassphrase,
       });
-      if (!status.unlocked) {
+      if (requestGenerationRef.current !== generation) return;
+      // Native IPC types are only compile-time promises: never claim an
+      // encrypted Drive unlocked from a truthy string or invalid state.
+      const status = validateDriveCryptoStatus(response);
+      if (!status.configured || !status.unlocked) {
         throw new Error('Drive remained locked after the unlock request');
       }
-      setPassphrase('');
       toast.success('TeraRelay Drive unlocked on this device');
       onUnlocked();
     } catch (unlockError) {
-      setError(String(unlockError));
-      setPassphrase('');
+      if (requestGenerationRef.current === generation) {
+        setError(String(unlockError));
+      }
     } finally {
-      setBusy(false);
+      // A stale native request still owns the single-flight lease until it
+      // actually finishes. The old response may release the busy indicator
+      // for a reopened prompt, but never show stale success/error UI.
+      inFlightRef.current = false;
+      if (requestGenerationRef.current === generation
+          || (openRef.current && !dismissedRef.current)) {
+        setBusy(false);
+      }
     }
   };
 
@@ -74,6 +111,12 @@ export function DriveContinuityUnlock({
         aria-modal="true"
         aria-labelledby="tr-continuity-title"
         aria-describedby="tr-continuity-description"
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            dismiss();
+          }
+        }}
       >
         <div className="tr-modal-icon" aria-hidden="true">
           {restoredFromRemote ? <Cloud size={26} /> : <LockKeyhole size={26} />}
@@ -121,7 +164,6 @@ export function DriveContinuityUnlock({
             <button
               type="button"
               className="tr-button tr-button--ghost"
-              disabled={busy}
               onClick={dismiss}
             >
               Later

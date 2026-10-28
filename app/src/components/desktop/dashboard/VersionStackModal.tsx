@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
     Download, Edit3, FilePlus2, Layers3, Loader2,
@@ -83,6 +83,8 @@ export function VersionStackModal({
     onMoveStack,
 }: VersionStackModalProps) {
     const { confirm } = useConfirm();
+    const dialogRef = useRef<HTMLDivElement>(null);
+    const closeButtonRef = useRef<HTMLButtonElement>(null);
     const [stack, setStack] = useState<FileStackView | null>(null);
     const [mode, setMode] = useState<Mode>(file.stack_id ? initialMode : 'add');
     const [addMethod, setAddMethod] = useState<'choose' | 'existing'>('choose');
@@ -94,6 +96,50 @@ export function VersionStackModal({
     const [labelDrafts, setLabelDrafts] = useState<Record<string, string>>({});
 
     useEscapeToClose(!busy, onClose);
+
+    useEffect(() => {
+        const active = document.activeElement;
+        const previousFocus = active instanceof HTMLElement && active !== document.body ? active : null;
+        const frame = requestAnimationFrame(() => closeButtonRef.current?.focus({ preventScroll: true }));
+        return () => {
+            cancelAnimationFrame(frame);
+            // The Add Version context-menu button is removed when the modal
+            // opens. If it no longer exists (or focus was already on body),
+            // return to this file's persistent More actions button instead.
+            const fileActionsLabel = `More actions for ${file.stack_name || file.name}`;
+            const fileActions = Array.from(document.querySelectorAll<HTMLButtonElement>(
+                'button[aria-label^="More actions for "]',
+            )).find(button => button.getAttribute('aria-label') === fileActionsLabel);
+            const returnTarget = previousFocus?.isConnected ? previousFocus : fileActions;
+            requestAnimationFrame(() => {
+                if (returnTarget?.isConnected) returnTarget.focus({ preventScroll: true });
+            });
+        };
+    }, []);
+
+    const trapVersionStackTab = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.key !== 'Tab') return;
+        const dialog = dialogRef.current;
+        if (!dialog) return;
+        const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        )).filter(element => element.getClientRects().length > 0);
+        if (focusable.length === 0) {
+            event.preventDefault();
+            dialog.focus();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !dialog.contains(active))) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
 
     const loadStack = async () => {
         if (!file.stack_id) {
@@ -398,19 +444,28 @@ export function VersionStackModal({
                 if (event.target === event.currentTarget && !busy) onClose();
             }}
         >
-            <div className="tr-modal flex max-h-[88vh] w-full max-w-[760px] flex-col overflow-hidden">
+            <div
+                ref={dialogRef}
+                tabIndex={-1}
+                onKeyDown={trapVersionStackTab}
+                className="tr-modal flex max-h-[88vh] w-full max-w-[760px] flex-col overflow-hidden"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="tr-version-stack-title"
+            >
                 <div className="tr-modal-header flex items-center gap-3 px-4 py-3.5 sm:px-5">
                     <div className="tr-modal-icon grid h-10 w-10 shrink-0 place-items-center">
                         <Layers3 className="h-5 w-5" />
                     </div>
                     <div className="min-w-0 flex-1">
-                        <h2 className="truncate text-base font-semibold text-telegram-text">{title}</h2>
+                        <h2 id="tr-version-stack-title" className="truncate text-base font-semibold text-telegram-text">{title}</h2>
                         <p className="text-xs text-telegram-subtext">
                             {stack ? 'Manage grouped files' : 'Add another file'}
                         </p>
                     </div>
                     {busy && <Loader2 className="h-4 w-4 animate-spin text-telegram-primary" />}
                     <button
+                        ref={closeButtonRef}
                         type="button"
                         onClick={onClose}
                         disabled={busy}
@@ -437,6 +492,7 @@ export function VersionStackModal({
                                         </div>
                                         <div className="flex gap-2">
                                             <input
+                                                aria-label="Stack name"
                                                 value={nameDraft}
                                                 onChange={event => setNameDraft(event.target.value)}
                                                 maxLength={512}
@@ -446,6 +502,7 @@ export function VersionStackModal({
                                                 onClick={saveStackName}
                                                 disabled={busy || !nameDraft.trim() || nameDraft.trim() === title}
                                                 className="grid h-10 w-10 place-items-center rounded-xl bg-telegram-primary text-white transition hover:brightness-110 disabled:opacity-35"
+                                                aria-label="Save stack name"
                                                 title="Save stack name"
                                             >
                                                 <Save className="h-4 w-4" />
@@ -485,6 +542,7 @@ export function VersionStackModal({
                                                         <button
                                                             onClick={() => onPreview(memberFile)}
                                                             className="rounded-lg p-2 text-telegram-subtext transition hover:bg-telegram-hover hover:text-telegram-primary"
+                                                            aria-label={`Preview ${displayFileName(memberFile.name)}`}
                                                             title="Preview this version"
                                                         >
                                                             <Play className="h-4 w-4" />
@@ -492,6 +550,7 @@ export function VersionStackModal({
                                                         <button
                                                             onClick={() => onDownload(memberFile)}
                                                             className="rounded-lg p-2 text-telegram-subtext transition hover:bg-telegram-hover hover:text-emerald-400"
+                                                            aria-label={`Download ${displayFileName(memberFile.name)}`}
                                                             title="Download this version"
                                                         >
                                                             <Download className="h-4 w-4" />
@@ -503,6 +562,7 @@ export function VersionStackModal({
                                                     <div className="mt-3 flex flex-col gap-2 border-t border-telegram-border/70 pt-3 sm:flex-row sm:items-center">
                                                         <div className="flex min-w-0 flex-1 gap-2">
                                                             <input
+                                                                aria-label={`Version label for ${displayFileName(memberFile.name)}`}
                                                                 value={labelDrafts[id] || ''}
                                                                 onChange={event => setLabelDrafts(prev => ({ ...prev, [id]: event.target.value }))}
                                                                 maxLength={64}
@@ -684,6 +744,7 @@ export function VersionStackModal({
                                                 value={search}
                                                 onChange={event => setSearch(event.target.value)}
                                                 placeholder="Search existing files"
+                                                aria-label="Search existing files"
                                                 className="tr-modal-input w-full py-2.5 pl-9 pr-3 text-sm"
                                             />
                                         </div>

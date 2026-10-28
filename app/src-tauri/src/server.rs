@@ -139,12 +139,234 @@ mod range_tests {
         assert_eq!(parse_range_header("items=0-1", 1_000), None);
         assert_eq!(parse_range_header("bytes=0-1", 0), None);
     }
+
+    #[test]
+    fn mp4_http_media_preserves_private_range_cache_until_decoder_fix() {
+        use super::logical_stream::media_stream_cache_control;
+
+        assert_eq!(
+            media_stream_cache_control("video/mp4"),
+            "private, max-age=120"
+        );
+        assert_eq!(
+            media_stream_cache_control("VIDEO/MP4"),
+            "private, max-age=120"
+        );
+        assert_eq!(
+            media_stream_cache_control("video/mp4; codecs=avc1"),
+            "private, max-age=120"
+        );
+        for other in [
+            "video/x-matroska",
+            "video/webm",
+            "image/jpeg",
+            "application/pdf",
+            "application/octet-stream",
+        ] {
+            assert_eq!(
+                media_stream_cache_control(other),
+                "private, max-age=120",
+                "unrelated media cannot lose its cache policy"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_signed_telegram_sizes_fail_before_http_streaming() {
+        assert_eq!(super::checked_stream_document_size(0_i64).unwrap(), 0);
+        assert_eq!(super::checked_stream_document_size(8192_i64).unwrap(), 8192);
+        assert_eq!(
+            super::checked_stream_document_size(i64::MAX).unwrap(),
+            i64::MAX as u64
+        );
+        assert!(super::checked_stream_document_size(-1_i64).is_err());
+        assert!(super::checked_stream_document_size(i64::MIN).is_err());
+
+        let source = include_str!("server.rs");
+        let shared = source
+            .rsplit_once("pub fn build_media_response(")
+            .unwrap()
+            .1
+            .split_once("struct LogicalStreamMedia")
+            .unwrap()
+            .0;
+        let parts = source
+            .rsplit_once("async fn resolve_stream_media(")
+            .unwrap()
+            .1
+            .split_once("fn build_logical_stream_response(")
+            .unwrap()
+            .0;
+        let video = source
+            .rsplit_once("fn build_logical_stream_response(")
+            .unwrap()
+            .1
+            .split_once("logical_stream::range_response(")
+            .unwrap()
+            .0;
+        for section in [shared, parts, video] {
+            assert!(
+                !section.contains("size() as u64")
+                    && section.contains("checked_stream_document_size("),
+                "all streaming routes must reject negative Telegram sizes before casting"
+            );
+        }
+    }
+
+    #[test]
+    fn cdn_seek_chunk_index_must_reject_i32_overflow() {
+        const CHUNK_BYTES: u64 = 65_536;
+        assert_eq!(super::checked_cdn_seek_chunk_index(0).unwrap(), 0);
+        assert_eq!(
+            super::checked_cdn_seek_chunk_index(CHUNK_BYTES * 8).unwrap(),
+            8
+        );
+        assert_eq!(
+            super::checked_cdn_seek_chunk_index(i32::MAX as u64 * CHUNK_BYTES).unwrap(),
+            i32::MAX
+        );
+        assert!(
+            super::checked_cdn_seek_chunk_index((i32::MAX as u64 + 1) * CHUNK_BYTES).is_err(),
+            "large Telegram seek offsets cannot wrap into an earlier download chunk"
+        );
+        assert!(super::checked_cdn_seek_chunk_index(u64::MAX).is_err());
+        let source = include_str!("server.rs");
+        let route = source
+            .rsplit_once("pub fn build_media_response(")
+            .unwrap()
+            .1
+            .split_once("struct LogicalStreamMedia")
+            .unwrap()
+            .0;
+        assert!(
+            route.contains("checked_cdn_seek_chunk_index(cdn_aligned_start)")
+                && !route.contains("(cdn_aligned_start / CHUNK_SIZE as u64) as i32"),
+            "direct HTTP range streaming must use checked Telegram chunk indices"
+        );
+    }
+
+    #[test]
+    fn single_document_http_stream_uses_error_propagating_range_guard() {
+        // Integration contract: the regular document/photo HTTP response
+        // must use the same byte-bounded, fallible stream path as logical
+        // multi-part media, not treat an incomplete Telegram read as EOF.
+        let source = include_str!("server.rs");
+        let direct = source
+            .rsplit_once("pub fn build_media_response(")
+            .unwrap()
+            .1
+            .split_once("struct LogicalStreamMedia")
+            .unwrap()
+            .0;
+        assert!(
+            direct.contains("logical_stream::bounded_chunks("),
+            "single-document stream must propagate download errors and short bodies"
+        );
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::attachment_content_disposition;
+    use actix_web::http::header::HeaderValue;
+
+    #[test]
+    fn ordinary_download_name_retains_compatible_ascii_fallback() {
+        let header = attachment_content_disposition("report (final).pdf");
+        assert_eq!(
+            header,
+            "attachment; filename=\"report (final).pdf\"; filename*=UTF-8''report%20%28final%29.pdf"
+        );
+        HeaderValue::from_str(&header).unwrap();
+    }
+
+    #[test]
+    fn malicious_and_utf8_filenames_cannot_inject_response_headers() {
+        let filename = "report\"; filename=evil\r\nX-Forged:yes/\\doc.txt";
+        let header = attachment_content_disposition(filename);
+        HeaderValue::from_str(&header).unwrap();
+        assert!(header.starts_with("attachment; filename=\""));
+        assert!(!header.contains('\r'));
+        assert!(!header.contains('\n'));
+        assert!(!header.contains("filename=evil"));
+        assert!(!header.contains("X-Forged:"));
+        assert!(!header.contains("/\\"));
+        assert!(header.contains("filename*=UTF-8''"));
+        assert!(header.contains("%22%3B"));
+        assert!(header.contains("%3D"));
+        assert_eq!(
+            attachment_content_disposition(""),
+            "attachment; filename=\"download\"; filename*=UTF-8''download"
+        );
+
+        let unicode = attachment_content_disposition("日本語.txt");
+        assert!(unicode.contains("filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.txt"));
+        HeaderValue::from_str(&unicode).unwrap();
+    }
+}
+
+/// Format a filename as a safe ASCII fallback and an RFC 5987 UTF-8 value.
+/// Never interpolate untrusted filenames directly into HTTP header syntax.
+fn attachment_content_disposition(filename: &str) -> String {
+    use std::fmt::Write;
+
+    // Reject path separators and control characters as download-name content.
+    let clean: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let clean = if clean.trim().is_empty() {
+        "download"
+    } else {
+        clean.as_str()
+    };
+
+    let fallback: String = clean
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '_' | '-' | '(' | ')') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let mut encoded = String::with_capacity(clean.len());
+    for byte in clean.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 /// Extra headers to inject into streaming responses (e.g. Cache-Control, Content-Disposition).
 pub struct StreamingExtras {
     pub extra_headers: Vec<(&'static str, String)>,
     pub log_label: &'static str,
+}
+
+// Telegram document sizes are signed. A negative value is invalid
+// metadata, not a multi-exabyte HTTP Content-Length or video part size.
+fn checked_stream_document_size<T: TryInto<u64>>(size: T) -> Result<u64, &'static str> {
+    size.try_into()
+        .map_err(|_| "Invalid Telegram document size")
+}
+
+// Grammers indexes 64 KiB chunks with a signed 32-bit offset. Never wrap
+// a large HTTP byte-range seek into an unrelated download chunk.
+fn checked_cdn_seek_chunk_index(offset: u64) -> Result<i32, &'static str> {
+    i32::try_from(offset / 65_536)
+        .map_err(|_| "Requested media offset exceeds Telegram download limits")
 }
 
 /// Build a streaming HTTP response for a Telegram media file with optional byte-range support.
@@ -158,7 +380,10 @@ pub fn build_media_response(
     extras: StreamingExtras,
 ) -> HttpResponse {
     let size = match media {
-        Media::Document(d) => Some(d.size() as u64),
+        Media::Document(d) => match checked_stream_document_size(d.size()) {
+            Ok(size) => Some(size),
+            Err(message) => return HttpResponse::BadGateway().body(message),
+        },
         // Telegram photos don't expose one stable document size through this
         // media abstraction. Stream them chunked instead of advertising
         // Content-Length: 0, which makes browsers treat the response as empty.
@@ -239,7 +464,10 @@ pub fn build_media_response(
         let cdn_aligned_start = (start_byte / CDN_ALIGNMENT) * CDN_ALIGNMENT;
 
         // 2) Compute how many 64 KB chunks to skip to reach that boundary.
-        let chunk_index = (cdn_aligned_start / CHUNK_SIZE as u64) as i32;
+        let chunk_index = match checked_cdn_seek_chunk_index(cdn_aligned_start) {
+            Ok(index) => index,
+            Err(message) => return HttpResponse::BadGateway().body(message),
+        };
 
         // Always set chunk size for predictable download behaviour.
         download_iter = download_iter.chunk_size(CHUNK_SIZE);
@@ -268,59 +496,23 @@ pub fn build_media_response(
         );
     }
 
+    // Convert Grammers' fallible download iterator into the same bounded
+    // byte stream used by logical multi-part media. That shared path
+    // propagates Telegram errors and incomplete bodies instead of treating
+    // them as a clean EOF after advertising Content-Length.
     let label = extras.log_label;
-    let stream = async_stream::stream! {
-        let mut skipped: usize = 0;
-        let mut total_yielded: u64 = 0;
-
-        while let Some(chunk) = download_iter.next().await.transpose() {
-            match chunk {
-                Ok(data) => {
-                    let mut data_slice = data;
-
-                    if skipped < bytes_to_skip {
-                        let to_skip = bytes_to_skip - skipped;
-                        if data_slice.len() <= to_skip {
-                            skipped += data_slice.len();
-                            continue;
-                        } else {
-                            data_slice = data_slice[to_skip..].to_vec();
-                            skipped = bytes_to_skip;
-                        }
-                    }
-
-                    if let Some(content_length) = content_length {
-                        if total_yielded + data_slice.len() as u64 > content_length {
-                            let allowed = (content_length - total_yielded) as usize;
-                            if allowed > 0 {
-                                yield Ok::<_, actix_web::Error>(web::Bytes::from(data_slice[..allowed].to_vec()));
-                                total_yielded += allowed as u64;
-                            }
-                            break;
-                        } else {
-                            let len = data_slice.len() as u64;
-                            yield Ok::<_, actix_web::Error>(web::Bytes::from(data_slice));
-                            total_yielded += len;
-                            if total_yielded >= content_length {
-                                break;
-                            }
-                        }
-                    } else {
-                        // Unknown-size media (notably Telegram photos): stream
-                        // until Telegram naturally ends the iterator.
-                        let len = data_slice.len() as u64;
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(data_slice));
-                        total_yielded += len;
-                    }
-                }
-                Err(e) => {
-                    log::error!("{} stream error: {}", label, e);
-                    break;
-                }
+    let source = futures::stream::unfold(Some(download_iter), move |download| async move {
+        let mut download = download?;
+        match download.next().await {
+            Ok(Some(data)) => Some((Ok(data), Some(download))),
+            Ok(None) => None,
+            Err(error) => {
+                log::error!("{} stream error: {}", label, error);
+                Some((Err(error), None))
             }
         }
-        log::debug!("{} stream completed (yielded: {})", label, total_yielded);
-    };
+    });
+    let stream = logical_stream::bounded_chunks(source, bytes_to_skip as u64, content_length);
 
     let mut resp = if is_range {
         let total_size = size.expect("range responses require a known size");
@@ -345,16 +537,14 @@ pub fn build_media_response(
     resp.insert_header(("Accept-Ranges", "bytes"));
 
     if let Some(fname) = filename {
-        resp.insert_header((
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", fname),
-        ));
+        resp.insert_header(("Content-Disposition", attachment_content_disposition(fname)));
     }
 
     for (key, val) in &extras.extra_headers {
         resp.insert_header((*key, val.clone()));
     }
-
+    // Keep caller-specific download/share headers intact. The authenticated
+    // /stream path applies its bounded private cache policy separately.
     resp.streaming(stream)
 }
 
@@ -434,7 +624,8 @@ async fn resolve_stream_media(
             format!("Video part {} has no media", id)
         })?;
         if let Media::Document(document) = &media {
-            let size = document.size() as u64;
+            let size = checked_stream_document_size(document.size())
+                .map_err(|error| format!("Video part {id}: {error}"))?;
             let stored_name = if message.text().is_empty() {
                 document.name()
             } else {
@@ -517,19 +708,26 @@ fn build_logical_stream_response(
             &media.mime,
             None,
             StreamingExtras {
-                extra_headers: vec![("Cache-Control", "private, max-age=120".to_string())],
+                extra_headers: vec![(
+                    "Cache-Control",
+                    logical_stream::media_stream_cache_control(&media.mime).to_string(),
+                )],
                 log_label: "Stream",
             },
         );
     }
-    let sizes: Vec<u64> = media
+    let sizes: Vec<u64> = match media
         .parts
         .iter()
         .map(|part| match part {
-            Media::Document(document) => document.size() as u64,
-            _ => 0,
+            Media::Document(document) => checked_stream_document_size(document.size()),
+            _ => Ok(0),
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(sizes) => sizes,
+        Err(message) => return HttpResponse::BadGateway().body(message),
+    };
     let client = client.clone();
     logical_stream::range_response(&sizes, &media.mime, req, move |ranges| {
         async_stream::stream! {
@@ -678,47 +876,40 @@ fn mime_type_from_media(media: &Media) -> String {
     }
 }
 
+/// Reserve the exact IPv4 endpoint before any clients receive its configuration.
+/// Keep the preferred port when available; another listener must never receive
+/// this session's token merely because it occupied our usual port.
+pub fn bind_stream_listener(port: u16) -> std::io::Result<TcpListener> {
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            log::warn!(
+                "Streaming port {} is occupied; reserving another IPv4 loopback port",
+                port
+            );
+            TcpListener::bind(("127.0.0.1", 0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn start_server(
     state: Arc<TelegramState>,
-    port: u16,
+    listener: TcpListener,
     token: String,
     db_pool: crate::db::DbConnection,
     transcode_manager: Arc<TranscodeManager>,
+    fmp4_remux: crate::fmp4_remux::Fmp4RemuxState,
 ) -> std::io::Result<actix_web::dev::Server> {
+    let port = listener.local_addr()?.port();
     let state_data = web::Data::new(state);
     let token_data = web::Data::new(StreamTokenData { token });
     let db_data = web::Data::new(db_pool);
     let parts_cache = web::Data::new(logical_stream::PartCache::default());
     let transcode_data = web::Data::new(transcode_manager);
+    let fmp4_data = web::Data::new(fmp4_remux);
 
     log::info!("Starting Streaming Server on port {}", port);
-
-    // Bind the listener to 127.0.0.1 explicitly.
-    // The streaming server is only accessed from the local frontend — binding
-    // to 0.0.0.0 is unnecessary and can trigger firewall prompts on Windows.
-    // 127.0.0.1 is the most universally reliable loopback address across all
-    // platforms (Windows, macOS, Linux) and pairs correctly with the "localhost"
-    // hostname used by the client (localhost → 127.0.0.1 is the standard mapping).
-    let ipv4_addr = format!("127.0.0.1:{}", port);
-    let listener = match TcpListener::bind(&ipv4_addr) {
-        Ok(l) => {
-            log::info!("Streaming Server listening on {} (IPv4)", ipv4_addr);
-            l
-        }
-        Err(e) => {
-            log::warn!(
-                "IPv4 loopback bind failed ({}), falling back to IPv6 loopback",
-                e
-            );
-            let ipv6_addr = format!("[::1]:{}", port);
-            let l = TcpListener::bind(&ipv6_addr)?;
-            log::info!(
-                "Streaming Server listening on {} (IPv6 loopback)",
-                ipv6_addr
-            );
-            l
-        }
-    };
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
@@ -743,6 +934,7 @@ pub async fn start_server(
             .app_data(db_data.clone())
             .app_data(parts_cache.clone())
             .app_data(transcode_data.clone())
+            .app_data(fmp4_data.clone())
             .service(stream_media)
             .service(serve_subtitle)
             .configure(crate::share_routes::configure_share_routes)

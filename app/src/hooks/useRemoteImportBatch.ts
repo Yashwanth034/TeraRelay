@@ -101,7 +101,20 @@ export function useRemoteImportBatch(
         await setBatches(current => {
             const exists = current.some(candidate => candidate.id === batch.id);
             return exists
-                ? current.map(candidate => candidate.id === batch.id ? batch : candidate)
+                ? current.map(candidate => {
+                    if (candidate.id !== batch.id) return candidate;
+                    if (candidate.phase === 'cancelled' || cancelledRef.current.has(batch.id)) return candidate;
+                    return {
+                        ...batch,
+                        stackGroups: batch.phase === 'analyzing' ? candidate.stackGroups : batch.stackGroups,
+                        entries: batch.entries.map(entry => {
+                            const latest = candidate.entries.find(value => value.id === entry.id);
+                            if (latest?.phase === 'skipped' || latest?.phase === 'cancelled') return latest;
+                            return batch.phase === 'analyzing' && latest
+                                ? { ...entry, selectedIds: latest.selectedIds } : entry;
+                        }),
+                    };
+                })
                 : [...current, batch];
         });
     }, [setBatches]);
@@ -113,7 +126,8 @@ export function useRemoteImportBatch(
         let updated: RemoteImportBatch | undefined;
         await setBatches(current => current.map(batch => {
             if (batch.id !== batchId) return batch;
-            updated = update(batch);
+            const next = update(batch);
+            updated = (cancelledRef.current.has(batchId) || batch.phase === 'cancelled') && next.phase !== 'cancelled' ? batch : next;
             return updated;
         }));
         if (!updated) throw new Error('Remote Import batch no longer exists');
@@ -176,8 +190,9 @@ export function useRemoteImportBatch(
                 return remoteImport.reanalyzeSource(prepared.id, { defaultSelection: false });
             },
             persistOne,
+            () => getBatch(initial.id),
         );
-    }, [activeFolderId, initialized, persistOne, remoteImport]);
+    }, [activeFolderId, getBatch, initialized, persistOne, remoteImport]);
 
     const resumeBatchAnalysis = useCallback(async (batchId: string): Promise<RemoteImportBatch> => {
         const batch = getBatch(batchId);
@@ -193,6 +208,7 @@ export function useRemoteImportBatch(
                 return remoteImport.reanalyzeSource(prepared.id, { defaultSelection: false });
             },
             persistOne,
+            () => getBatch(batchId),
         );
     }, [getBatch, persistOne, remoteImport]);
 
@@ -483,6 +499,7 @@ export function useRemoteImportBatch(
         batchId: string,
         entry: RemoteImportBatchEntry,
     ): Promise<RemoteImportBatchEntry> => {
+        if (cancelledRef.current.has(batchId) || getBatch(batchId)?.phase === 'cancelled') return { ...entry, phase: 'cancelled' };
         if (!entry.jobId) return { ...entry, phase: 'error', error: 'Analyze this source before importing it' };
         let job = remoteImport.getRemoteImportJob(entry.jobId);
         if (!job?.analysis) return { ...entry, phase: 'error', error: 'Source analysis is unavailable' };
@@ -548,6 +565,7 @@ export function useRemoteImportBatch(
                 batch,
                 entry => runEntry(batchId, entry),
                 persistOne,
+                () => getBatch(batchId),
             );
             if (completed.phase !== 'cancelled') {
                 try {
@@ -615,14 +633,6 @@ export function useRemoteImportBatch(
         const active = batch.activeEntryIndex === null
             ? undefined
             : batch.entries.find(entry => entry.ordinal === batch.activeEntryIndex);
-        if (active?.jobId) {
-            const job = remoteImport.getRemoteImportJob(active.jobId);
-            if (job?.uploadQueueIds.length) {
-                for (const queueId of job.uploadQueueIds) cancelUploadItem?.(queueId);
-            } else {
-                await remoteImport.cancelJob(active.jobId).catch(() => false);
-            }
-        }
         await updateBatch(batchId, current => ({
             ...current,
             phase: 'cancelled',
@@ -633,6 +643,14 @@ export function useRemoteImportBatch(
             error: undefined,
             updatedAt: Date.now(),
         }));
+        if (active?.jobId) {
+            const job = remoteImport.getRemoteImportJob(active.jobId);
+            if (job?.uploadQueueIds.length) {
+                for (const queueId of job.uploadQueueIds) cancelUploadItem?.(queueId);
+            } else {
+                await remoteImport.cancelJob(active.jobId).catch(() => false);
+            }
+        }
     }, [cancelUploadItem, getBatch, remoteImport, updateBatch]);
 
     return {

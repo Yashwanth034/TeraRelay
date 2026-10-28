@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { X, Link, Copy, Check, Shield, Clock, AlertCircle, Share2 } from 'lucide-react';
 import { TelegramFile, ShareInfo } from '../../../types';
 import { invoke } from '@tauri-apps/api/core';
 import { motion, AnimatePresence } from 'framer-motion';
-import { nativeShareOrCopy } from '../../../utils';
+import { nativeShareOrCopy, copyToClipboard } from '../../../utils';
 import { useTranslation } from 'react-i18next';
 import { useEscapeToClose } from '../../../hooks/useEscapeToClose';
 
@@ -27,10 +27,16 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
     const [shareInfo, setShareInfo] = useState<ShareInfo | null>(null);
     const [copied, setCopied] = useState(false);
     const [customDomain, setCustomDomain] = useState('');
+    const generatePendingRef = useRef(false);
 
-    useEscapeToClose(true, onClose, loading);
+    const closeIfIdle = () => {
+        if (!generatePendingRef.current) onClose();
+    };
+    useEscapeToClose(true, closeIfIdle, loading);
 
     const handleGenerate = async () => {
+        if (generatePendingRef.current) return;
+        generatePendingRef.current = true;
         setLoading(true);
         setError(null);
         try {
@@ -39,14 +45,18 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
             else if (expiryType === '1d') expiryHours = 24;
             else if (expiryType === '7d') expiryHours = 168;
             else if (expiryType === 'custom') {
-                const parsed = parseInt(customHours, 10);
-                if (isNaN(parsed) || parsed <= 0) {
-                    throw new Error('Please enter a valid number of hours');
+                const input = customHours.trim();
+                const parsed = Number(input);
+                if (!/^[0-9]+$/.test(input) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+                    throw new Error('Please enter a valid positive whole number of hours');
                 }
                 expiryHours = parsed;
             }
 
-            const pwdParam = requirePassword && password.trim() ? password : null;
+            if (requirePassword && !password.trim()) {
+                throw new Error('Enter a password to protect this share link');
+            }
+            const pwdParam = requirePassword ? password : null;
 
             const res = await invoke<ShareInfo>('cmd_create_share', {
                 folderId,
@@ -61,6 +71,7 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
         } catch (err: any) {
             setError(err.toString());
         } finally {
+            generatePendingRef.current = false;
             setLoading(false);
         }
     };
@@ -79,34 +90,39 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
         return shareInfo.link;
     };
 
-    const handleCopy = () => {
+    const copyShareLink = async (link: string): Promise<void> => {
+        await copyToClipboard(link);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    const handleCopy = async () => {
         const link = getDisplayLink();
-        if (link) {
-            navigator.clipboard.writeText(link);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
+        if (!link) return;
+        setError(null);
+        setCopied(false);
+        try {
+            await copyShareLink(link);
+        } catch {
+            setError('Could not copy share link. Select and copy it manually.');
         }
     };
 
     // Native Android/iOS share sheet via Web Share API
     const handleNativeShare = () => {
         if (!shareInfo) return;
-        nativeShareOrCopy(file.name, file.sizeStr, getDisplayLink(), () => {
-            navigator.clipboard.writeText(getDisplayLink());
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
-        });
+        void nativeShareOrCopy(file.name, file.sizeStr, getDisplayLink(), copyShareLink);
     };
 
     return (
-        <div className="tr-modal-backdrop fixed inset-0 z-[100] flex items-center justify-center p-4" onClick={onClose}>
-            <div className="tr-modal w-full max-w-[440px] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150" onClick={e => e.stopPropagation()}>
+        <div className="tr-modal-backdrop fixed inset-0 z-[100] flex items-center justify-center p-4" onClick={closeIfIdle}>
+            <div className="tr-modal w-full max-w-[440px] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150" role="dialog" aria-modal="true" aria-busy={loading} aria-labelledby="tr-share-dialog-title" onClick={e => e.stopPropagation()}>
                 <div className="tr-modal-header p-4 flex justify-between items-center">
-                    <h3 className="text-telegram-text font-medium flex items-center gap-2">
+                    <h3 id="tr-share-dialog-title" className="text-telegram-text font-medium flex items-center gap-2">
                         <Link className="w-5 h-5 text-telegram-primary" />
                         {t('share.title')}
                     </h3>
-                    <button onClick={onClose} className="tr-modal-close" aria-label="Close">
+                    <button type="button" onClick={closeIfIdle} disabled={loading} className="tr-modal-close" aria-label="Close">
                         <X className="w-4 h-4" />
                     </button>
                 </div>
@@ -130,6 +146,8 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
                                     <button
                                         type="button"
                                         onClick={() => setRequirePassword(!requirePassword)}
+                                        aria-label={t('share.password_protection')}
+                                        aria-pressed={requirePassword}
                                         className={`relative w-10 h-5.5 rounded-full transition-colors duration-200 shrink-0 ${
                                             requirePassword ? 'bg-telegram-primary' : 'bg-telegram-border'
                                         }`}
@@ -153,6 +171,7 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
                                         >
                                             <input
                                                 type="password"
+                                                aria-label={t('share.enter_password')}
                                                 placeholder={t('share.enter_password')}
                                                 value={password}
                                                 onChange={(e) => setPassword(e.target.value)}
@@ -212,14 +231,15 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
                             </div>
 
                             {error && (
-                                <div className="tr-modal-note tr-modal-note--danger flex gap-2 items-start">
+                                <div role="alert" className="tr-modal-note tr-modal-note--danger flex gap-2 items-start">
                                     <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                                     <span>{error}</span>
                                 </div>
                             )}
 
                             <button
-                                onClick={handleGenerate}
+                                type="button"
+                                onClick={() => { void handleGenerate(); }}
                                 disabled={loading}
                                 className="tr-button tr-button--primary tr-button--md w-full mt-4"
                             >
@@ -237,16 +257,19 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
 
                             {/* Shareable Link Display */}
                             <div className="space-y-1.5">
-                                <label className="text-xs font-semibold text-telegram-subtext">{t('files.share_link')}</label>
+                                <label htmlFor="tr-share-link-value" className="text-xs font-semibold text-telegram-subtext">{t('files.share_link')}</label>
                                 <div className="flex gap-2">
                                     <input
+                                        id="tr-share-link-value"
                                         type="text"
                                         readOnly
                                         value={getDisplayLink()}
                                         className="tr-modal-input flex-1 px-3 py-2 text-sm select-all"
                                     />
                                     <button
-                                        onClick={handleCopy}
+                                        type="button"
+                                        onClick={() => { void handleCopy(); }}
+                                        aria-label={copied ? 'Copied share link' : t('common.copy_share_link')}
                                         className={`px-3 py-2 rounded-lg border flex items-center justify-center transition-all ${
                                             copied 
                                                 ? 'bg-emerald-500 border-emerald-500 text-white' 
@@ -256,6 +279,8 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
                                         {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                                     </button>
                                 </div>
+                                {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
+                                <span role="status" className="sr-only">{copied ? 'Share link copied' : ''}</span>
                             </div>
 
                             {/* Native Share Button (Android/iOS) */}
@@ -292,7 +317,8 @@ export function ShareDialog({ file, folderId, onClose }: ShareDialogProps) {
                             </>)}
 
                             <button
-                                onClick={onClose}
+                                type="button"
+                                onClick={closeIfIdle}
                                 className="tr-button tr-button--secondary tr-button--md w-full"
                             >
                                 {t('share.done')}

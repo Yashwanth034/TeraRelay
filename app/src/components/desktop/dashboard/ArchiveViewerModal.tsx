@@ -314,6 +314,9 @@ export function ArchiveViewerModal({
 
             <div
                 className="tr-modal w-full max-w-[560px] max-h-[74vh] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="tr-archive-viewer-title"
                 onClick={e => e.stopPropagation()}
             >
                 {/* Header */}
@@ -321,7 +324,7 @@ export function ArchiveViewerModal({
                     <div className="flex items-center gap-3 min-w-0">
                         <FileArchive className="w-6 h-6 text-telegram-primary shrink-0" />
                         <div className="min-w-0">
-                            <h3 className="text-telegram-text font-medium truncate">{file.name}</h3>
+                            <h3 id="tr-archive-viewer-title" className="text-telegram-text font-medium truncate">{file.name}</h3>
                             <p className="text-xs text-telegram-subtext">{file.sizeStr}</p>
                         </div>
                     </div>
@@ -333,6 +336,7 @@ export function ArchiveViewerModal({
                         )}
                         <button
                             onClick={onClose}
+                            aria-label="Close archive"
                             className="tr-modal-close"
                         >
                             <X className="w-5 h-5" />

@@ -186,7 +186,7 @@ export async function nativeShareOrCopy(
     name: string,
     sizeStr: string,
     link: string,
-    onCopy?: (link: string) => void
+    onCopy?: (link: string) => Promise<void> | void
 ): Promise<void> {
     const canShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
     if (canShare) {
@@ -197,18 +197,18 @@ export async function nativeShareOrCopy(
                 url: link,
             });
             return;
-        } catch (e: any) {
-            if (e?.name !== 'AbortError') {
-                toast.error('Share failed, but link has been copied');
-            }
+        } catch (e: unknown) {
+            // Cancelling the native share sheet must not silently copy a link.
+            if (e && typeof e === 'object' && 'name' in e && e.name === 'AbortError') return;
         }
     }
-    // Fallback: copy to clipboard
-    if (onCopy) {
-        onCopy(link);
-    } else {
-        navigator.clipboard.writeText(link);
+    try {
+        // A rejected clipboard permission request must never display success.
+        if (onCopy) await onCopy(link);
+        else await copyToClipboard(link);
         toast.success('Link copied to clipboard');
+    } catch {
+        toast.error('Could not copy share link. Select and copy it manually.');
     }
 }
 

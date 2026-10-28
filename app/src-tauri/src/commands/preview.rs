@@ -234,7 +234,7 @@ pub async fn cmd_get_preview(
                     // the download and renamed its .part file to the final path.
                     if tokio::fs::metadata(&save_path)
                         .await
-                        .map_or(false, |m| m.len() > 0)
+                        .is_ok_and(|m| m.len() > 0)
                     {
                         log::info!(
                             "Preview already downloaded by concurrent request (final file exists)"
@@ -261,7 +261,7 @@ pub async fn cmd_get_preview(
                                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                         if tokio::fs::metadata(&save_path)
                                             .await
-                                            .map_or(false, |m| m.len() > 0)
+                                            .is_ok_and(|m| m.len() > 0)
                                         {
                                             log::info!(
                                                 "Preview already downloaded by concurrent request"
@@ -316,7 +316,7 @@ pub async fn cmd_get_preview(
                                                 {
                                                     if tokio::fs::metadata(&save_path)
                                                         .await
-                                                        .map_or(false, |m| m.len() > 0)
+                                                        .is_ok_and(|m| m.len() > 0)
                                                     {
                                                         log::info!("Preview already downloaded by concurrent request");
                                                         download_ok = true;
@@ -403,7 +403,20 @@ pub async fn cmd_clean_preview_cache(app_handle: tauri::AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-pub async fn cmd_clean_cache(app_handle: tauri::AppHandle) -> Result<(), String> {
+pub async fn cmd_clean_cache(
+    app_handle: tauri::AppHandle,
+    fast_state: State<'_, crate::tdlib_fast::TdlibFastState>,
+    db_pool: State<'_, crate::db::DbConnection>,
+) -> Result<(), String> {
+    if !crate::tdlib_fast::clean_file_cache_if_idle(
+        &app_handle,
+        fast_state.inner(),
+        db_pool.inner(),
+    )
+    .await?
+    {
+        return Err("Some file caches are protected by unfinished transfers or unavailable TDLib authorization. Finish/resume transfers before clearing them.".to_string());
+    }
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
@@ -530,7 +543,7 @@ pub async fn cmd_get_thumbnail(
                 // the download and renamed its .part file to the final path.
                 if tokio::fs::metadata(&save_path)
                     .await
-                    .map_or(false, |m| m.len() > 0)
+                    .is_ok_and(|m| m.len() > 0)
                 {
                     download_ok = true;
                 }

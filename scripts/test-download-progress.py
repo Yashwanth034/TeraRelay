@@ -98,6 +98,7 @@ class DownloadProgressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="terarelay-download-test-") as folder:
             root = Path(folder)
             w = Worker()
+            w.files_dir = root / "tdlib-cache"
             w.stats_calls = 0
             w.td = td_type(root, clock, cached)
             chunks = [{"message_id": k, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}

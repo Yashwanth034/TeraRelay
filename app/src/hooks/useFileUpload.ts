@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -12,6 +12,8 @@ import { useTransferMethod } from '../context/TransferMethodContext';
 import { useUploadSuggestion, type UploadPreflightResult } from '../context/UploadSuggestionContext';
 import type { Store } from '@tauri-apps/plugin-store';
 import { normalizeUploadQueue, useRecoverableTransferQueue } from '../transferQueue';
+import { validateDriveSyncResult } from '../deviceContinuity';
+import { subscribeToVerifiedDriveSync } from '../driveSyncSignal';
 import {
     recordRemoteImportUploadOutcome,
     type PreparedImportInput,
@@ -88,6 +90,71 @@ export function useFileUpload(
     const cancelledRef = useRef<Set<string>>(new Set());
     const pausedRef = useRef<Set<string>>(new Set());
     const activeIdsRef = useRef<Set<string>>(new Set());
+    const driveSyncNoticeRef = useRef({ latestRequest: 0, warningShown: false, mounted: true });
+    const driveSyncRetryInFlightRef = useRef(false);
+    const [driveSyncWarning, setDriveSyncWarning] = useState<string | null>(null);
+    const [driveSyncRetryBusy, setDriveSyncRetryBusy] = useState(false);
+    useEffect(() => {
+        driveSyncNoticeRef.current.mounted = true;
+        const unsubscribe = subscribeToVerifiedDriveSync(() => {
+            if (!driveSyncNoticeRef.current.mounted) return;
+            // A clean status verified by the toolbar supersedes delayed
+            // older upload sync responses, even if they fail afterward.
+            ++driveSyncNoticeRef.current.latestRequest;
+            driveSyncNoticeRef.current.warningShown = false;
+            setDriveSyncWarning(null);
+        });
+        return () => {
+            driveSyncNoticeRef.current.mounted = false;
+            unsubscribe();
+        };
+    }, []);
+    // A local Drive finalize is durable before metadata publication reaches
+    // Telegram. Only the latest verified sync result can clear a warning;
+    // failed, dirty and QA-local responses must never appear cloud-synced.
+    const requestDriveMetadataPublication = (manualRetry = false) => {
+        // The toolbar notification survives completed upload-queue removal,
+        // but an explicit Retry must never dispatch overlapping native syncs.
+        if (manualRetry) {
+            if (driveSyncRetryInFlightRef.current) return;
+            driveSyncRetryInFlightRef.current = true;
+            setDriveSyncRetryBusy(true);
+        }
+        const request = ++driveSyncNoticeRef.current.latestRequest;
+        void invoke<unknown>('cmd_drive_sync_metadata').then(raw => {
+            const result = validateDriveSyncResult(raw);
+            const notice = driveSyncNoticeRef.current;
+            if (!notice.mounted || request !== notice.latestRequest) return;
+            if (!result.dirty && result.source !== 'qa-local') {
+                notice.warningShown = false;
+                setDriveSyncWarning(null);
+                if (manualRetry) toast.success('Drive metadata synchronization verified.');
+                return;
+            }
+            const warning = result.source === 'qa-local'
+                ? 'Drive files are saved locally in QA mode; Telegram metadata is not synchronized.'
+                : 'Drive files are saved locally, but metadata is still waiting for Telegram sync.';
+            setDriveSyncWarning(warning);
+            if (!notice.warningShown) {
+                notice.warningShown = true;
+                toast.warning(warning + ' Use Sync on the Drive toolbar.');
+            }
+        }).catch(() => {
+            const notice = driveSyncNoticeRef.current;
+            if (!notice.mounted || request !== notice.latestRequest) return;
+            const warning = 'Drive files are saved locally, but Telegram metadata synchronization is unverified.';
+            setDriveSyncWarning(warning);
+            if (!notice.warningShown) {
+                notice.warningShown = true;
+                toast.warning(warning + ' Retry Sync on the Drive toolbar.');
+            }
+        }).finally(() => {
+            if (manualRetry) {
+                driveSyncRetryInFlightRef.current = false;
+                if (driveSyncNoticeRef.current.mounted) setDriveSyncRetryBusy(false);
+            }
+        });
+    };
     const { ensureFastTransferReady } = useFastTransferAuth();
     const { chooseTransferMethod } = useTransferMethod();
     const { reviewUploadSuggestion } = useUploadSuggestion();
@@ -156,6 +223,10 @@ export function useFileUpload(
 
         const enqueueDriveUpload = (payload: DriveStagedPayload) => {
             if (disposed) return;
+            // New synthetic writes have no assigned Telegram storage. Keep their
+            // real local staging bytes readable, just like QA replacement edits;
+            // a mock upload cannot provide remote content after finalization.
+            if (qaFeatureATest && payload.folder_id === 0) return;
             setUploadQueue(queue => {
                 if (queue.some(item => item.drivePendingId === payload.pending_id)) {
                     return queue;
@@ -317,9 +388,7 @@ export function useFileUpload(
                             pendingId: workingItem.drivePendingId,
                             logicalFileId: preflight.exact_duplicate.logical_file_id,
                         });
-                        void invoke('cmd_drive_sync_metadata').catch(error => {
-                            console.warn('[Drive] Metadata sync will retry later:', error);
-                        });
+                        requestDriveMetadataPublication();
                         const next = queueRef.current.filter(i => i.id !== workingItem.id);
                         setUploadQueue(next);
                         await persist(next);
@@ -478,9 +547,7 @@ export function useFileUpload(
                     // Local filesystem state is already durable. Cross-device
                     // metadata publication is retried by the background Drive
                     // sync loop if Telegram is temporarily unavailable.
-                    void invoke('cmd_drive_sync_metadata').catch(error => {
-                        console.warn('[Drive] Metadata sync will retry later:', error);
-                    });
+                    requestDriveMetadataPublication();
                 }
 
                 // Version grouping is deliberately a post-upload metadata step.
@@ -556,7 +623,9 @@ export function useFileUpload(
                     } : i));
                 }
             } else {
-                const errMsg = completed ? `Upload completed, but queue save failed: ${e}` : String(e);
+                const errMsg = completed
+                    ? `Telegram upload finished, but finalization or queue persistence needs attention: ${e}`
+                    : String(e);
                 if (!completed && errMsg.includes('TDLIB_SETUP_CANCELLED')) {
                     setUploadQueue(q => q.map(i => i.id === workingItem.id ? {
                         ...i, status: 'paused',
@@ -614,10 +683,10 @@ export function useFileUpload(
      * queue. They are local files now, never legacy URL uploads. One transfer
      * engine choice applies to the whole import batch.
      */
-    const enqueuePreparedImports = async (inputs: PreparedImportInput[]): Promise<string[]> => {
-        if (!inputs.length) return [];
+    const enqueuePreparedImports = async (inputs: PreparedImportInput[], options?: { isCancelled: () => boolean }): Promise<string[]> => {
+        if (!inputs.length || options?.isCancelled()) return [];
         const transferEngine = await chooseTransferMethod('upload');
-        if (!transferEngine) return [];
+        if (!transferEngine || options?.isCancelled()) return [];
 
         const newItems: QueueItem[] = inputs.map(input => ({
             id: `remote-${Math.random().toString(36).slice(2, 11)}`,
@@ -641,6 +710,9 @@ export function useFileUpload(
             setUploadQueue(previous);
             await persist(previous).catch(() => {});
             throw error;
+        }
+        if (options?.isCancelled()) {
+            for (const item of newItems) cancelItem(item.id);
         }
         toast.info(`Queued ${newItems.length} remote import${newItems.length === 1 ? '' : 's'} for upload`);
         return newItems.map(item => item.id);
@@ -913,6 +985,9 @@ export function useFileUpload(
 
     return {
         uploadQueue,
+        driveSyncWarning,
+        driveSyncRetryBusy,
+        retryDriveMetadataSync: () => requestDriveMetadataPublication(true),
         setUploadQueue,
         handleManualUpload,
         handleFolderUpload,

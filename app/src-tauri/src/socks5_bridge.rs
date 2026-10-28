@@ -10,6 +10,41 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWr
 
 type BoxedStream = Box<dyn AsyncReadWrite>;
 
+/// Convert the SOCKS destination to one safe HTTP CONNECT authority.
+/// The SOCKS domain field is arbitrary client-controlled bytes; never embed
+/// it directly into an HTTP request line or header (CRLF/header injection).
+fn http_connect_authority(host: &str, port: u16) -> Result<String, String> {
+    if host.is_empty()
+        || port == 0
+        || host.chars().any(|ch| {
+            ch.is_control()
+                || ch.is_whitespace()
+                || matches!(ch, '@' | '/' | '\\' | '?' | '#' | '%')
+        })
+    {
+        return Err("Invalid SOCKS target authority".into());
+    }
+    let mut url = reqwest::Url::parse("http://localhost/")
+        .map_err(|_| "Could not validate SOCKS target authority".to_string())?;
+    // Brackets are legal only around a complete IPv6 address. A raw IPv6
+    // address from SOCKS ATYP=4 is already formatted with brackets.
+    if (host.starts_with('[') || host.ends_with(']'))
+        && !(host.starts_with('[')
+            && host.ends_with(']')
+            && host[1..host.len() - 1]
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok())
+    {
+        return Err("Invalid IPv6 SOCKS target".into());
+    }
+    url.set_host(Some(host))
+        .map_err(|_| "Invalid SOCKS target hostname".to_string())?;
+    let normalized = url
+        .host_str()
+        .ok_or_else(|| "SOCKS target has no hostname".to_string())?;
+    Ok(format!("{normalized}:{port}"))
+}
+
 /// Starts a local SOCKS5 bridge.
 /// Returns the local port it is listening on, and the JoinHandle for the server task.
 pub async fn start_bridge(
@@ -170,12 +205,7 @@ async fn handle_client(
                 .read_exact(&mut ip)
                 .await
                 .map_err(|e| format!("Failed reading IPv6: {}", e))?;
-            // Format IPv6 cleanly
-            let mut parts = vec![];
-            for chunk in ip.chunks(2) {
-                parts.push(format!("{:x}{:02x}", chunk[0], chunk[1]));
-            }
-            format!("[{}]", parts.join(":"))
+            format!("[{}]", std::net::Ipv6Addr::from(ip))
         }
         _ => {
             client_stream
@@ -192,6 +222,8 @@ async fn handle_client(
         .await
         .map_err(|e| format!("Failed reading target port: {}", e))?;
     let target_port = u16::from_be_bytes(port_buf);
+    // Reject invalid destination names before opening an upstream socket.
+    let authority = http_connect_authority(&target_host, target_port)?;
 
     log::debug!(
         "Client {} requesting connection to {}:{}",
@@ -231,8 +263,7 @@ async fn handle_client(
 
     // 4. Send HTTP CONNECT request
     let mut connect_req = format!(
-        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n",
-        target_host, target_port, target_host, target_port
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
     );
 
     if !upstream_username.is_empty() {
@@ -301,4 +332,53 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod proxy_bridge_authority_tests {
+    use super::http_connect_authority;
+
+    #[test]
+    fn proxy_bridge_connect_authorities_validate_domains_ipv4_and_ipv6() {
+        assert_eq!(
+            http_connect_authority("example.org", 443).unwrap(),
+            "example.org:443"
+        );
+        assert_eq!(
+            http_connect_authority("192.0.2.25", 443).unwrap(),
+            "192.0.2.25:443"
+        );
+        assert_eq!(
+            http_connect_authority("[2001:db8::1]", 443).unwrap(),
+            "[2001:db8::1]:443"
+        );
+        assert_eq!(
+            http_connect_authority("BÜCHER.example", 443).unwrap(),
+            "xn--bcher-kva.example:443"
+        );
+    }
+
+    #[test]
+    fn proxy_bridge_rejects_header_injection_ambiguous_hosts_and_bad_ports() {
+        for host in [
+            "",
+            "bad host",
+            "bad\r\nX-Injected: yes",
+            "bad\nX-Injected: yes",
+            "evil.example@localhost",
+            "evil.example/path",
+            "evil.example\\rest",
+            "evil.example?secret",
+            "evil.example#fragment",
+            "evil.example%0d%0aInjected",
+            "[::1",
+            "[no-ipv6]",
+        ] {
+            assert!(
+                http_connect_authority(host, 443).is_err(),
+                "unsafe SOCKS destination must not enter CONNECT: {host:?}"
+            );
+        }
+        assert!(http_connect_authority("example.org", 0).is_err());
+    }
 }

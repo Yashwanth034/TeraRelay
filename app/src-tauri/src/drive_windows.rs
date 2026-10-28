@@ -1383,8 +1383,6 @@ fn hydrate_request(
     if metadata.kind != DriveNodeKind::File {
         return Err("Windows requested hydration for a Drive directory".to_string());
     }
-    let expected_content_version = metadata.content_version.clone();
-
     // CfAPI requires TRANSFER_DATA offsets and lengths to be 4 KiB aligned
     // except for the final range ending at logical EOF.
     let (start, aligned_length) =
@@ -1414,7 +1412,7 @@ fn hydrate_request(
         let take = (end - offset).min(HYDRATION_CHUNK_BYTES);
         let bytes = context
             .core
-            .read_versioned(&id, &expected_content_version, offset, take)
+            .read_snapshot_versioned(&id, &metadata, offset, take)
             .map_err(|e| e.to_string())?;
         if bytes.is_empty() && take != 0 {
             return Err("TeraRelay Drive hydration reached an unexpected end of file".to_string());

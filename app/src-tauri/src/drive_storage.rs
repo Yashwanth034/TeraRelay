@@ -66,25 +66,37 @@ pub fn init_drive_storage_schema(conn: &sqlite::Connection) -> Result<(), String
 }
 
 fn read_channel(stmt: &sqlite::Statement) -> Result<DriveStorageChannel, String> {
-    Ok(DriveStorageChannel {
-        generation: stmt
-            .read::<i64, _>("generation")
-            .map_err(|e| e.to_string())?,
-        backing_channel_id: stmt
-            .read::<i64, _>("backing_channel_id")
-            .map_err(|e| e.to_string())?,
+    // SQLite's numeric affinity can leave REAL/TEXT/BLOB values in persisted
+    // INTEGER columns. Typed i64 reads may coerce them into plausible
+    // Telegram destinations or timestamps, so require the actual storage class.
+    let integer = |column| match stmt
+        .read::<sqlite::Value, _>(column)
+        .map_err(|e| e.to_string())?
+    {
+        sqlite::Value::Integer(value) => Ok(value),
+        _ => Err("Corrupt Drive storage channel metadata".to_string()),
+    };
+    let channel = DriveStorageChannel {
+        generation: integer("generation")?,
+        backing_channel_id: integer("backing_channel_id")?,
         state: stmt.read::<String, _>("state").map_err(|e| e.to_string())?,
         title: stmt.read::<String, _>("title").map_err(|e| e.to_string())?,
-        created_at: stmt
-            .read::<i64, _>("created_at")
-            .map_err(|e| e.to_string())?,
-        updated_at: stmt
-            .read::<i64, _>("updated_at")
-            .map_err(|e| e.to_string())?,
+        created_at: integer("created_at")?,
+        updated_at: integer("updated_at")?,
         retirement_reason: stmt
             .read::<Option<String>, _>("retirement_reason")
             .map_err(|e| e.to_string())?,
-    })
+    };
+    if channel.generation <= 0
+        || channel.backing_channel_id <= 0
+        || !matches!(channel.state.as_str(), "active" | "read_only" | "retired")
+        || channel.title.trim().is_empty()
+        || channel.created_at < 0
+        || channel.updated_at < channel.created_at
+    {
+        return Err("Corrupt Drive storage channel metadata".to_string());
+    }
+    Ok(channel)
 }
 
 pub fn active_storage_channel(
@@ -98,16 +110,25 @@ pub fn active_storage_channel(
              FROM drive_storage_channels
              WHERE state = 'active'
              ORDER BY generation DESC
-             LIMIT 1",
+             LIMIT 2",
         )
         .map_err(|e: sqlite::Error| e.to_string())?;
+    if !matches!(
+        stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
+        sqlite::State::Row
+    ) {
+        return Ok(None);
+    }
+    let active = read_channel(&stmt)?;
+    // A restored/corrupted DB with two active write destinations must not
+    // arbitrarily pick a channel and risk splitting new Drive uploads.
     if matches!(
         stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
         sqlite::State::Row
     ) {
-        return read_channel(&stmt).map(Some);
+        return Err("Drive storage metadata contains multiple active channels".to_string());
     }
-    Ok(None)
+    Ok(Some(active))
 }
 
 pub fn storage_channel_by_backing(
@@ -137,16 +158,25 @@ pub fn storage_channel_by_backing(
 
 pub fn next_storage_generation(conn: &sqlite::Connection) -> Result<i64, String> {
     init_drive_storage_schema(conn)?;
+    // SQLite promotes overflowing INTEGER arithmetic to REAL; reading the
+    // rounded result as i64 may silently reuse an existing PRIMARY KEY.
+    // Read the actual maximum integer, then allocate its successor with
+    // checked arithmetic so exhausted or corrupt generations fail closed.
     let mut stmt = conn
-        .prepare("SELECT COALESCE(MAX(generation), 0) + 1 FROM drive_storage_channels")
+        .prepare("SELECT COALESCE(MAX(generation), 0) FROM drive_storage_channels")
         .map_err(|e: sqlite::Error| e.to_string())?;
     if !matches!(
         stmt.next().map_err(|e: sqlite::Error| e.to_string())?,
         sqlite::State::Row
     ) {
-        return Ok(1);
+        return Err("Drive storage generation could not be read".to_string());
     }
-    stmt.read::<i64, _>(0).map_err(|e| e.to_string())
+    let maximum = stmt.read::<i64, _>(0).map_err(|e| e.to_string())?;
+    let next = maximum
+        .checked_add(1)
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| "Drive storage generation has exceeded supported limits".to_string())?;
+    Ok(next)
 }
 
 pub fn storage_title(generation: i64) -> String {
@@ -182,6 +212,11 @@ pub fn register_storage_channel(
     }
     if !matches!(state, "active" | "read_only" | "retired") {
         return Err("Drive storage channel state is invalid".to_string());
+    }
+    // Reject invalid destinations before the transaction demotes an existing
+    // active channel; otherwise the subsequent read-back fails after COMMIT.
+    if title.trim().is_empty() {
+        return Err("Drive storage channel title is invalid".to_string());
     }
     let now = now_ms();
     conn.execute("BEGIN IMMEDIATE")
@@ -268,18 +303,15 @@ fn permanent_storage_error_code(error: &str) -> Option<&'static str> {
     // Keep this list intentionally small. These errors mean the current peer is
     // no longer writable/usable; file-size, media, network and rate-limit errors
     // must never create another Telegram channel.
-    for code in [
+    [
         "CHAT_WRITE_FORBIDDEN",
         "CHANNEL_PRIVATE",
         "CHANNEL_INVALID",
         "USER_BANNED_IN_CHANNEL",
         "CHAT_ADMIN_REQUIRED",
-    ] {
-        if value.contains(code) {
-            return Some(code);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|code| value.contains(code))
 }
 
 /// Rollover is intentionally allowlisted. FloodWait, network failures, upload
@@ -743,6 +775,157 @@ mod tests {
         assert_eq!(active.generation, 3);
         assert_eq!(active.backing_channel_id, 1003);
         assert_eq!(active.state, "active");
+
+        // Even if a corrupted/restored SQLite state contains two active
+        // storage destinations, uploading must not silently choose one.
+        conn.execute("UPDATE drive_storage_channels SET state = 'active' WHERE generation = 1")
+            .unwrap();
+        assert!(
+            active_storage_channel(&conn).is_err(),
+            "multiple simultaneously active Drive storage channels must fail closed"
+        );
+    }
+
+    #[test]
+    fn corrupted_storage_channel_fields_fail_closed_before_upload_routing() {
+        // SQLite's persisted channel rows are not constrained by the schema.
+        // A damaged row must not become the upload destination merely because
+        // it still has state='active'. Check both public lookup paths.
+        for (column, value) in [
+            ("generation", "0"),
+            ("backing_channel_id", "0"),
+            ("state", "'unknown'"),
+            ("title", "'   '"),
+            ("created_at", "-1"),
+            ("updated_at", "-1"),
+        ] {
+            let conn = memory_db();
+            init_drive_storage_schema(&conn).unwrap();
+            register_storage_channel(&conn, 1, 1001, "TeraRelay Drive Storage", "active", None)
+                .unwrap();
+            let valid = active_storage_channel(&conn).unwrap().unwrap();
+            assert_eq!(valid.backing_channel_id, 1001);
+            assert_eq!(
+                storage_channel_by_backing(&conn, 1001)
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                1
+            );
+
+            conn.execute(format!(
+                "UPDATE drive_storage_channels SET {column} = {value} WHERE generation = 1"
+            ))
+            .unwrap();
+            let invalid = storage_channel_by_backing(
+                &conn,
+                if column == "backing_channel_id" {
+                    0
+                } else {
+                    1001
+                },
+            );
+            assert!(
+                invalid
+                    .unwrap_err()
+                    .contains("Corrupt Drive storage channel metadata"),
+                "invalid {column} must be rejected even when queried by backing id"
+            );
+            if column != "state" {
+                assert!(
+                    active_storage_channel(&conn)
+                        .unwrap_err()
+                        .contains("Corrupt Drive storage channel metadata"),
+                    "invalid {column} must not become the active upload destination"
+                );
+            } else {
+                assert!(
+                    active_storage_channel(&conn).unwrap().is_none(),
+                    "unknown state must not be considered active"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_channel_reader_rejects_sqlite_numeric_type_coercion() {
+        // SQLite INTEGER affinity does not prevent nonintegral REAL, TEXT or
+        // BLOB values from being persisted in these ordinary columns.
+        for (column, value) in [
+            ("backing_channel_id", "1001.5"),
+            ("backing_channel_id", "'invalid-id'"),
+            ("backing_channel_id", "x'0102'"),
+            ("created_at", "1.5"),
+            ("created_at", "'invalid-time'"),
+            ("created_at", "x'01'"),
+            ("updated_at", "created_at + 0.5"),
+            ("updated_at", "'invalid-time'"),
+            ("updated_at", "x'01'"),
+        ] {
+            let conn = memory_db();
+            register_storage_channel(&conn, 1, 1001, "TeraRelay Drive Storage", "active", None)
+                .unwrap();
+            conn.execute(format!(
+                "UPDATE drive_storage_channels SET {column} = {value} WHERE generation = 1"
+            ))
+            .unwrap();
+            assert!(
+                active_storage_channel(&conn)
+                    .unwrap_err()
+                    .contains("Corrupt Drive storage channel metadata"),
+                "typed read accepted {column}={value} as an upload destination"
+            );
+            if column != "backing_channel_id" {
+                assert!(
+                    storage_channel_by_backing(&conn, 1001)
+                        .unwrap_err()
+                        .contains("Corrupt Drive storage channel metadata"),
+                    "direct lookup accepted {column}={value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blank_storage_title_does_not_demote_existing_active_upload_channel() {
+        let conn = memory_db();
+        let old =
+            register_storage_channel(&conn, 1, 1001, "TeraRelay Drive Storage", "active", None)
+                .unwrap();
+        for title in ["", "  \t  "] {
+            assert!(
+                register_storage_channel(&conn, 2, 1002, title, "active", None)
+                    .unwrap_err()
+                    .contains("title is invalid")
+            );
+            assert_eq!(active_storage_channel(&conn).unwrap(), Some(old.clone()));
+            assert!(storage_channel_by_backing(&conn, 1002).unwrap().is_none());
+            assert!(
+                register_storage_channel(&conn, 1, 1001, title, "active", None).is_err(),
+                "invalid re-registration must not poison the previous channel"
+            );
+            assert_eq!(
+                storage_channel_by_backing(&conn, 1001).unwrap(),
+                Some(old.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn storage_generation_exhaustion_fails_instead_of_reusing_identity() {
+        let conn = memory_db();
+        init_drive_storage_schema(&conn).unwrap();
+        assert_eq!(next_storage_generation(&conn).unwrap(), 1);
+        conn.execute(
+            "INSERT INTO drive_storage_channels
+             (generation, backing_channel_id, state, title, created_at, updated_at)
+             VALUES (9223372036854775807, 101, 'retired', 'exhausted generation', 1, 1)",
+        )
+        .unwrap();
+        assert!(
+            next_storage_generation(&conn).is_err(),
+            "a 64-bit storage-generation overflow must not produce a duplicate or rounded identity"
+        );
     }
 
     #[test]

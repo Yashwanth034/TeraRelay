@@ -1,6 +1,14 @@
 use actix_web::{web::Bytes, Error};
 use futures::{Stream, StreamExt};
 
+/// Keep a bounded private HTTP cache across full and ranged media responses.
+/// WebKitGTK's intermittent 0.021s MP4 duration also occurred under no-store;
+/// disabling range caching indefinitely caused avoidable Telegram re-fetches.
+/// The small-file opt-in memory fallback works without changing this policy.
+pub(super) fn media_stream_cache_control(_mime: &str) -> &'static str {
+    "private, max-age=120"
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PartRange {
     pub index: usize,
@@ -134,7 +142,7 @@ where
     ));
     response.insert_header(("Content-Type", mime.to_string()));
     response.insert_header(("Accept-Ranges", "bytes"));
-    response.insert_header(("Cache-Control", "private, max-age=120"));
+    response.insert_header(("Cache-Control", media_stream_cache_control(mime)));
     response.streaming(source(ranges))
 }
 
@@ -256,6 +264,49 @@ mod response_tests {
     }
 
     #[actix_web::test]
+    async fn mp4_http_ranges_preserve_bounded_private_cache() {
+        // No-store improved some native WebKitGTK runs but failed on later
+        // repeats. Do not force redundant Telegram re-downloads for every
+        // seek while the WebKit/GStreamer 0.021s decoder defect remains open.
+        let request = actix_web::test::TestRequest::default()
+            .insert_header(("Range", "bytes=0-3"))
+            .to_http_request();
+        let response = range_response(&[12], "video/mp4", &request, |_| {
+            futures::stream::iter([Ok::<_, actix_web::Error>(Bytes::from_static(b"test"))])
+        });
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::PARTIAL_CONTENT
+        );
+        assert_eq!(
+            response.headers().get("Cache-Control").unwrap(),
+            "private, max-age=120"
+        );
+        assert_eq!(
+            response.headers().get("Content-Range").unwrap(),
+            "bytes 0-3/12"
+        );
+        let request = actix_web::test::TestRequest::default().to_http_request();
+        let full_mp4 = range_response(&[12], "video/mp4", &request, |_| {
+            futures::stream::empty::<Result<Bytes, actix_web::Error>>()
+        });
+        assert_eq!(full_mp4.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(
+            full_mp4.headers().get("Cache-Control").unwrap(),
+            "private, max-age=120",
+            "The full 200 MP4 response must not disagree with its 206 ranges"
+        );
+        let non_mp4 = range_response(&[12], "video/x-matroska", &request, |_| {
+            futures::stream::empty::<Result<Bytes, actix_web::Error>>()
+        });
+        assert_eq!(
+            non_mp4.headers().get("Cache-Control").unwrap(),
+            "private, max-age=120",
+            "The experimental native MP4 cache policy must not affect MKV"
+        );
+    }
+
+    #[actix_web::test]
     async fn invalid_ranges_do_not_start_a_download() {
         let request = actix_web::test::TestRequest::default()
             .insert_header(("Range", "bytes=15-"))
@@ -338,6 +389,24 @@ mod tests {
         futures::pin_mut!(bytes);
         assert_eq!(&bytes.next().await.unwrap().unwrap()[..], b"short");
         assert!(bytes.next().await.unwrap().is_err());
+    }
+
+    #[actix_web::test]
+    async fn telegram_failure_mid_range_propagates_as_http_body_error() {
+        let interrupted = stream::iter(vec![
+            Ok::<Vec<u8>, &'static str>(b"first".to_vec()),
+            Err("Telegram transport interrupted"),
+            Ok(b"should never be served".to_vec()),
+        ]);
+        let response = actix_web::HttpResponse::PartialContent()
+            .insert_header(("Content-Length", "10"))
+            .streaming(bounded_chunks(interrupted, 0, Some(10)));
+        assert!(
+            actix_web::body::to_bytes(response.into_body())
+                .await
+                .is_err(),
+            "a failed Telegram download must not look like successful HTTP EOF"
+        );
     }
 
     #[actix_web::test]

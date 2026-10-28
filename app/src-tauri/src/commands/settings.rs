@@ -31,11 +31,12 @@ pub async fn cmd_apply_proxy_settings(
         password: req.password,
     };
 
+    crate::vpn_optimizer::validate_enabled_proxy(&config)?;
+    // Do not print user-controlled proxy host or credentials into app logs.
     log::info!(
-        "Applying proxy settings: enabled={}, type={}, host={}:{}",
+        "Applying proxy settings: enabled={}, type={}, port={}",
         config.enabled,
         config.proxy_type,
-        config.host,
         config.port
     );
 

@@ -105,6 +105,8 @@ export interface RemoteImportJob {
     stackedFileIds?: string[];
     /** Batch orchestration owns finalization when true; single-link jobs default to automatic finalization. */
     deferAutomaticFinalization?: boolean;
+    /** Hide a dismissed batch row while retaining its recovery/finalization journal. */
+    dismissedAt?: number;
     progress?: RemoteImportProgress;
     error?: string;
     createdAt: number;
@@ -193,6 +195,8 @@ export function buildRemoteImportSelections(
 export function normalizeBackendImportPhase(phase: string): RemoteImportPhase | null {
     switch (phase) {
         case 'analyzing': return 'analyzing';
+        case 'connecting':
+        case 'waiting_for_peers':
         case 'downloading': return 'downloading';
         case 'processing': return 'processing';
         case 'ready_to_upload': return 'ready-to-upload';

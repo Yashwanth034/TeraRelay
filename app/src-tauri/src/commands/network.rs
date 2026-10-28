@@ -1,5 +1,6 @@
 use crate::vpn_optimizer::NetworkConfig;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 use tauri::State;
 
@@ -18,19 +19,29 @@ pub async fn cmd_get_proxy_status(
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
 ) -> Result<ProxyStatus, String> {
     let proxy = net_config.proxy.read().map_err(|e| e.to_string())?.clone();
-    if !proxy.enabled || proxy.host.is_empty() {
+    if !proxy.enabled {
         return Ok(ProxyStatus {
             reachable: false,
             latency_ms: -1,
         });
     }
-
-    let addr_str = format!("{}:{}", proxy.host, proxy.port);
+    crate::vpn_optimizer::validate_enabled_proxy(&proxy)?;
+    // Tuple-based ToSocketAddrs accepts unbracketed IPv6 literals on every
+    // platform, unlike formatting host:port as an ambiguous string.
+    let endpoint = (
+        proxy
+            .host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+        proxy.port,
+    );
     tokio::task::spawn_blocking(move || {
         let timeout = Duration::from_secs(3);
         let start = std::time::Instant::now();
 
-        let addrs = match std::net::ToSocketAddrs::to_socket_addrs(&addr_str) {
+        let addrs = match std::net::ToSocketAddrs::to_socket_addrs(&endpoint) {
             Ok(iter) => iter.collect::<Vec<_>>(),
             Err(_) => {
                 return Ok(ProxyStatus {
@@ -59,6 +70,41 @@ pub async fn cmd_get_proxy_status(
     .map_err(|e| e.to_string())?
 }
 
+/// Owns a fresh, test-only authentication session directory. Dropping it
+/// removes only this attempt's random path, including SQLite -wal/-shm files.
+/// Never reuse or delete the user's real Telegram session or a shared test DB.
+struct OwnedProxyTestDirectory(PathBuf);
+
+impl OwnedProxyTestDirectory {
+    fn create() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "terarelay-proxy-check-{:032x}",
+            rand::random::<u128>()
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&path).map_err(|_| {
+                "Could not create a private proxy-test session directory".to_string()
+            })?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&path)
+            .map_err(|_| "Could not create a private proxy-test session directory".to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for OwnedProxyTestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            log::warn!("Could not clean up a private proxy-test session: {error}");
+        }
+    }
+}
+
 /// Test whether Telegram MTProto traffic can pass through the configured proxy.
 /// Unlike cmd_is_network_available (which only TCP-pings the proxy host:port),
 /// this creates a temporary grammers session and attempts a real API call.
@@ -67,25 +113,22 @@ pub async fn cmd_get_proxy_status(
 pub async fn cmd_test_proxy_traffic(
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
 ) -> Result<bool, String> {
-    let proxy_url = match net_config.effective_proxy_url() {
+    let proxy_url = match net_config.effective_proxy_url_checked()? {
         Some(url) => url,
         None => return Ok(false),
     };
 
-    log::info!("Testing proxy traffic through: {}", proxy_url);
-
-    // Create a temporary session in a temp directory
-    let temp_dir = std::env::temp_dir().join("telegram_drive_proxy_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let session_path = temp_dir.join("test.session");
-    let session_path_str = session_path.to_string_lossy().to_string();
-
-    // Remove any previous test session
-    let _ = std::fs::remove_file(&session_path);
-    let _ = std::fs::remove_file(format!("{}-wal", session_path_str));
-    let _ = std::fs::remove_file(format!("{}-shm", session_path_str));
+    // Keep this diagnostic on the same fail-closed OS-resolved SOCKS5 path
+    // as actual Telegram login. Never log the URL: it can carry credentials.
+    let proxy_url = crate::commands::auth::resolve_telegram_proxy_url(proxy_url).await?;
+    log::info!("Testing configured Telegram proxy traffic");
 
     let result: Result<bool, String> = tokio::task::spawn_blocking(move || {
+        // Each attempt owns a new restricted directory, never the shared
+        // historical test.session path (which could contain another session).
+        let owned_dir = OwnedProxyTestDirectory::create()?;
+        let session_path = owned_dir.0.join("test.session");
+        let session_path_str = session_path.to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         rt.block_on(async {
             // Open a fresh in-memory-ish SQLite session
@@ -94,8 +137,10 @@ pub async fn cmd_test_proxy_traffic(
             let session = std::sync::Arc::new(session);
 
             // Build connection params with proxy
-            let mut conn_params = grammers_mtsender::ConnectionParams::default();
-            conn_params.proxy_url = Some(proxy_url);
+            let conn_params = grammers_mtsender::ConnectionParams {
+                proxy_url: Some(proxy_url),
+                ..Default::default()
+            };
 
             let pool = grammers_mtsender::SenderPool::with_configuration(
                 session.clone(),
@@ -124,11 +169,8 @@ pub async fn cmd_test_proxy_traffic(
             // Abort runner regardless of outcome
             runner_handle.abort();
 
-            // Clean up test session files
-            let _ = std::fs::remove_file(&session_path_str);
-            let _ = std::fs::remove_file(format!("{}-wal", session_path_str));
-            let _ = std::fs::remove_file(format!("{}-shm", session_path_str));
-
+            // The owned private directory is removed by RAII on all return
+            // paths, including session-open failure, timeout and API failure.
             match result {
                 Ok(Ok(_me)) => Ok(true),
                 Ok(Err(e)) => {
@@ -320,4 +362,47 @@ pub async fn cmd_detect_vpn() -> Result<bool, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod proxy_test_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_diagnostics_use_distinct_owned_session_directories_and_clean_up() {
+        let first = OwnedProxyTestDirectory::create().unwrap();
+        let second = OwnedProxyTestDirectory::create().unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(first.0.is_dir());
+        assert!(second.0.is_dir());
+        let first_path = first.0.clone();
+        let second_path = second.0.clone();
+        let marker = first.0.join("test.session");
+        std::fs::write(&marker, b"synthetic-ephemeral-test").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&second.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        drop(first);
+        assert!(
+            !first_path.exists(),
+            "cleanup must include the owned SQLite fixture"
+        );
+        assert!(
+            second_path.is_dir(),
+            "cleanup must not touch a concurrent attempt"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+    }
 }

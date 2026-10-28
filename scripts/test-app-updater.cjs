@@ -94,6 +94,20 @@ test('desktop updater is configured for signed GitHub latest.json artifacts', ()
   const cargo = read('app/src-tauri/Cargo.toml');
   assert.ok(cargo.includes('tauri-plugin-updater'), 'Rust updater plugin dependency missing');
   assert.ok(cargo.includes('tauri-plugin-process'), 'Rust process plugin dependency missing');
+  // v2 signed Windows update artifacts are direct EXE/MSI binaries; the
+  // legacy v1 zip feature is unnecessary and pulls the vulnerable zip 4.x
+  // extraction path into Windows builds. Do not weaken TLS/proxy support.
+  assert.match(cargo, /tauri-plugin-updater\s*=\s*\{[^\n]*default-features\s*=\s*false[^\n]*features\s*=\s*\[[^\]]*"rustls-tls"[^\]]*"system-proxy"[^\]]*\]/,
+    'updater must opt out of legacy zip while keeping TLS and system proxy');
+  const cargoLock = read('app/src-tauri/Cargo.lock');
+  assert.doesNotMatch(cargoLock, /\nname = "zip"\nversion = "4\./,
+    'obsolete Windows updater zip 4.x extraction dependency must remain absent');
+  assert.match(cargo, /^zip\s*=\s*\{\s*version\s*=\s*"9\./m,
+    'first-party ZIP viewer must keep the patched zip 9 release family');
+  assert.match(cargoLock, /\nname = "zip"\nversion = "9\./,
+    'locked ZIP library must be in patched version 9 family');
+  assert.doesNotMatch(cargoLock, /\nname = "zip"\nversion = "[1-8]\./,
+    'old ZIP crate lines must not re-enter the lockfile');
 
   const lib = read('app/src-tauri/src/lib.rs');
   assert.ok(lib.includes('tauri_plugin_updater'), 'desktop updater plugin is not registered');
@@ -117,6 +131,18 @@ test('shared update coordinator and prompt are mounted and both About surfaces c
   assert.ok(context.includes("cmd_android_install_update', { apkPath, sha256: asset.sha256 }"), 'Android installer does not re-bind the cached APK to the signed manifest hash');
   assert.ok(/cmd_android_install_update[\s\S]{0,260}setStatus\('ready-to-install'\)/.test(context), 'Android installer cancellation would leave the updater stuck in installing state');
   assert.ok(context.includes('startup'), 'startup update check marker missing');
+
+  // Windows updater ZIP extraction is performed by a transitive zip release
+  // with outstanding RustSec advisories. Keep our desktop entry point on
+  // Tauri's verified download-and-install flow, never raw install(bytes).
+  assert.ok(
+    /await\s+update\.downloadAndInstall\s*\(/.test(context),
+    'desktop updates must download and verify the signed archive before installation',
+  );
+  assert.ok(
+    !/\bupdate\.install\s*\(/.test(context),
+    'raw desktop updater install would bypass the signed download entry point',
+  );
 
   const desktop = read('app/src/components/desktop/dashboard/SettingsModal.tsx');
   const mobile = read('app/src/components/mobile/MobileDashboard.tsx');

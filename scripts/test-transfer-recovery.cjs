@@ -41,7 +41,7 @@ function makeBackend(saved = {}) {
   const backend = {
     db, saves: [], jobs: [], deleted: [], listeners: new Map(), saveHolds: [], failures: 0, authReady: true,
     authCalls: 0, transferChoice: 'tdlib',
-    driveSnapshot: { pending: [] }, driveFinalized: [], driveSyncs: 0, preflightResult: null,
+    driveSnapshot: { pending: [] }, driveFinalized: [], driveSyncs: 0, driveSyncResults: [], preflightResult: null,
     saveInFlight: 0, maxSaveInFlight: 0, dialogs: [], filename: path.join(fixtures, 'folder-' + serial + '.zip'),
     read: kind => database(db, 'load', kind),
     holdSave(predicate = () => true) { const gate = deferred(); backend.saveHolds.push({ predicate, gate }); return gate; },
@@ -55,7 +55,15 @@ function makeBackend(saved = {}) {
     async invoke(command, args) {
       if (command === 'cmd_load_transfer_queue') return backend.read(args.kind);
       if (command === 'cmd_drive_get_snapshot') return structuredClone(backend.driveSnapshot);
-      if (command === 'cmd_drive_sync_metadata') { backend.driveSyncs++; return { revision: 1, dirty: false, source: 'fixture' }; }
+      if (command === 'cmd_drive_sync_metadata') {
+        backend.driveSyncs++;
+        if (backend.driveSyncResults.length) {
+          const next = backend.driveSyncResults.shift();
+          if (next instanceof Error) throw next;
+          return next;
+        }
+        return { revision: 1, dirty: false, source: 'current' };
+      }
       if (command === 'cmd_drive_finalize_upload') {
         backend.driveFinalized.push(structuredClone(args));
         backend.driveSnapshot.pending = backend.driveSnapshot.pending.filter(item => item.id !== args.pendingId);
@@ -170,7 +178,7 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
       open: async options => options.title === 'Select Folder to Upload' ? '/fixture/folder' : null,
     },
     '@tanstack/react-query': { useQueryClient: () => ({ invalidateQueries() {} }) },
-    sonner: { toast: Object.fromEntries(['info', 'success', 'error'].map(level => [level, text => toasts.push({ level, text })])) },
+    sonner: { toast: Object.fromEntries(['info', 'success', 'error', 'warning'].map(level => [level, text => toasts.push({ level, text })])) },
     '../utils': {
       isAndroidPlatform: false, isIOSPlatform: false, sanitizeFilename: value => value,
       pickWithFallback: async fn => fn(), showFileDialogFallback: async () => [],
@@ -304,6 +312,45 @@ test('legacy URL identity can recover without a separate local source path', () 
   assert.equal(backend.jobs[0].command, 'cmd_upload_from_url');
 }, 1, { uploadQueue: [{ id: 'url-only', url: 'https://fixture.invalid/large.mkv', folderId: null, status: 'pending' }] }));
 
+// Unassigned synthetic Drive writes have no Telegram storage or readable remote
+// object. Keep their local staging intact across close events and app recovery.
+for (const recovery of [false, true]) test(
+  'QA unassigned Drive write stays local after ' + (recovery ? 'snapshot recovery' : 'native close'),
+  async () => {
+    const priorQa = globalThis.__TERARELAY_QA_FEATURE_A__;
+    globalThis.__TERARELAY_QA_FEATURE_A__ = true;
+    const backend = makeBackend({ upload: [] });
+    const source = path.join(fixtures, 'qa-local-' + recovery + '.js');
+    fs.writeFileSync(source, "console.log('local staging');\n");
+    const pendingId = 'e'.repeat(32);
+    const pending = {
+      id: pendingId, staging_path: source, backing_channel_id: 0,
+      display_name: 'local.js',
+    };
+    backend.driveSnapshot.pending = recovery ? [pending] : [];
+    const harness = makeHarness('upload', backend);
+    try {
+      await harness.flush();
+      if (!recovery) {
+        backend.driveSnapshot.pending = [pending];
+        backend.emit('drive-upload-staged', {
+          pending_id: pendingId, path: source, folder_id: 0, file_name: 'local.js',
+        });
+        await harness.flush();
+      }
+      assert.equal(backend.jobs.length, 0, 'Unassigned QA write started a fake remote upload');
+      assert.equal(harness.queue.length, 0, 'Local staging leaked into the upload queue');
+      assert.deepEqual(backend.driveSnapshot.pending, [pending], 'Pending bytes were finalized or removed');
+      assert.equal(fs.readFileSync(source, 'utf8'), "console.log('local staging');\n");
+      assert.deepEqual(backend.driveFinalized, []);
+    } finally {
+      harness.close();
+      if (priorQa === undefined) delete globalThis.__TERARELAY_QA_FEATURE_A__;
+      else globalThis.__TERARELAY_QA_FEATURE_A__ = priorQa;
+    }
+  }
+);
+
 test('mounted-drive close enters the durable Boost upload queue and finalizes the virtual entry', () =>
   withHarness('upload', { upload: [] }, async (h, backend) => {
     const source = path.join(fixtures, 'drive-staged.txt');
@@ -377,6 +424,265 @@ test('mounted-drive byte-identical copy reuses existing logical content without 
     assert.equal(backend.read('upload').length, 0, 'De-duplicated Drive work remained stuck in the queue');
   })
 );
+
+test('mounted Drive local finalize reports unverified cross-device sync once and rearms after clean sync', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'sync-notice-dedup.txt');
+    fs.writeFileSync(source, 'identical existing Drive data');
+    backend.preflightResult = {
+      file_name: 'Drive sync notice.txt', size: 28,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-sync-notice',
+      exact_duplicate: { logical_file_id: '9'.repeat(32), message_id: 44,
+        name: 'same-remote-file.txt', size: 28 }, similar_files: [],
+    };
+    backend.driveSyncResults = [
+      new Error('synthetic Telegram offline'),
+      { revision: 2, dirty: true, source: 'current' },
+      { revision: 3, dirty: false, source: 'unknown-fake-publication' },
+      { revision: 4, dirty: false, source: 'current' },
+      { revision: 5, dirty: false, source: 'qa-local' },
+      { revision: 6, dirty: false, source: 'remote-merged' },
+      new Error('synthetic second offline'),
+    ];
+    const queueDrive = async index => {
+      backend.emit('drive-upload-staged', {
+        pending_id: String(index).padStart(32, 'a'), path: source,
+        folder_id: 9100001, file_name: 'Drive sync notice.txt',
+      });
+      await h.flush();
+    };
+    await queueDrive(1);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 1,
+      'offline metadata sync warns user even though local finalize succeeded');
+    assert.match(h.toasts.find(t => t.level === 'warning').text, /saved locally|sync is unverified/i);
+    await queueDrive(2);
+    await queueDrive(3);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 1,
+      'more dirty or malformed outcomes do not flood the user with warning toasts');
+    await queueDrive(4);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 1,
+      'a verified clean result clears the warning latch without extra success noise');
+    await queueDrive(5);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 2,
+      'QA-local response cannot masquerade as successful cloud publication');
+    assert.match(h.toasts.filter(t => t.level === 'warning')[1].text, /QA mode/);
+    await queueDrive(6);
+    await queueDrive(7);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 3,
+      'another offline episode after verified publication is surfaced once');
+    assert.equal(backend.driveFinalized.length, 7, 'local finalized entries remain durable');
+    assert.equal(backend.driveSyncs, 7, 'each finalize still requests metadata publication');
+    assert.equal(backend.jobs.length, 0, 'duplicate Drive content never retransmits bytes');
+  })
+);
+
+test('older delayed Drive metadata result cannot undo a newer verified upload sync', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'sync-epoch-dedup.txt');
+    fs.writeFileSync(source, 'identical bytes');
+    backend.preflightResult = {
+      file_name: 'Drive delayed sync.txt', size: 15,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-sync-epoch',
+      exact_duplicate: { logical_file_id: '8'.repeat(32), message_id: 45,
+        name: 'same.txt', size: 15 }, similar_files: [],
+    };
+    const delayed = deferred();
+    backend.driveSyncResults = [delayed.promise, { revision: 8, dirty: false, source: 'current' }];
+    for (let i = 1; i <= 2; i++) {
+      backend.emit('drive-upload-staged', {
+        pending_id: String(i).padStart(32, 'b'), path: source,
+        folder_id: 9100001, file_name: 'Drive delayed sync.txt',
+      });
+      await h.flush();
+    }
+    assert.equal(backend.driveSyncs, 2);
+    delayed.resolve({ revision: 6, dirty: true, source: 'current' });
+    await h.flush();
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 0,
+      'stale delayed dirty response may not override newer clean metadata result');
+  })
+);
+
+test('uploaded Drive bytes stay successful even if later Telegram metadata sync fails', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-real-upload-sync.txt');
+    fs.writeFileSync(source, 'new upload bytes');
+    backend.driveSyncResults = [new Error('synthetic Telegram unavailable')];
+    backend.emit('drive-upload-staged', {
+      pending_id: '7'.repeat(32), path: source, folder_id: 9100001,
+      file_name: 'Drive real upload.txt',
+    });
+    await h.flush();
+    assert.equal(backend.jobs.length, 1, 'new bytes really enter the upload worker');
+    backend.complete(backend.jobs[0].id, null, {
+      message: 'synthetic transfer complete', logical_file_id: 'a'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.driveFinalized.length, 1, 'local native finalize must still complete');
+    assert.equal(backend.driveSyncs, 1);
+    assert.equal(h.queue[0]?.status, 'success',
+      'metadata publication failure must not mark uploaded bytes as failed');
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 1,
+      'new uploaded bytes also surface the cross-device publication warning');
+  })
+);
+
+test('Drive metadata warning persists after uploads drain and Retry synchronizes once', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-visible-warning.txt');
+    fs.writeFileSync(source, 'identical bytes');
+    backend.preflightResult = {
+      file_name: 'Visible Drive warning.txt', size: 15,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-visible-warning',
+      exact_duplicate: { logical_file_id: 'e'.repeat(32), message_id: 77,
+        name: 'same.txt', size: 15 }, similar_files: [],
+    };
+    const retry = deferred();
+    backend.driveSyncResults = [new Error('offline'), retry.promise];
+    backend.emit('drive-upload-staged', {
+      pending_id: 'd'.repeat(32), path: source, folder_id: 9100001,
+      file_name: 'Visible Drive warning.txt',
+    });
+    await h.flush();
+    assert.equal(h.queue.length, 0, 'duplicate content finalizes and drains queue');
+    assert.match(h.state.driveSyncWarning, /metadata synchronization is unverified/,
+      'warning persists even after all file transfers disappear');
+    assert.equal(h.state.driveSyncRetryBusy, false);
+    h.state.retryDriveMetadataSync();
+    h.state.retryDriveMetadataSync();
+    await h.flush();
+    assert.equal(backend.driveSyncs, 2, 'rapid Retry clicks start only one native metadata request');
+    assert.equal(h.state.driveSyncRetryBusy, true);
+    assert.ok(h.state.driveSyncWarning, 'warning remains while native retry is unresolved');
+    retry.resolve({ revision: 2, dirty: false, source: 'current' });
+    await h.flush();
+    assert.equal(h.state.driveSyncWarning, null, 'verified clean retry removes persistent warning');
+    assert.equal(h.state.driveSyncRetryBusy, false, 'Retry button becomes usable after native result');
+    assert.ok(h.toasts.some(t => t.level === 'success' && /synchronization verified/.test(t.text)));
+    assert.equal(backend.driveFinalized.length, 1, 'manual Retry never re-uploads existing bytes');
+  })
+);
+
+test('clean toolbar Drive Sync clears stale upload warning but QA, dirty and delayed old outcomes do not', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-toolbar-sync-signal.txt');
+    fs.writeFileSync(source, 'already stored');
+    backend.preflightResult = {
+      file_name: 'Toolbar sync.txt', size: 14,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-toolbar-sync',
+      exact_duplicate: { logical_file_id: '7'.repeat(32), message_id: 46,
+        name: 'duplicate.txt', size: 14 }, similar_files: [],
+    };
+    const signal = h.load(path.join(root, 'app/src/driveSyncSignal.ts'));
+    const send = id => backend.emit('drive-upload-staged', {
+      pending_id: String(id).padStart(32, 'c'), path: source, folder_id: 9100001,
+      file_name: 'Toolbar sync.txt',
+    });
+    backend.driveSyncResults = [new Error('offline metadata sync')];
+    send(1);
+    await h.flush();
+    assert.ok(h.state.driveSyncWarning, 'upload warning is visible before toolbar action');
+    assert.equal(signal.publishVerifiedDriveSync({ revision: 2, dirty: true, source: 'current' }), false);
+    assert.equal(signal.publishVerifiedDriveSync({ revision: 3, dirty: false, source: 'qa-local' }), false);
+    await h.flush();
+    assert.ok(h.state.driveSyncWarning, 'dirty and local QA do not dismiss real warning');
+    assert.equal(signal.publishVerifiedDriveSync({ revision: 4, dirty: false, source: 'merged-published' }), true);
+    await h.flush();
+    assert.equal(h.state.driveSyncWarning, null, 'verified toolbar publication clears outdated upload warning');
+    const slow = deferred();
+    backend.driveSyncResults = [slow.promise];
+    send(2);
+    await h.flush();
+    assert.equal(backend.driveSyncs, 2);
+    signal.publishVerifiedDriveSync({ revision: 5, dirty: false, source: 'current' });
+    slow.reject(new Error('older sync completed late'));
+    await h.flush();
+    assert.equal(h.state.driveSyncWarning, null,
+      'older asynchronous failed upload sync cannot resurrect a warning after newer toolbar success');
+    assert.equal(backend.driveFinalized.length, 2, 'signal never retransmits or cancels durable uploads');
+    assert.equal(backend.driveSyncs, 2, 'signal never launches an extra Telegram sync');
+  })
+);
+
+test('Drive upload sync warning ignores native reply after frontend unmount', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'drive-closed-sync.txt');
+    fs.writeFileSync(source, 'already stored bytes');
+    backend.preflightResult = {
+      file_name: 'Closed Drive sync.txt', size: 20,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-closed-sync',
+      exact_duplicate: { logical_file_id: '8'.repeat(32), message_id: 46,
+        name: 'duplicate.txt', size: 20 }, similar_files: [],
+    };
+    const pendingSync = deferred();
+    backend.driveSyncResults = [pendingSync.promise];
+    backend.emit('drive-upload-staged', {
+      pending_id: 'c'.repeat(32), path: source, folder_id: 9100001,
+      file_name: 'Closed Drive sync.txt',
+    });
+    await h.flush();
+    assert.equal(backend.driveSyncs, 1);
+    h.close();
+    pendingSync.reject(new Error('offline after view closed'));
+    for (let turn = 0; turn < 4; turn++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 0,
+      'unmounted hook must not surface a late upload metadata warning');
+  })
+);
+
+test('Drive upload warning panel remains usable with no queue rows and handles busy Retry', () => {
+  const dashboard = fs.readFileSync(path.join(root, 'app/src/components/desktop/DesktopDashboard.tsx'), 'utf8');
+  assert.match(dashboard, /driveSyncWarning !== null\) && \(/,
+    'desktop transfer dock must stay visible after upload queue drains');
+  assert.match(dashboard, /driveSyncWarning=\{driveSyncWarning\}/);
+  assert.match(dashboard, /driveSyncRetryBusy=\{driveSyncRetryBusy\}/);
+  assert.match(dashboard, /onRetryDriveSync=\{retryDriveMetadataSync\}/);
+  const file = path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx');
+  const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020,
+      jsx: ts.JsxEmit.ReactJSX },
+  }).outputText;
+  const exported = {};
+  const jsx = (type, props) => ({ type, props: props || {} });
+  const icons = new Proxy({}, { get: (_target, name) => String(name) });
+  vm.runInNewContext(compiled, {
+    exports: exported,
+    require(name) {
+      if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx, Fragment: 'fragment' };
+      if (name === 'lucide-react') return icons;
+      if (name === '../../../utils') return { formatBytes: n => `${n} bytes` };
+      throw new Error('unexpected UI import: ' + name);
+    },
+  });
+  const emptyProps = {
+    items: [], onCancelAll() {}, onCancelItem() {}, onPauseItem() {},
+    onResumeItem() {}, onRetryItem() {}, onDismissItem() {},
+  };
+  assert.equal(exported.UploadQueue(emptyProps), null, 'idle dock remains hidden without warning');
+  let clicks = 0;
+  const collect = (node, out = []) => {
+    if (!node || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { node.forEach(part => collect(part, out)); return out; }
+    out.push(node);
+    collect(node.props?.children, out);
+    return out;
+  };
+  const render = busy => collect(exported.UploadQueue({ ...emptyProps,
+    driveSyncWarning: 'Telegram metadata publication not verified',
+    driveSyncRetryBusy: busy,
+    onRetryDriveSync: () => { clicks++; },
+  }));
+  const nodes = render(false);
+  assert.ok(nodes.find(n => n.props?.role === 'alert'), 'persistent warning has alert semantics');
+  assert.ok(!nodes.find(n => n.props?.role === 'list'), 'empty upload list is not fabricated');
+  const retryButton = nodes.find(n => n.props?.['aria-label'] === 'Retry TeraRelay Drive metadata sync');
+  assert.ok(retryButton, 'one-click Retry remains reachable with zero queued uploads');
+  assert.equal(retryButton.props.disabled, false);
+  retryButton.props.onClick();
+  assert.equal(clicks, 1, 'Retry click invokes the actual wired callback');
+  assert.equal(render(true).find(n => n.props?.['aria-label'] === 'Retry TeraRelay Drive metadata sync').props.disabled,
+    true, 'Retry is disabled during an in-progress native metadata synchronization');
+});
 
 for (const kind of ['upload', 'download']) test('TeraRelay Boost ' + kind + ' persists its engine and bypasses TDLib setup', () =>
   withHarness(kind, { [kind]: [] }, async (h, backend) => {

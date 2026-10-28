@@ -1,10 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
-import { TelegramFile, BandwidthStats, ShareInfo } from '../../types';
+import { TelegramFile, ShareInfo } from '../../types';
 import { formatBytes, getFileCategory, isMediaFile, isVideoFile, isPdfFile, isArchiveFile, nativeShareOrCopy, copyToClipboard, type FileCategory } from '../../utils';
 import { getPremiumFileTitle } from '../../filePresentation';
 
@@ -27,6 +27,7 @@ import { RenameFolderModal } from './dashboard/RenameFolderModal';
 import { RenameFileModal } from './dashboard/RenameFileModal';
 import { VersionStackModal } from './dashboard/VersionStackModal';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
+import { RemoteImportQueue } from './dashboard/RemoteImportQueue';
 import { JoinChannelModal } from './dashboard/JoinChannelModal';
 import { ChannelInfoPanel } from './dashboard/ChannelInfoPanel';
 import { MediaDetailsPanel } from './dashboard/MediaDetailsPanel';
@@ -75,6 +76,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         internalDragRef.current = ids;
     };
     const [showRemoteUpload, setShowRemoteUpload] = useState(false);
+    const [remoteImportView, setRemoteImportView] = useState<{ jobId?: string; batchId?: string }>({});
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveViewFile, setArchiveViewFile] = useState<TelegramFile | null>(null);
@@ -86,7 +88,38 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
     const [renameFolder, setRenameFolder] = useState<{ id: number; name: string } | null>(null);
     const [showJoinChannel, setShowJoinChannel] = useState(false);
+    const joinChannelReturnFocusRef = useRef<HTMLElement | null>(null);
+    const openJoinChannel = () => {
+        const active = document.activeElement;
+        joinChannelReturnFocusRef.current = active instanceof HTMLElement && active !== document.body ? active : null;
+        setShowJoinChannel(true);
+    };
+    const closeJoinChannel = () => {
+        setShowJoinChannel(false);
+        const previousFocus = joinChannelReturnFocusRef.current;
+        joinChannelReturnFocusRef.current = null;
+        if (previousFocus?.isConnected) {
+            requestAnimationFrame(() => {
+                if (previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+            });
+        }
+    };
     const [showChannelInfo, setShowChannelInfo] = useState(false);
+    const channelInfoReturnFocusRef = useRef<HTMLElement | null>(null);
+    const openChannelInfo = () => {
+        channelInfoReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        setShowChannelInfo(true);
+    };
+    const closeChannelInfo = () => {
+        setShowChannelInfo(false);
+        const previousFocus = channelInfoReturnFocusRef.current;
+        channelInfoReturnFocusRef.current = null;
+        if (previousFocus?.isConnected) {
+            requestAnimationFrame(() => {
+                if (previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+            });
+        }
+    };
     const [channelFileCategory, setChannelFileCategory] = useState<FileCategory>('all');
     const [moveFileTarget, setMoveFileTarget] = useState<TelegramFile | null>(null);
     const [renameFileTarget, setRenameFileTarget] = useState<TelegramFile | null>(null);
@@ -114,16 +147,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         enabled: !!store,
     });
 
-    const displayedFiles = activeFolderId !== null
-        ? allFiles.filter((f: TelegramFile) =>
-            (f.stack_name || f.name).toLowerCase().includes(searchTerm.trim().toLowerCase())
-            && (channelFileCategory === 'all' || getFileCategory(f.name) === channelFileCategory)
-        )
-        : searchTerm.length > 2
-            ? searchResults
-            : allFiles.filter((f: TelegramFile) =>
-                (f.stack_name || f.name).toLowerCase().includes(searchTerm.trim().toLowerCase())
-            );
+    // Keep file-array identity stable during transfer progress and unrelated UI updates.
+    // The file explorer sorts/virtualizes this array; recreating it on every
+    // dashboard render causes avoidable O(n log n) work and thumbnail updates.
+    const displayedFiles = useMemo(() => {
+        const term = searchTerm.trim().toLowerCase();
+        if (activeFolderId === null && searchTerm.length > 2) return searchResults;
+        if (!term && (activeFolderId === null || channelFileCategory === 'all')) return allFiles;
+        return allFiles.filter((file: TelegramFile) =>
+            (file.stack_name || file.name).toLowerCase().includes(term)
+            && (activeFolderId === null || channelFileCategory === 'all' || getFileCategory(file.name) === channelFileCategory)
+        );
+    }, [activeFolderId, allFiles, channelFileCategory, searchResults, searchTerm]);
 
     const activeCategoryLabel: Record<FileCategory, string | undefined> = {
         all: undefined,
@@ -134,16 +169,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         other: 'Other',
     };
 
-    const { data: bandwidth } = useQuery({
-        queryKey: ['bandwidth'],
-        queryFn: () => invoke<BandwidthStats>('cmd_get_bandwidth'),
-        refetchInterval: 5000,
-        enabled: !!store
-    });
-
-
     const {
         uploadQueue,
+        driveSyncWarning,
+        driveSyncRetryBusy,
+        retryDriveMetadataSync,
         handleManualUpload,
         handleFolderUpload,
         handleVersionUpload,
@@ -156,7 +186,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         retryItem: retryUploadItem,
         dismissItem: dismissUploadItem,
     } = useFileUpload(activeFolderId, store, allFiles);
-    const remoteImport = useRemoteImport(activeFolderId, store, enqueuePreparedImports);
+    const remoteImport = useRemoteImport(activeFolderId, store, enqueuePreparedImports, cancelUploadItem);
     const {
         jobs: remoteImportJobs,
         analyzeSource: analyzeRemoteImport,
@@ -233,8 +263,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }, [activeChannelReadOnly, activeFolderId, displayedFiles, selectedIds]);
 
-    const handleCopyBulkLink = useCallback((link: string) => {
-        navigator.clipboard.writeText(link);
+    const handleCopyBulkLink = useCallback(async (link: string) => {
+        await copyToClipboard(link);
         setBulkShareCopied(prev => new Set(prev).add(link));
         setTimeout(() => setBulkShareCopied(prev => {
             const next = new Set(prev);
@@ -711,7 +741,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                                     toast.error(`Failed to move: ${error}`);
                                 }
                             } else {
-                                handleBulkMove(targetFolderId, () => setShowMoveModal(false));
+                                await handleBulkMove(targetFolderId, () => setShowMoveModal(false));
                             }
                         }}
                         activeFolderId={activeFolderId}
@@ -745,6 +775,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {showRemoteUpload && activeFolderId !== null && !activeChannelReadOnly && (
                     <RemoteUploadModal
                         isOpen={showRemoteUpload}
+                        initialJobId={remoteImportView.jobId}
+                        initialBatchId={remoteImportView.batchId}
                         onClose={() => setShowRemoteUpload(false)}
                         activeFolderId={activeFolderId}
                         currentChannelName={currentFolderName}
@@ -773,12 +805,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     } catch { /* toast handled in hook */ }
                 }}
                 onCreate={handleCreateFolder}
-                onJoinChannel={() => setShowJoinChannel(true)}
+                onJoinChannel={openJoinChannel}
                 isSyncing={isSyncing}
                 isConnected={isConnected}
                 onSync={handleSyncFolders}
                 onLogout={handleLogout}
-                bandwidth={bandwidth || null}
                 onAssignFolderToGroup={handleAssignFolderToGroup}
                 onReorderFolders={handleReorderFolders}
                 onUpdateGroupOrder={handleUpdateGroupOrder}
@@ -803,12 +834,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     searchTerm={searchTerm}
                     onSearchChange={setSearchTerm}
                     onSettingsClick={() => setShowSettings(true)}
-                    onRemoteUploadClick={() => setShowRemoteUpload(true)}
+                    onRemoteUploadClick={() => { setRemoteImportView({}); setShowRemoteUpload(true); }}
                     readOnly={activeChannelReadOnly}
                     channelMode={activeFolderId !== null}
                     channelFileCount={activeFolderId !== null ? allFiles.length : undefined}
                     channelCategoryLabel={activeFolderId !== null && channelFileCategory !== 'all' ? activeCategoryLabel[channelFileCategory] : undefined}
-                    onChannelInfo={activeFolderId !== null ? () => setShowChannelInfo(true) : undefined}
+                    onChannelInfo={activeFolderId !== null ? openChannelInfo : undefined}
                 />
                 {activeFolderId === null && searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">
@@ -819,6 +850,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {activeFolderId !== null ? (
                     <ChannelFeed
+                        hasTransferPanel={uploadQueue.length > 0 || downloadQueue.length > 0 || remoteImportJobs.length > 0 || driveSyncWarning !== null}
                         files={displayedFiles}
                         loading={isLoading || isSearching}
                         error={error}
@@ -954,10 +986,51 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             )}
 
 
-            {(uploadQueue.length > 0 || downloadQueue.length > 0) && (
+            {(uploadQueue.length > 0 || downloadQueue.length > 0 || remoteImportJobs.length > 0 || driveSyncWarning !== null) && (
                 <div className="fixed bottom-24 right-5 z-[100] flex max-h-[calc(100vh-8rem)] w-[380px] max-w-[calc(100vw-2.5rem)] flex-col gap-3 overflow-y-auto">
+                    <RemoteImportQueue
+                        jobs={remoteImportJobs}
+                        batches={remoteImportBatch.batches}
+                        uploadItems={uploadQueue}
+                        onReview={(jobId, batchId) => {
+                            const job = remoteImport.getRemoteImportJob(jobId);
+                            if (!job) return;
+                            setActiveFolderId(job.folderId);
+                            setRemoteImportView({ jobId: batchId ? undefined : jobId, batchId });
+                            setShowRemoteUpload(true);
+                        }}
+                        onCancel={async (jobId, batchId) => {
+                            if (batchId) return remoteImportBatch.cancelBatch(batchId);
+                            return remoteImport.cancelJob(jobId);
+                        }}
+                        onDismiss={async (jobId, batchId) => {
+                            const batch = remoteImportBatch.batches.find(value => value.id === batchId);
+                            if (batch?.phase === 'cancelled' && remoteImport.getRemoteImportJob(jobId)?.phase === 'waiting-for-selection') {
+                                await remoteImport.cancelJob(jobId);
+                            }
+                            await remoteImport.dismissJob(jobId, { retainJournal: Boolean(batchId) });
+                        }}
+                        onRetry={async (jobId, batchId) => {
+                            if (batchId) {
+                                const entry = remoteImportBatch.batches.find(batch => batch.id === batchId)?.entries.find(value => value.jobId === jobId);
+                                if (entry) await remoteImportBatch.retryBatchEntry(batchId, entry.id);
+                                return;
+                            }
+                            const job = remoteImport.getRemoteImportJob(jobId);
+                            const failed = job?.uploadQueueIds.filter(id => ['error', 'cancelled'].includes(job.uploadOutcomes?.[id]?.status ?? '')) ?? [];
+                            if (failed.length) {
+                                await remoteImport.resetRemoteImportUploadOutcomes(jobId, failed);
+                                for (const id of failed) retryUploadItem(id);
+                            } else {
+                                await remoteImport.retryJob(jobId);
+                            }
+                        }}
+                    />
                     <UploadQueue
                         items={uploadQueue}
+                        driveSyncWarning={driveSyncWarning}
+                        driveSyncRetryBusy={driveSyncRetryBusy}
+                        onRetryDriveSync={retryDriveMetadataSync}
                         onCancelAll={cancelUploads}
                         onCancelItem={cancelUploadItem}
                         onPauseItem={pauseUploadItem}
@@ -986,7 +1059,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     files={allFiles}
                     activeCategory={channelFileCategory}
                     onSelectCategory={setChannelFileCategory}
-                    onClose={() => setShowChannelInfo(false)}
+                    onClose={closeChannelInfo}
                     onInvite={activeChannelReadOnly ? undefined : async () => {
                         try {
                             const info = await handleExportFolderInvite(activeFolderId);
@@ -1001,7 +1074,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <JoinChannelModal
                 open={showJoinChannel}
-                onClose={() => setShowJoinChannel(false)}
+                onClose={closeJoinChannel}
                 onJoin={async (invite) => {
                     await handleJoinChannel(invite);
                     queryClient.invalidateQueries({ queryKey: ['files'] });
@@ -1047,14 +1120,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 >
                     <div
                         className="tr-modal w-full max-w-[520px] max-h-[70vh] overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="tr-bulk-share-links-title"
                         onClick={e => e.stopPropagation()}
                     >
                         <div className="tr-modal-header p-4 flex items-center justify-between">
-                            <h3 className="text-telegram-text font-medium flex items-center gap-2">
+                            <h3 id="tr-bulk-share-links-title" className="text-telegram-text font-medium flex items-center gap-2">
                                 <Link className="w-5 h-5 text-telegram-primary" />
                                 {bulkShareLinks.length} Share Link{bulkShareLinks.length !== 1 ? 's' : ''}
                             </h3>
-                            <button onClick={() => setBulkShareLinks(null)} className="tr-modal-close">
+                            <button type="button" aria-label="Close share links" autoFocus onClick={() => setBulkShareLinks(null)} className="tr-modal-close">
                                 <X className="w-5 h-5" />
                             </button>
                         </div>
@@ -1079,10 +1155,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                                                     type="text"
                                                     readOnly
                                                     value={link}
+                                                    aria-label={`Share link for ${file.name}`}
                                                     className="tr-modal-input flex-1 px-2.5 py-2 text-xs select-all truncate"
                                                 />
                                                 <button
-                                                    onClick={() => handleCopyBulkLink(link)}
+                                                    type="button"
+                                                    aria-label={isCopied ? `Copied share link for ${file.name}` : `Copy share link for ${file.name}`}
+                                                    onClick={() => { void handleCopyBulkLink(link).catch(() => toast.error('Could not copy share link. Select and copy it manually.')); }}
                                                     className={`px-2.5 py-1.5 rounded-lg border flex items-center justify-center transition-all flex-shrink-0 ${
                                                         isCopied
                                                             ? 'bg-emerald-500 border-emerald-500 text-white'
@@ -1093,7 +1172,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                                                 </button>
                                                 {typeof navigator !== 'undefined' && typeof navigator.share === 'function' && (
                                                     <button
-                                                        onClick={() => nativeShareOrCopy(file.name, file.sizeStr, link, () => handleCopyBulkLink(link))}
+                                                        type="button"
+                                                        aria-label={`Share link for ${file.name} with another app`}
+                                                        onClick={() => { void nativeShareOrCopy(file.name, file.sizeStr, link, handleCopyBulkLink); }}
                                                         className="px-2.5 py-1.5 rounded-lg bg-telegram-primary/20 hover:bg-telegram-primary/30 text-telegram-primary border border-telegram-primary/30 transition-all flex items-center justify-center flex-shrink-0"
                                                     >
                                                         <Share2 className="w-3.5 h-3.5" />
@@ -1107,6 +1188,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         )}
 
                         <button
+                            type="button"
                             onClick={() => setBulkShareLinks(null)}
                             className="tr-button tr-button--secondary tr-button--md m-4 mt-0"
                         >

@@ -94,16 +94,17 @@ fn upsert_folder(
     Ok(())
 }
 
-fn insert_seed_file(
-    conn: &sqlite::Connection,
-    file_id: &str,
-    logical_channel_id: &str,
+struct QaSeedFile<'a> {
+    file_id: &'a str,
+    logical_channel_id: &'a str,
     message_id: i64,
-    display_name: &str,
+    display_name: &'a str,
     total_size: i64,
-    mime_type: &str,
+    mime_type: &'a str,
     created_at: i64,
-) -> Result<(), String> {
+}
+
+fn insert_seed_file(conn: &sqlite::Connection, file: QaSeedFile<'_>) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
             "INSERT OR IGNORE INTO logical_files
@@ -112,19 +113,19 @@ fn insert_seed_file(
              VALUES (?, ?, ?, ?, ?, ?, 1, NULL, 1, ?, 'complete')",
         )
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((1, file_id))
+    stmt.bind((1, file.file_id))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((2, logical_channel_id))
+    stmt.bind((2, file.logical_channel_id))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((3, message_id))
+    stmt.bind((3, file.message_id))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((4, display_name))
+    stmt.bind((4, file.display_name))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((5, total_size))
+    stmt.bind((5, file.total_size))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((6, mime_type))
+    stmt.bind((6, file.mime_type))
         .map_err(|e: sqlite::Error| e.to_string())?;
-    stmt.bind((7, created_at))
+    stmt.bind((7, file.created_at))
         .map_err(|e: sqlite::Error| e.to_string())?;
     stmt.next().map_err(|e: sqlite::Error| e.to_string())?;
     Ok(())
@@ -154,43 +155,51 @@ pub async fn cmd_qa_feature_a_seed(db_pool: State<'_, DbConnection>) -> Result<b
     let now = chrono::Utc::now().timestamp();
     insert_seed_file(
         &conn,
-        "11111111111111111111111111111111",
-        QA_MOVIES_LOGICAL_ID,
-        91_001,
-        "Interstellar.1080p.BluRay.mkv",
-        2_100_000_000,
-        "video/x-matroska",
-        now - 86_400 * 60,
+        QaSeedFile {
+            file_id: "11111111111111111111111111111111",
+            logical_channel_id: QA_MOVIES_LOGICAL_ID,
+            message_id: 91_001,
+            display_name: "Interstellar.1080p.BluRay.mkv",
+            total_size: 2_100_000_000,
+            mime_type: "video/x-matroska",
+            created_at: now - 86_400 * 60,
+        },
     )?;
     insert_seed_file(
         &conn,
-        "22222222222222222222222222222222",
-        QA_MOVIES_LOGICAL_ID,
-        91_002,
-        "Interstellar.2160p.HDR.mkv",
-        4_300_000_000,
-        "video/x-matroska",
-        now - 86_400 * 10,
+        QaSeedFile {
+            file_id: "22222222222222222222222222222222",
+            logical_channel_id: QA_MOVIES_LOGICAL_ID,
+            message_id: 91_002,
+            display_name: "Interstellar.2160p.HDR.mkv",
+            total_size: 4_300_000_000,
+            mime_type: "video/x-matroska",
+            created_at: now - 86_400 * 10,
+        },
     )?;
     insert_seed_file(
         &conn,
-        "33333333333333333333333333333333",
-        QA_MOVIES_LOGICAL_ID,
-        91_003,
-        "Dune.Part.Two.2160p.mkv",
-        5_600_000_000,
-        "video/x-matroska",
-        now - 86_400 * 2,
+        QaSeedFile {
+            file_id: "33333333333333333333333333333333",
+            logical_channel_id: QA_MOVIES_LOGICAL_ID,
+            message_id: 91_003,
+            display_name: "Dune.Part.Two.2160p.mkv",
+            total_size: 5_600_000_000,
+            mime_type: "video/x-matroska",
+            created_at: now - 86_400 * 2,
+        },
     )?;
     insert_seed_file(
         &conn,
-        "44444444444444444444444444444444",
-        QA_MOVIES_LOGICAL_ID,
-        91_004,
-        "TeraRelay-Feature-A-notes.pdf",
-        1_250_000,
-        "application/pdf",
-        now - 86_400,
+        QaSeedFile {
+            file_id: "44444444444444444444444444444444",
+            logical_channel_id: QA_MOVIES_LOGICAL_ID,
+            message_id: 91_004,
+            display_name: "TeraRelay-Feature-A-notes.pdf",
+            total_size: 1_250_000,
+            mime_type: "application/pdf",
+            created_at: now - 86_400,
+        },
     )?;
 
     Ok(true)
@@ -677,24 +686,28 @@ mod tests {
         .expect("seed archive folder");
         insert_seed_file(
             conn,
-            "11111111111111111111111111111111",
-            QA_MOVIES_LOGICAL_ID,
-            91_001,
-            "Interstellar.1080p.BluRay.mkv",
-            2_100_000_000,
-            "video/x-matroska",
-            100,
+            QaSeedFile {
+                file_id: "11111111111111111111111111111111",
+                logical_channel_id: QA_MOVIES_LOGICAL_ID,
+                message_id: 91_001,
+                display_name: "Interstellar.1080p.BluRay.mkv",
+                total_size: 2_100_000_000,
+                mime_type: "video/x-matroska",
+                created_at: 100,
+            },
         )
         .expect("seed 1080p file");
         insert_seed_file(
             conn,
-            "22222222222222222222222222222222",
-            QA_MOVIES_LOGICAL_ID,
-            91_002,
-            "Interstellar.2160p.HDR.mkv",
-            4_300_000_000,
-            "video/x-matroska",
-            200,
+            QaSeedFile {
+                file_id: "22222222222222222222222222222222",
+                logical_channel_id: QA_MOVIES_LOGICAL_ID,
+                message_id: 91_002,
+                display_name: "Interstellar.2160p.HDR.mkv",
+                total_size: 4_300_000_000,
+                mime_type: "video/x-matroska",
+                created_at: 200,
+            },
         )
         .expect("seed 4K file");
     }

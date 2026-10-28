@@ -7,6 +7,40 @@ pub type DbConnection = Arc<Mutex<sqlite::Connection>>;
 /// Maximum number of retry attempts for database initialization
 const MAX_DB_INIT_RETRIES: u32 = 5;
 
+fn configure_database_durability(conn: &sqlite::Connection) -> Result<(), String> {
+    // WAL avoids DELETE-journal metadata churn on every small filesystem
+    // transaction while FULL keeps SQLite's strongest ordinary sync policy.
+    // This is a latency optimization, not a durability downgrade.
+    conn.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+        .map_err(|e: sqlite::Error| format!("Failed to configure SQLite durability: {e}"))?;
+
+    let mut journal = conn
+        .prepare("PRAGMA journal_mode")
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    if journal.next().map_err(|e: sqlite::Error| e.to_string())? != sqlite::State::Row
+        || !journal
+            .read::<String, _>(0)
+            .map_err(|e| e.to_string())?
+            .eq_ignore_ascii_case("wal")
+    {
+        return Err("SQLite refused WAL journal mode".to_string());
+    }
+    drop(journal);
+
+    let mut synchronous = conn
+        .prepare("PRAGMA synchronous")
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    if synchronous
+        .next()
+        .map_err(|e: sqlite::Error| e.to_string())?
+        != sqlite::State::Row
+        || synchronous.read::<i64, _>(0).map_err(|e| e.to_string())? != 2
+    {
+        return Err("SQLite refused FULL synchronous durability".to_string());
+    }
+    Ok(())
+}
+
 pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -44,6 +78,8 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
             )
         })?
     };
+
+    configure_database_durability(&conn)?;
 
     // Run migration (also with retry for locked-database scenarios)
     {
@@ -159,4 +195,33 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
 
     log::info!("SQLite database initialized successfully using sqlite crate.");
     Ok(Arc::new(Mutex::new(conn)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_durability_is_wal_full() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-db-durability-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("shares.db");
+        let conn = sqlite::open(&path).unwrap();
+
+        configure_database_durability(&conn).unwrap();
+
+        let mut journal = conn.prepare("PRAGMA journal_mode").unwrap();
+        assert_eq!(journal.next().unwrap(), sqlite::State::Row);
+        assert_eq!(journal.read::<String, _>(0).unwrap(), "wal");
+        drop(journal);
+        let mut synchronous = conn.prepare("PRAGMA synchronous").unwrap();
+        assert_eq!(synchronous.next().unwrap(), sqlite::State::Row);
+        assert_eq!(synchronous.read::<i64, _>(0).unwrap(), 2);
+        drop(synchronous);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

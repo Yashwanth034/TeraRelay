@@ -1,3 +1,7 @@
+#[cfg(desktop)]
+mod desktop_autostart;
+#[cfg(desktop)]
+mod desktop_background;
 pub mod models;
 
 /// Initialize COM in Multi-Threaded Apartment mode on Windows worker threads.
@@ -42,6 +46,9 @@ fn init_com_on_worker_thread() {
 }
 
 pub mod bandwidth;
+mod cache_cleanup;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod cache_directory;
 pub mod commands;
 pub mod socks5_bridge;
 pub mod tdlib_fast;
@@ -59,11 +66,21 @@ use tokio::sync::Mutex;
 pub mod api_routes;
 pub mod db;
 mod download_output;
+#[cfg(target_os = "linux")]
+mod drive_bulk_export;
 pub mod drive_crypto;
 pub mod drive_fs_core;
+mod drive_health;
+#[cfg(target_os = "linux")]
+mod drive_integrity_ledger;
+mod drive_lookup;
 pub mod drive_mount;
+mod drive_pending_rescue;
+pub mod drive_posix;
 #[cfg(target_os = "macos")]
 pub mod drive_provider_ipc;
+#[cfg(target_os = "linux")]
+mod drive_restore;
 pub mod drive_storage;
 pub mod drive_stream;
 #[cfg(target_os = "windows")]
@@ -216,6 +233,20 @@ pub fn restart_api_server(_app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn cmd_quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Err("Use the system app controls on mobile".to_string())
+    }
+}
+
+#[tauri::command]
 fn cmd_open_file_externally(path: String, app_handle: tauri::AppHandle) -> Result<(), String> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -314,7 +345,12 @@ pub fn run() {
         Arc::new(std::sync::Mutex::new(None));
     let server_handle_for_setup = server_handle.clone();
 
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        desktop_background::show_main_window(app);
+    }));
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -327,10 +363,41 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_window_state::Builder::default().build());
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        );
 
     let app = builder
+        .on_window_event(|window, event| {
+            #[cfg(desktop)]
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        log::error!("Could not hide TeraRelay window: {error}");
+                    }
+                }
+            }
+            #[cfg(not(desktop))]
+            let _ = (window, event);
+        })
         .setup(move |app| {
+            #[cfg(desktop)]
+            if let Err(error) = desktop_background::init(app) {
+                // App launcher reopens this instance; the in-app Quit button remains available.
+                log::error!("Could not create TeraRelay tray icon: {error}");
+            }
+            #[cfg(target_os = "linux")]
+            if !desktop_background::background_start_requested() {
+                // Linux starts with its window hidden to avoid a startup flash.
+                // Only an explicit user launch should show/focus the window.
+                desktop_background::show_main_window(app.handle());
+            }
             #[cfg(target_os = "android")]
             {
                 // Initialize ndk-context once from Tauri's real Activity/WebView JNI
@@ -368,9 +435,15 @@ pub fn run() {
             });
             app.manage(Arc::new(bandwidth::BandwidthManager::new(app.handle())));
             app.manage(tdlib_fast::TdlibFastState::default());
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let stream_listener = server::bind_stream_listener(STREAM_PORT)?;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let stream_port = stream_listener.local_addr()?.port();
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let stream_port = STREAM_PORT;
             app.manage(StreamConfig {
                 token: stream_token.clone(),
-                port: STREAM_PORT,
+                port: stream_port,
             });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
@@ -384,6 +457,7 @@ pub fn run() {
                 e
             })?;
             let cache_root = app_data_dir.join("streaming");
+            let startup_fmp4_root = cache_root.join("fmp4");
             let transcode_manager = transcode::TranscodeManager::new(cache_root);
             // Detect FFmpeg only on desktop. Mobile builds do not ship or launch
             // arbitrary FFmpeg sidecar processes.
@@ -399,7 +473,14 @@ pub fn run() {
             }
             let transcode_arc = Arc::new(transcode_manager);
             app.manage(transcode_arc.clone());
-            app.manage(fmp4_remux::Fmp4RemuxState::new());
+            let remux_state = fmp4_remux::Fmp4RemuxState::new();
+            app.manage(remux_state.clone());
+            // Recover stale completed windows and crashed partial sessions
+            // on normal startup, even if the user never plays another video.
+            // The shared job/active-source locks prevent overlap with playback.
+            tauri::async_runtime::spawn(async move {
+                remux_state.prune_idle_cache(&startup_fmp4_root).await;
+            });
             let loaded_config = vpn_optimizer::load_network_config(app.handle());
             let net_config = Arc::new(vpn_optimizer::NetworkConfig::new_with_config(loaded_config));
             app.manage(net_config.clone());
@@ -452,7 +533,7 @@ pub fn run() {
                 e
             })?;
             let drive_state = drive_mount::DriveMountState::new(
-                STREAM_PORT,
+                stream_port,
                 stream_token.clone(),
                 drive_cache_root,
             )
@@ -501,6 +582,19 @@ pub fn run() {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            match drive_mount::start_native_recovery(app.handle()) {
+                Ok(monitor) => {
+                    app.manage(monitor);
+                }
+                Err(error) => log::warn!("Native Drive recovery monitor unavailable: {error}"),
+            }
+
+            #[cfg(target_os = "linux")]
+            if desktop_background::background_start_requested() {
+                desktop_autostart::start_background_telegram_session(app.handle());
+            }
+
             // Start Streaming Server on dedicated thread (Actix needs its own runtime).
             // Desktop only: mobile platforms should not create a second Actix/Tokio
             // runtime or expose desktop-only localhost streaming services.
@@ -511,6 +605,7 @@ pub fn run() {
                 let handle_for_thread = server_handle_for_setup.clone();
                 let db_pool_for_server = db_pool.clone();
                 let transcode_for_server = transcode_arc.clone();
+                let remux_for_server = app.state::<fmp4_remux::Fmp4RemuxState>().inner().clone();
                 std::thread::spawn(move || {
                     #[cfg(target_os = "windows")]
                     init_com_on_worker_thread();
@@ -518,10 +613,11 @@ pub fn run() {
                     sys.block_on(async move {
                         match server::start_server(
                             state,
-                            STREAM_PORT,
+                            stream_listener,
                             token_for_server,
                             db_pool_for_server,
                             transcode_for_server,
+                            remux_for_server,
                         )
                         .await
                         {
@@ -544,6 +640,30 @@ pub fn run() {
 
             // Start API server if enabled in settings
             restart_api_server(app.handle());
+
+            // Small idle cache housekeeping never waits behind an active transfer.
+            // Keep desktop background/tray sessions from accumulating old data.
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let cache_app = app.handle().clone();
+                let cache_db = db_pool.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    loop {
+                        let cache_state = cache_app.state::<tdlib_fast::TdlibFastState>();
+                        if let Err(error) = tdlib_fast::clean_file_cache_if_idle(
+                            &cache_app,
+                            cache_state.inner(),
+                            &cache_db,
+                        )
+                        .await
+                        {
+                            log::warn!("Idle cache cleanup skipped: {error}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
 
             // Start VPN keep-alive background task on desktop only.
             // Mobile platforms have strict background execution limits and should
@@ -597,8 +717,92 @@ pub fn run() {
             commands::cmd_get_files,
             commands::cmd_drive_sync_metadata,
             commands::cmd_drive_get_snapshot,
+            commands::cmd_drive_namespace_audit,
+            commands::cmd_drive_time_capsule_list,
+            commands::cmd_drive_time_capsule_capture,
+            commands::cmd_drive_time_capsule_compare,
+            commands::cmd_drive_portable_manifest_export,
+            commands::cmd_drive_portable_manifest_compare,
+            commands::cmd_drive_folder_parity,
+            commands::cmd_drive_backup_watchlist_list,
+            commands::cmd_drive_backup_watchlist_add,
+            commands::cmd_drive_backup_watchlist_remove,
+            commands::cmd_drive_backup_watchlist_scan,
+            commands::cmd_drive_backup_timeline_list,
+            commands::cmd_drive_backup_timeline_record,
+            commands::cmd_drive_backup_timeline_clear,
+            commands::cmd_drive_backup_batch_repair_preview,
+            commands::cmd_drive_backup_batch_repair_apply,
+            commands::cmd_drive_bulk_preview,
+            commands::cmd_drive_bulk_apply,
+            commands::cmd_drive_folder_preview,
+            commands::cmd_drive_folder_apply,
+            commands::cmd_drive_folder_mirror_preview,
+            commands::cmd_drive_folder_mirror_apply,
+            commands::cmd_drive_folder_tree_trash_runs,
+            commands::cmd_drive_folder_tree_trash_preview,
+            commands::cmd_drive_folder_tree_trash_apply,
+            commands::cmd_drive_folder_tree_restore_preview,
+            commands::cmd_drive_folder_tree_restore_apply,
+            commands::cmd_drive_tree_receipt_export,
+            commands::cmd_drive_tree_receipt_import,
+            commands::cmd_drive_complete_copy_preview,
+            commands::cmd_drive_complete_copy_apply,
+            commands::cmd_drive_file_copy_preview,
+            commands::cmd_drive_file_copy_apply,
+            commands::cmd_drive_folder_blueprint_preview,
+            commands::cmd_drive_folder_blueprint_apply,
+            commands::cmd_drive_folder_clone_preview,
+            commands::cmd_drive_folder_clone_apply,
+            commands::cmd_drive_folder_undo_history,
+            commands::cmd_drive_folder_undo_preview,
+            commands::cmd_drive_folder_undo_apply,
+            commands::cmd_drive_bulk_history,
+            commands::cmd_drive_bulk_undo_preview,
+            commands::cmd_drive_bulk_undo,
+            commands::cmd_drive_smart_views_list,
+            commands::cmd_drive_smart_views_save,
+            commands::cmd_drive_smart_views_delete,
+            commands::cmd_drive_smart_views_preview,
+            commands::cmd_drive_collections_list,
+            commands::cmd_drive_collections_save,
+            commands::cmd_drive_collections_delete,
+            commands::cmd_drive_change_review_inspect,
+            commands::cmd_drive_change_review_capture,
+            drive_health::cmd_drive_health_inspect,
+            drive_pending_rescue::cmd_drive_rescue_candidates,
+            drive_pending_rescue::cmd_drive_rescue_export,
+            drive_pending_rescue::cmd_drive_rescue_restore,
+            #[cfg(target_os = "linux")]
+            drive_bulk_export::cmd_drive_bulk_export_start,
+            #[cfg(target_os = "linux")]
+            drive_bulk_export::cmd_drive_bulk_export_status,
+            #[cfg(target_os = "linux")]
+            drive_bulk_export::cmd_drive_bulk_export_cancel,
+            #[cfg(target_os = "linux")]
+            drive_integrity_ledger::cmd_drive_integrity_ledger_info,
+            #[cfg(target_os = "linux")]
+            drive_integrity_ledger::cmd_drive_integrity_ledger_status,
+            #[cfg(target_os = "linux")]
+            drive_integrity_ledger::cmd_drive_integrity_ledger_start,
+            #[cfg(target_os = "linux")]
+            drive_integrity_ledger::cmd_drive_integrity_ledger_cancel,
+            #[cfg(target_os = "linux")]
+            drive_mount::safe_mode::cmd_drive_safe_mount_status,
+            #[cfg(target_os = "linux")]
+            drive_mount::safe_mode::cmd_drive_safe_mount_set,
+            #[cfg(target_os = "linux")]
+            drive_mount::transfer_center::cmd_drive_transfer_snapshot,
+            #[cfg(target_os = "linux")]
+            drive_mount::transfer_center::cmd_drive_transfer_pause,
+            #[cfg(target_os = "linux")]
+            drive_mount::transfer_center::cmd_drive_transfer_retry,
             commands::cmd_drive_list_trash,
             commands::cmd_drive_restore_trash_item,
+            commands::cmd_drive_batch_trash_preview,
+            commands::cmd_drive_batch_trash_apply,
+            commands::cmd_drive_batch_restore_preview,
+            commands::cmd_drive_batch_restore_apply,
             commands::cmd_drive_finalize_upload,
             drive_crypto::cmd_drive_crypto_status,
             drive_crypto::cmd_drive_crypto_setup,
@@ -649,6 +853,8 @@ pub fn run() {
             upload_service::cmd_start_foreground_service,
             upload_service::cmd_stop_foreground_service,
             commands::cmd_connect,
+            commands::cmd_saved_telegram_session_exists,
+            commands::cmd_restore_saved_telegram_session,
             commands::cmd_log,
             commands::cmd_delete_file,
             commands::cmd_download_file,
@@ -695,6 +901,11 @@ pub fn run() {
             commands::cmd_get_logical_channel,
             commands::cmd_get_tera_channel_members,
             cmd_get_system_diagnostics,
+            cmd_quit_app,
+            #[cfg(desktop)]
+            desktop_autostart::cmd_desktop_autostart_status,
+            #[cfg(desktop)]
+            desktop_autostart::cmd_desktop_autostart_set,
             commands::cmd_get_video_metadata,
             commands::cmd_get_rich_media_metadata,
             commands::cmd_probe_media_tracks,
@@ -730,6 +941,11 @@ pub fn run() {
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
             log::info!("Application exiting — shutting down background services...");
+            #[cfg(target_os = "linux")]
+            if let Some(monitor) = app_handle.try_state::<drive_mount::NativeDriveRecovery>() {
+                monitor.stop();
+            }
+            commands::remote_import::shutdown_import_processes();
 
             // Unmount the user-space cloud drive before its local
             // streaming/cache services disappear.

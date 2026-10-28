@@ -1,4 +1,5 @@
-import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
     Check,
     Download,
@@ -40,6 +41,7 @@ interface ChannelFeedProps {
     onDrop?: (e: React.DragEvent, folderId: number) => void;
     activeFolderId: number;
     readOnly?: boolean;
+    hasTransferPanel?: boolean;
 }
 
 function parseTelegramDate(value?: string) {
@@ -101,6 +103,7 @@ export function ChannelFeed({
     onDrop,
     activeFolderId,
     readOnly = false,
+    hasTransferPanel = false,
 }: ChannelFeedProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [collapsedStackIds, setCollapsedStackIds] = useState<Set<string>>(() => new Set());
@@ -111,13 +114,36 @@ export function ChannelFeed({
     const selectionMode = selectedIds.length > 0;
 
     const orderedFiles = useMemo(
-        () => [...files].sort((a, b) => {
-            const aTime = parseTelegramDate(a.created_at)?.getTime() ?? 0;
-            const bTime = parseTelegramDate(b.created_at)?.getTime() ?? 0;
-            return aTime === bTime ? (a.id ?? 0) - (b.id ?? 0) : aTime - bTime;
-        }),
+        () => files
+            .map(file => ({ file, time: parseTelegramDate(file.created_at)?.getTime() ?? 0 }))
+            .sort((a, b) => a.time === b.time
+                ? (a.file.id ?? 0) - (b.file.id ?? 0)
+                : a.time - b.time)
+            .map(entry => entry.file),
         [files],
     );
+    // Compute day separators once per file-list change, not every scroll frame.
+    const dayLabels = useMemo(() => orderedFiles.map((file, index) => {
+        const dayKey = channelDayKey(file.created_at);
+        const previousDayKey = index > 0 ? channelDayKey(orderedFiles[index - 1].created_at) : '';
+        return dayKey && dayKey !== previousDayKey ? formatChannelDay(file.created_at) : '';
+    }), [orderedFiles]);
+
+    // Render only visible rows. Stacked version rows can expand to arbitrary
+    // heights, so measure the actual DOM nodes rather than assuming fixed size.
+    const getRowKey = useCallback((index: number) => {
+        const file = orderedFiles[index];
+        if (!file) return index;
+        const isExpandedStack = !!file.stack_id && (file.stack_version_count ?? 0) > 1;
+        return `channel-${activeFolderId}-${isExpandedStack ? `stack-${file.stack_id}` : `file-${file.id}`}`;
+    }, [activeFolderId, orderedFiles]);
+    const rowVirtualizer = useVirtualizer({
+        count: loading || error ? 0 : orderedFiles.length,
+        getScrollElement: () => scrollRef.current,
+        estimateSize: () => 76,
+        getItemKey: getRowKey,
+        overscan: 6,
+    });
 
     // Initialize after the channel's files have mounted, then follow incoming
     // files only while the reader stays near the bottom.
@@ -131,7 +157,7 @@ export function ChannelFeed({
             scroller.scrollTop = scroller.scrollHeight;
             scrollState.current.initialized = true;
         }
-    }, [activeFolderId, loading, error, orderedFiles]);
+    }, [activeFolderId, loading, error, orderedFiles, hasTransferPanel]);
 
     // Expanded version stacks and loaded thumbnails can change height after
     // the initial render. Keep the newest row visible without moving a reader
@@ -187,12 +213,17 @@ export function ChannelFeed({
             <div
                 ref={scrollRef}
                 className="tr-channel-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3"
+                style={{ paddingBottom: hasTransferPanel ? 88 : undefined }}
                 onScroll={(event) => {
                     const scroller = event.currentTarget;
                     scrollState.current.followNewest = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
                 }}
             >
-                <div ref={contentRef} className="mx-auto max-w-[820px] space-y-1.5">
+                <div
+                    ref={contentRef}
+                    className="relative mx-auto w-full max-w-[820px]"
+                    style={orderedFiles.length > 0 ? { height: rowVirtualizer.getTotalSize() } : undefined}
+                >
                     {orderedFiles.length === 0 ? (
                         <div className="flex min-h-[420px] flex-col items-center justify-center px-6 text-center">
                             <div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl border border-telegram-primary/15 bg-telegram-primary/10">
@@ -210,14 +241,13 @@ export function ChannelFeed({
                             </p>
                         </div>
                     ) : (
-                        orderedFiles.map((file, index) => {
+                        rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                            const index = virtualRow.index;
+                            const file = orderedFiles[index];
                             const selected = selectedIdSet.has(file.id);
                             const title = getPremiumFileTitle(file);
-                            const dayKey = channelDayKey(file.created_at);
-                            const previousDayKey = index > 0 ? channelDayKey(orderedFiles[index - 1].created_at) : '';
-                            const dayLabel = formatChannelDay(file.created_at);
-                            const showDay = Boolean(dayKey && dayLabel && dayKey !== previousDayKey);
-                            const dayDivider = showDay ? (
+                            const dayLabel = dayLabels[index];
+                            const dayDivider = dayLabel ? (
                                 <div
                                     className="tr-channel-day-divider flex items-center gap-2 px-1 pb-1 pt-3"
                                     role="separator"
@@ -232,7 +262,13 @@ export function ChannelFeed({
 
                             if (file.stack_id && (file.stack_version_count ?? 0) > 1) {
                                 return (
-                                    <div key={`stack-${file.stack_id}`}>
+                                    <div
+                                        key={virtualRow.key}
+                                        data-index={virtualRow.index}
+                                        ref={rowVirtualizer.measureElement}
+                                        className="absolute left-0 top-0 w-full pb-1.5"
+                                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                                    >
                                         {dayDivider}
                                         <StackedFileRow
                                             file={file}
@@ -268,7 +304,13 @@ export function ChannelFeed({
                             }
 
                             return (
-                                <div key={file.id}>
+                                <div
+                                    key={virtualRow.key}
+                                    data-index={virtualRow.index}
+                                    ref={rowVirtualizer.measureElement}
+                                    className="absolute left-0 top-0 w-full pb-1.5"
+                                    style={{ transform: `translateY(${virtualRow.start}px)` }}
+                                >
                                     {dayDivider}
                                     <article
                                         onClick={(event) => onFileClick(event, file.id)}

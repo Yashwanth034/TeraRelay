@@ -10,8 +10,40 @@ permissions:
   contents: write
 
 jobs:
+  release-security-gate:
+    name: Block release on RustSec or high-severity npm advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install verified cargo-audit on ephemeral runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+          fallback: none
+
+      - name: Reject unresolved RustSec vulnerabilities (no ignores)
+        working-directory: app/src-tauri
+        run: cargo audit --file Cargo.lock
+
+      - name: Reject high-severity frontend vulnerabilities
+        working-directory: app
+        run: npm audit --audit-level=high
+
   release-capabilities:
     name: Detect signed release targets
+    needs: release-security-gate
     runs-on: ubuntu-24.04
     outputs:
       desktop_matrix: ${{ steps.detect.outputs.desktop_matrix }}
@@ -684,6 +716,7 @@ jobs:
 
   ios-simulator:
     name: iOS simulator release validation
+    needs: release-security-gate
     runs-on: macos-latest
     defaults:
       run:

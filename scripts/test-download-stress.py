@@ -134,6 +134,7 @@ try:
     with tempfile.TemporaryDirectory(prefix="terarelay-download-stress-") as name:
         folder = Path(name)
         worker = Worker()
+        worker.files_dir = folder / "tdlib-cache"
         native = worker.td = NativeTransfer(folder, "http://127.0.0.1:" + str(server.server_port))
         chunks = [{"message_id": k, "size": PART_SIZE, "sha256": expected_hashes[k]} for k in (1, 2)]
         outcome = worker.download(17, {"path": str(folder / "output.bin"), "chunks": chunks,

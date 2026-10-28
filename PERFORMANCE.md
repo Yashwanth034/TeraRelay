@@ -22,6 +22,22 @@ Linux x86_64 currently has the additional TDLib/C++ fast-transfer path used for 
 
 The Linux TDLib helper is optional platform-specific acceleration; Python and the pinned Ubuntu TDLib runtime are not requirements for normal transfers on the other platforms.
 
+## Native Linux Drive versus local SSD (separate from Telegram transfers)
+
+The latest accepted private **synthetic Linux FUSE** test on 2026-10-18 used the rebuilt `v0.2.0` development binary and a load-gated, five-round paired `secure-fd-v2` benchmark. The benchmark runner verified a fresh source build, private owned profile/mount, local controls, and full cleanup. **The goal of at least 90% of local-SSD-relative performance was not met.**
+
+| Default test workload | Local-relative timing ratio |
+| --- | ---: |
+| 64-file warm directory scan | 0.79% |
+| 64-file warm small reads | 1.60% |
+| 64 file metadata `stat()` calls | 0.63% |
+| 64 file open/close calls | 0.66% |
+| 64 KiB editor-style replace/save | 4.91% |
+| 24 renames out and back | 0.28% |
+| Node opening/reading a 64 KiB source | 70.26% |
+
+Here **local-relative timing ratio = local median elapsed time / Drive median elapsed time × 100**. A lower number means the FUSE operation was slower than local SSD. This is not Telegram upload/download throughput, a whole-app score, or proof about arbitrary large-project disk consumption. Details and exact receipts are documented in `docs/superpowers/plans/2026-10-18-seven-lane-testing-report.md`; the private benchmark task is preserved. Do not average these ratios into a false overall performance claim or compare differing test harness versions as if directly interchangeable.
+
 ## Benchmarking rules
 
 For meaningful comparisons, use the same file, account class, network, storage device, and Telegram region/path. Record:

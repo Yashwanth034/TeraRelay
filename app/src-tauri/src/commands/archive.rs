@@ -41,6 +41,14 @@ fn detect_archive_type(filename: &str) -> ArchiveType {
     }
 }
 
+fn rar_preview_unavailable() -> String {
+    concat!(
+        "RAR in-app preview is temporarily disabled until safe extraction is available. ",
+        "You can still download the RAR file and open it with a trusted external archiver."
+    )
+    .to_string()
+}
+
 fn generate_unique_temp_prefix(label: &str) -> String {
     format!(
         "archive_{}_{}_{}",
@@ -64,7 +72,7 @@ pub async fn cmd_list_archive_contents(
 
     match archive_type {
         ArchiveType::Zip => list_zip_contents(&client, &media, max_bytes, &filename).await,
-        ArchiveType::Rar => list_rar_contents(&client, &media, max_bytes, &filename).await,
+        ArchiveType::Rar => Err(rar_preview_unavailable()),
         ArchiveType::SevenZ => list_sevenz_contents(&client, &media, max_bytes, &filename).await,
     }
 }
@@ -85,7 +93,7 @@ pub async fn cmd_extract_archive_entry(
 
     match archive_type {
         ArchiveType::Zip => extract_zip_entry(&client, &media, max_bytes, entry_index).await,
-        ArchiveType::Rar => extract_rar_entry(&client, &media, max_bytes, entry_index).await,
+        ArchiveType::Rar => Err(rar_preview_unavailable()),
         ArchiveType::SevenZ => extract_sevenz_entry(&client, &media, max_bytes, entry_index).await,
     }
 }
@@ -155,7 +163,7 @@ async fn download_to_memory(
     let mut download_iter = client.iter_download(media);
     let mut total_bytes: u64 = 0;
 
-    while let Some(chunk) = download_iter.next().await.ok().flatten() {
+    while let Some(chunk) = archive_download_chunk(download_iter.next().await, label)? {
         total_bytes += chunk.len() as u64;
         if max_bytes > 0 && total_bytes > max_bytes {
             return Err(format!(
@@ -186,7 +194,10 @@ async fn list_zip_contents(
             .by_index(i)
             .map_err(|e| format!("Failed to read ZIP entry at index {}: {}", i, e))?;
         entries.push(ArchiveEntry {
-            filename: file.name().to_string(),
+            filename: file
+                .name()
+                .map_err(|error| format!("Invalid ZIP entry name: {error}"))?
+                .into_owned(),
             size: file.size(),
             compressed_size: file.compressed_size(),
             is_dir: file.is_dir(),
@@ -214,7 +225,10 @@ async fn extract_zip_entry(
         if file.is_dir() {
             return Err("Cannot extract a directory entry".to_string());
         }
-        let entry_name = file.name().to_string();
+        let entry_name = file
+            .name()
+            .map_err(|error| format!("Invalid ZIP entry name: {error}"))?
+            .into_owned();
         let entry_size = file.size();
         let safe_name = sanitise_entry_name(&entry_name, entry_index);
         let temp_path = std::env::temp_dir().join(format!(
@@ -222,15 +236,19 @@ async fn extract_zip_entry(
             generate_unique_temp_prefix("extract"),
             safe_name
         ));
-        let mut buf = Vec::with_capacity(entry_size as usize);
-        file.read_to_end(&mut buf)
-            .map_err(|e| format!("Failed to read ZIP entry bytes: {}", e))?;
+        // A small compressed ZIP entry can claim an enormous uncompressed size.
+        // Never reserve that claimed capacity or decode past the preview budget.
+        let buf = read_bounded_archive_entry(&mut file, entry_size)?;
         Ok::<_, String>((buf, safe_name, entry_size, temp_path))
     }?;
 
     tokio::fs::write(&temp_path, &buf)
         .await
         .map_err(|e| format!("Failed to write extracted file: {}", e))?;
+    if let Err(error) = super::fs::register_temporary_output(&temp_path) {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(error);
+    }
 
     Ok(ExtractedFile {
         temp_path: temp_path.to_string_lossy().to_string(),
@@ -263,7 +281,17 @@ async fn download_to_temp_file(
         let mut download_iter = client.iter_download(media);
         let mut total_bytes: u64 = 0;
 
-        while let Some(chunk) = download_iter.next().await.ok().flatten() {
+        loop {
+            let next = match archive_download_chunk(download_iter.next().await, label) {
+                Ok(next) => next,
+                Err(error) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+                    return Err(error);
+                }
+            };
+            let Some(chunk) = next else { break };
             total_bytes += chunk.len() as u64;
             if max_bytes > 0 && total_bytes > max_bytes {
                 let _ = tokio::fs::remove_file(&archive_path).await;
@@ -286,106 +314,8 @@ async fn download_to_temp_file(
     Ok((archive_path, extract_dir))
 }
 
-async fn list_rar_contents(
-    client: &grammers_client::Client,
-    media: &Media,
-    max_bytes: u64,
-    filename: &str,
-) -> Result<Vec<ArchiveEntry>, String> {
-    let (archive_path, extract_dir) =
-        download_to_temp_file(client, media, max_bytes, "RAR", "rar").await?;
-    let rar_path = archive_path.clone();
-    let dir = extract_dir.clone();
-
-    let entries_result: Result<Vec<ArchiveEntry>, String> =
-        tokio::task::spawn_blocking(move || {
-            let archive = rar::Archive::extract_all(
-                rar_path.to_str().unwrap_or(""),
-                dir.to_str().unwrap_or(""),
-                "",
-            )
-            .map_err(|e| format!("Failed to open RAR file: {}", e))?;
-            Ok(archive
-                .files
-                .iter()
-                .map(|fb| ArchiveEntry {
-                    filename: fb.name.clone(),
-                    size: fb.head.size,
-                    compressed_size: fb.head.data_area_size,
-                    is_dir: fb.name.ends_with('/') || fb.name.ends_with('\\'),
-                })
-                .collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|e| format!("RAR parsing task panicked: {:?}", e))?;
-
-    let _ = tokio::fs::remove_file(&archive_path).await;
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
-
-    let entries = entries_result?;
-    check_non_empty(&entries, filename, "RAR")?;
-    Ok(entries)
-}
-
-async fn extract_rar_entry(
-    client: &grammers_client::Client,
-    media: &Media,
-    max_bytes: u64,
-    entry_index: usize,
-) -> Result<ExtractedFile, String> {
-    let (archive_path, extract_dir) =
-        download_to_temp_file(client, media, max_bytes, "RAR", "rar").await?;
-    let rar_path = archive_path.clone();
-    let dir = extract_dir.clone();
-
-    let extraction_result: Result<ExtractedFile, String> = tokio::task::spawn_blocking(move || {
-        let archive = rar::Archive::extract_all(
-            rar_path.to_str().unwrap_or(""),
-            dir.to_str().unwrap_or(""),
-            "",
-        )
-        .map_err(|e| format!("Failed to open RAR file: {}", e))?;
-
-        if entry_index >= archive.files.len() {
-            return Err(format!(
-                "Entry index {} out of range ({} entries)",
-                entry_index,
-                archive.files.len()
-            ));
-        }
-        let fb = &archive.files[entry_index];
-        if fb.name.ends_with('/') || fb.name.ends_with('\\') {
-            return Err("Cannot extract a directory entry".to_string());
-        }
-        let source_path = dir.join(&fb.name);
-        if !source_path.exists() {
-            return Err(format!(
-                "Extracted file not found at: {}",
-                source_path.display()
-            ));
-        }
-        let safe_name = sanitise_entry_name(&fb.name, entry_index);
-        let temp_path = std::env::temp_dir().join(format!(
-            "{}_{}",
-            generate_unique_temp_prefix("extract"),
-            safe_name
-        ));
-        std::fs::copy(&source_path, &temp_path)
-            .map_err(|e| format!("Failed to copy RAR entry: {}", e))?;
-        Ok(ExtractedFile {
-            temp_path: temp_path.to_string_lossy().to_string(),
-            filename: safe_name,
-            size: fb.head.size,
-        })
-    })
-    .await
-    .map_err(|e| format!("RAR extraction task panicked: {:?}", e))?;
-
-    let _ = tokio::fs::remove_file(&archive_path).await;
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
-
-    extraction_result
-}
+// RAR in-app previews intentionally fail closed until a safe, licensed,
+// single-member decoder is available. Stored RAR downloads remain supported.
 
 // ── 7z helpers ──────────────────────────────────────────────────────────
 
@@ -464,10 +394,8 @@ async fn extract_sevenz_entry(
                     ));
                 }
                 let safe_name = sanitise_entry_name(entry.name(), entry_index);
-                let mut buf = Vec::new();
-                entry_reader.read_to_end(&mut buf).map_err(|e| {
-                    sevenz_rust2::Error::other(format!("Failed to read 7z entry bytes: {}", e))
-                })?;
+                let buf = read_bounded_archive_entry(entry_reader, entry.size)
+                    .map_err(sevenz_rust2::Error::other)?;
                 found = Some((safe_name, entry.size, buf));
                 Ok(false) // stop iteration
             })
@@ -483,6 +411,10 @@ async fn extract_sevenz_entry(
         ));
         std::fs::write(&temp_path, &buf)
             .map_err(|e| format!("Failed to write extracted 7z entry: {}", e))?;
+        if let Err(error) = super::fs::register_temporary_output(&temp_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
 
         Ok(ExtractedFile {
             temp_path: temp_path.to_string_lossy().to_string(),
@@ -501,6 +433,55 @@ async fn extract_sevenz_entry(
 
 // ── Shared utilities ────────────────────────────────────────────────────
 
+// Do not interpret a Telegram network/transport error as a clean EOF.
+// Treating Err as None previously returned incomplete archive bytes as if
+// the remote download had completed successfully.
+fn archive_download_chunk<T, E: std::fmt::Display>(
+    result: Result<Option<T>, E>,
+    label: &str,
+) -> Result<Option<T>, String> {
+    result.map_err(|error| format!("{label} download failed: {error}"))
+}
+
+// ZIP and 7z previews load one decompressed entry into memory. Keep the
+// decoded output bounded even when the configured archive-download limit is
+// unlimited (or the entry's advertised uncompressed size is malicious).
+const MAX_ARCHIVE_ENTRY_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_bounded_archive_entry<R: Read + ?Sized>(
+    reader: &mut R,
+    declared_size: u64,
+) -> Result<Vec<u8>, String> {
+    read_bounded_archive_entry_with_limit(reader, declared_size, MAX_ARCHIVE_ENTRY_PREVIEW_BYTES)
+}
+
+fn read_bounded_archive_entry_with_limit<R: Read + ?Sized>(
+    reader: &mut R,
+    declared_size: u64,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    if declared_size > limit {
+        return Err(format!(
+            "Archive entry exceeds the {} MiB preview limit",
+            limit / (1024 * 1024)
+        ));
+    }
+    let read_limit = declared_size
+        .checked_add(1)
+        .ok_or_else(|| "Archive entry size overflow".to_string())?;
+    let mut bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed to read archive entry bytes: {e}"))?;
+    if bytes.len() as u64 != declared_size {
+        return Err(
+            "Archive entry's decompressed length does not match its declared size".to_string(),
+        );
+    }
+    Ok(bytes)
+}
+
 fn sanitise_entry_name(entry_name: &str, entry_index: usize) -> String {
     std::path::Path::new(entry_name)
         .file_name()
@@ -516,4 +497,107 @@ fn check_non_empty(entries: &[ArchiveEntry], filename: &str, label: &str) -> Res
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_archive_tests {
+    use super::{
+        archive_download_chunk, detect_archive_type, rar_preview_unavailable,
+        read_bounded_archive_entry, read_bounded_archive_entry_with_limit, sanitise_entry_name,
+        ArchiveType,
+    };
+    use std::io::{Cursor, Read, Write};
+
+    #[test]
+    fn zip_nine_deflate_archive_lists_and_extracts_one_bounded_entry() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("nested/hello.txt", options).unwrap();
+        writer.write_all(b"TeraRelay ZIP compatibility").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut entry = archive.by_index(0).unwrap();
+        let entry_name = entry.name().unwrap().into_owned();
+        assert_eq!(sanitise_entry_name(&entry_name, 0), "hello.txt");
+        let size = entry.size();
+        let extracted = read_bounded_archive_entry(&mut entry, size).unwrap();
+        assert_eq!(extracted, b"TeraRelay ZIP compatibility");
+    }
+
+    #[test]
+    fn unsafe_rar_preview_fails_closed_without_disabling_zip_or_sevenz() {
+        assert_eq!(detect_archive_type("anything.RAR"), ArchiveType::Rar);
+        assert_eq!(detect_archive_type("anything.zip"), ArchiveType::Zip);
+        assert_eq!(detect_archive_type("anything.7z"), ArchiveType::SevenZ);
+        let message = rar_preview_unavailable();
+        assert!(message.contains("temporarily disabled"));
+        assert!(message.contains("download the RAR"));
+    }
+
+    #[test]
+    fn download_transport_failure_is_not_silently_treated_as_end_of_file() {
+        let failure = archive_download_chunk::<Vec<u8>, std::io::Error>(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection lost",
+            )),
+            "RAR",
+        )
+        .unwrap_err();
+        assert!(failure.contains("RAR download failed"));
+        assert!(failure.contains("connection lost"));
+
+        assert_eq!(
+            archive_download_chunk::<Vec<u8>, std::io::Error>(Ok(None), "ZIP").unwrap(),
+            None
+        );
+        assert_eq!(
+            archive_download_chunk::<Vec<u8>, std::io::Error>(Ok(Some(b"ok".to_vec())), "ZIP")
+                .unwrap(),
+            Some(b"ok".to_vec())
+        );
+    }
+
+    #[test]
+    fn accepts_exact_bounded_data_and_empty_entries() {
+        assert_eq!(
+            read_bounded_archive_entry_with_limit(&mut Cursor::new(b"hello"), 5, 8).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            read_bounded_archive_entry_with_limit(&mut Cursor::new(b""), 0, 8).unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_claim_before_reading_any_bytes() {
+        struct MustNotRead;
+        impl Read for MustNotRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized archive entry must be rejected before decompression")
+            }
+        }
+        assert!(
+            read_bounded_archive_entry_with_limit(&mut MustNotRead, 9, 8)
+                .unwrap_err()
+                .contains("preview limit")
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_or_truncated_decompressed_entries() {
+        assert!(
+            read_bounded_archive_entry_with_limit(&mut Cursor::new(b"123456789"), 8, 8)
+                .unwrap_err()
+                .contains("decompressed length")
+        );
+        assert!(
+            read_bounded_archive_entry_with_limit(&mut Cursor::new(b"123"), 8, 8)
+                .unwrap_err()
+                .contains("decompressed length")
+        );
+    }
 }

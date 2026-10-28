@@ -1,8 +1,8 @@
 use crate::bandwidth::BandwidthManager;
-use crate::commands::utils::{map_error, resolve_peer};
+use crate::commands::utils::{map_error, resolve_peer, transfer_retry_delay};
 use crate::db::DbConnection;
 use crate::models::{FileMetadata, FolderMetadata};
-use crate::vpn_optimizer::{backoff_ms, NetworkConfig};
+use crate::vpn_optimizer::NetworkConfig;
 use crate::TelegramState;
 use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
@@ -26,6 +26,15 @@ static UPLOAD_CANCELLATIONS: OnceLock<Mutex<HashMap<String, watch::Sender<bool>>
 
 fn get_upload_cancellations() -> &'static Mutex<HashMap<String, watch::Sender<bool>>> {
     UPLOAD_CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Filename formats alone do not establish cleanup ownership.
+static OWNED_TEMP_OUTPUTS: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    OnceLock::new();
+const MAX_OWNED_TEMP_OUTPUTS: usize = 8192;
+
+fn owned_temp_outputs() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    OWNED_TEMP_OUTPUTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 fn url_decode(s: &str) -> String {
@@ -1042,6 +1051,35 @@ pub async fn cmd_preflight_upload_candidate(
 /// Report real acknowledged throughput over a short sliding window.
 /// No exponential smoothing or guessed carry-forward: the displayed MB/s is
 /// computed only from bytes Telegram has actually acknowledged.
+/// File counters include confirmed cached bytes; network rate starts at that
+/// baseline so resuming a large file cannot fabricate a throughput spike.
+struct DownloadProgress {
+    previous: u64,
+    window: SpeedWindow,
+}
+
+impl DownloadProgress {
+    fn new(confirmed: u64) -> Self {
+        Self {
+            previous: confirmed,
+            window: SpeedWindow::new(),
+        }
+    }
+
+    fn update(&mut self, received: u64, total: u64, seconds: f64) -> (u8, u64) {
+        let speed = self
+            .window
+            .update(received.saturating_sub(self.previous), seconds);
+        self.previous = received;
+        let percent = if total > 0 {
+            ((received as f64 / total as f64) * 100.0).min(99.0) as u8
+        } else {
+            0
+        };
+        (percent, speed)
+    }
+}
+
 struct SpeedWindow {
     total: u64,
     samples: std::collections::VecDeque<(std::time::Instant, u64)>,
@@ -1215,16 +1253,25 @@ fn adapt_upload_parallelism(
     (next_lanes, next_workers)
 }
 
+struct UploadAckStage<'a> {
+    previous_speed: &'a mut Option<f64>,
+    acknowledged: &'a mut u64,
+    started: &'a mut std::time::Instant,
+}
+
 fn observe_upload_ack(
     mode: &str,
     max_lanes: usize,
     active_lanes: &mut usize,
     workers: &mut usize,
-    previous_speed: &mut Option<f64>,
-    stage_acknowledged: &mut u64,
-    stage_started: &mut std::time::Instant,
+    stage: UploadAckStage<'_>,
     acknowledged: usize,
 ) {
+    let UploadAckStage {
+        previous_speed,
+        acknowledged: stage_acknowledged,
+        started: stage_started,
+    } = stage;
     *stage_acknowledged = stage_acknowledged.saturating_add(acknowledged as u64);
     if *stage_acknowledged < UPLOAD_ADAPT_BYTES {
         return;
@@ -1370,9 +1417,18 @@ async fn build_upload_lane_pool(
     }
 
     let raw_needed = desired_total.saturating_sub(lanes.len());
+    // Resolve once per pool, not once per transfer lane. An enabled but
+    // invalid proxy must never downgrade extra sockets to direct Telegram.
+    let proxy_url = match net_config.effective_proxy_url_checked()? {
+        Some(proxy) => Some(crate::commands::auth::resolve_telegram_proxy_url(proxy).await?),
+        None => None,
+    };
     for _ in 0..raw_needed {
-        let server = if let Some(proxy) = net_config.effective_proxy_url() {
-            ServerAddr::Proxied { address, proxy }
+        let server = if let Some(proxy) = &proxy_url {
+            ServerAddr::Proxied {
+                address,
+                proxy: proxy.clone(),
+            }
         } else {
             ServerAddr::Tcp { address }
         };
@@ -1457,6 +1513,13 @@ fn telegram_upload_chunk_size(len: u64, mode: &str) -> usize {
     }
 }
 
+struct UploadPartRetryPolicy {
+    max_retries: u32,
+    base_ms: u64,
+    max_ms: u64,
+    respect_flood: bool,
+}
+
 async fn save_upload_part_with_retry(
     lane: UploadLane,
     file_id: i64,
@@ -1464,15 +1527,17 @@ async fn save_upload_part_with_retry(
     part_count: i32,
     is_big: bool,
     bytes: Vec<u8>,
-    max_retries: u32,
-    base_ms: u64,
-    max_ms: u64,
-    respect_flood: bool,
+    retry: UploadPartRetryPolicy,
 ) -> Result<usize, String> {
+    let UploadPartRetryPolicy {
+        max_retries,
+        base_ms,
+        max_ms,
+        respect_flood,
+    } = retry;
     let byte_len = bytes.len();
-    let mut last_err = String::new();
-
-    for attempt in 0..=max_retries {
+    let mut retries_left = max_retries;
+    loop {
         let result = if is_big {
             let request = tl::functions::upload::SaveBigFilePart {
                 file_id,
@@ -1516,40 +1581,37 @@ async fn save_upload_part_with_retry(
             }
         };
 
-        match result {
+        let last_err = match result {
             Ok(true) => return Ok(byte_len),
-            Ok(false) => last_err = "Telegram rejected an upload chunk".to_string(),
-            Err(error) => {
-                let mapped = map_error(error);
-                if respect_flood && mapped.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = mapped.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        last_err = mapped;
-                        continue;
-                    }
-                }
-                last_err = mapped;
-            }
-        }
+            Ok(false) => "Telegram rejected an upload chunk".to_string(),
+            Err(error) => map_error(error),
+        };
 
-        if attempt < max_retries {
-            let delay = backoff_ms(attempt, base_ms, max_ms);
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        }
+        let Some(delay) = transfer_retry_delay(
+            &last_err,
+            respect_flood,
+            &mut retries_left,
+            max_retries,
+            base_ms,
+            max_ms,
+        ) else {
+            return Err(format!(
+                "Upload chunk {} failed after {} network attempts: {}",
+                part_index,
+                max_retries + 1,
+                last_err
+            ));
+        };
+        tokio::time::sleep(delay).await;
     }
-
-    Err(format!(
-        "Upload chunk {} failed after {} attempts: {}",
-        part_index,
-        max_retries + 1,
-        last_err
-    ))
 }
-
 /// Upload one Telegram document through the already-authorized transfer pool.
 /// Bytes are added to the progress counter only after Telegram acknowledges the
 /// corresponding SaveFilePart/SaveBigFilePart RPC.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Transfer worker requires explicit range, cancellation, network and progress context"
+)]
 async fn upload_range_fast(
     pool: &UploadLanePool,
     path: &str,
@@ -1638,10 +1700,12 @@ async fn upload_range_fast(
                 part_count,
                 is_big,
                 chunk,
-                max_retries,
-                base_ms,
-                max_ms,
-                respect_flood,
+                UploadPartRetryPolicy {
+                    max_retries,
+                    base_ms,
+                    max_ms,
+                    respect_flood,
+                },
             )
             .await?;
             counter.fetch_add(acknowledged as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1658,9 +1722,11 @@ async fn upload_range_fast(
                             max_lanes,
                             &mut active_lanes,
                             &mut window,
-                            &mut previous_stage_speed,
-                            &mut stage_acknowledged,
-                            &mut stage_started,
+                            UploadAckStage {
+                                previous_speed: &mut previous_stage_speed,
+                                acknowledged: &mut stage_acknowledged,
+                                started: &mut stage_started,
+                            },
                             acknowledged,
                         );
                     }
@@ -1683,9 +1749,11 @@ async fn upload_range_fast(
                             max_lanes,
                             &mut active_lanes,
                             &mut window,
-                            &mut previous_stage_speed,
-                            &mut stage_acknowledged,
-                            &mut stage_started,
+                            UploadAckStage {
+                                previous_speed: &mut previous_stage_speed,
+                                acknowledged: &mut stage_acknowledged,
+                                started: &mut stage_started,
+                            },
                             acknowledged,
                         );
                     }
@@ -1886,29 +1954,20 @@ pub fn parse_part_name(name: &str) -> Option<(&str, u32, u32, Option<&str>)> {
     Some((&name[..pos], idx, total, hash))
 }
 
-/// Async reader wrapper that tracks bytes read for progress reporting.
+/// Test-only historical reader used by existing split-range checksum fixtures.
+/// The production transfer uses the shared chunk uploader instead.
 /// Reads a byte range of a file and adds consumed bytes to a shared counter,
 /// so multiple readers (split parts) report cumulative progress. Optionally
 /// hashes everything it yields, for the part checksum in the caption.
+#[cfg(test)]
 struct ProgressReader {
     inner: tokio::io::Take<tokio::io::BufReader<tokio::fs::File>>,
     bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     hasher: Option<sha2::Sha256>,
 }
 
+#[cfg(test)]
 impl ProgressReader {
-    async fn new(
-        path: &str,
-    ) -> Result<(Self, u64, std::sync::Arc<std::sync::atomic::AtomicU64>), String> {
-        let size = tokio::fs::metadata(path)
-            .await
-            .map_err(|e| e.to_string())?
-            .len();
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let reader = Self::new_range(path, 0, size, counter.clone(), false).await?;
-        Ok((reader, size, counter))
-    }
-
     /// Reader over bytes [offset, offset + len) of the file.
     async fn new_range(
         path: &str,
@@ -1933,13 +1992,13 @@ impl ProgressReader {
     }
 
     /// SHA-256 hex of everything read so far; None when hashing was off.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn finalize_hash(&mut self) -> Option<String> {
         use sha2::Digest;
         self.hasher.take().map(|h| format!("{:x}", h.finalize()))
     }
 }
 
+#[cfg(test)]
 impl tokio::io::AsyncRead for ProgressReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -1989,6 +2048,10 @@ pub async fn cmd_cancel_transfer(
 
 #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(unused_mut))]
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri IPC command arguments and injected states are frontend API contracts"
+)]
 pub async fn cmd_upload_file(
     mut path: String,
     folder_id: Option<i64>,
@@ -2062,6 +2125,10 @@ pub async fn cmd_upload_file(
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Upload worker mirrors the Tauri IPC contract and injected transfer states"
+)]
 async fn cmd_upload_file_inner(
     path: String,
     folder_id: Option<i64>,
@@ -2219,20 +2286,15 @@ async fn cmd_upload_file_inner(
     // Multipart numbering is checked independently of file size. The
     // manifest preflight runs before any data upload or large allocation.
     let part_size = split_part_size().max(1);
-    let total_parts = checked_upload_part_count(size, part_size).map_err(|error| {
-        bw_state.release_up(size);
-        error
-    })?;
+    let total_parts =
+        checked_upload_part_count(size, part_size).inspect_err(|_| bw_state.release_up(size))?;
     crate::commands::logical_files::ensure_upload_manifest_capacity(
         logical_channel_id.as_deref().unwrap_or("saved-messages"),
         &file_name,
         size,
         total_parts,
     )
-    .map_err(|error| {
-        bw_state.release_up(size);
-        error
-    })?;
+    .inspect_err(|_| bw_state.release_up(size))?;
 
     let mut journal = crate::commands::transfers::UploadJournal::open(
         db_pool.inner().clone(),
@@ -2241,12 +2303,10 @@ async fn cmd_upload_file_inner(
         folder_id,
         part_size,
         logical_file_id,
+        &file_name,
     )
     .await
-    .map_err(|error| {
-        bw_state.release_up(size);
-        error
-    })?;
+    .inspect_err(|_| bw_state.release_up(size))?;
     let logical_file_id = journal.snapshot.logical_file_id.clone();
     if journal.snapshot.source.size != size {
         bw_state.release_up(size);
@@ -2268,10 +2328,7 @@ async fn cmd_upload_file_inner(
         &journal,
     )
     .await
-    .map_err(|error| {
-        bw_state.release_up(size);
-        error
-    })?;
+    .inspect_err(|_| bw_state.release_up(size))?;
     let (upload_indices, _, done_bytes) =
         parts_to_upload(size, part_size, total_parts, &existing_parts);
     let mut manifest_chunks: std::collections::BTreeMap<
@@ -2293,14 +2350,11 @@ async fn cmd_upload_file_inner(
         .collect();
     journal
         .replace_chunks(manifest_chunks.clone())
-        .map_err(|error| {
-            bw_state.release_up(size);
-            error
-        })?;
-    journal.verify_source(&path).await.map_err(|error| {
-        bw_state.release_up(size);
-        error
-    })?;
+        .inspect_err(|_| bw_state.release_up(size))?;
+    journal
+        .verify_source(&path)
+        .await
+        .inspect_err(|_| bw_state.release_up(size))?;
     bw_state.release_up(done_bytes);
 
     // Authoritative file-byte counter shared by every upload chunk. It starts
@@ -2688,6 +2742,7 @@ async fn cmd_upload_file_inner(
                     send_name,
                     caption,
                     &peer,
+                    cancel_rx.clone(),
                 )
                 .await?;
                 journal.verify_source(&path).await?;
@@ -2730,10 +2785,10 @@ async fn cmd_upload_file_inner(
         return Err(err);
     }
 
-    journal.verify_source(&path).await.map_err(|error| {
-        bw_state.release_up(size.saturating_sub(done_bytes));
-        error
-    })?;
+    journal
+        .verify_source(&path)
+        .await
+        .inspect_err(|_| bw_state.release_up(size.saturating_sub(done_bytes)))?;
     let mut published_manifest_id = None;
 
     // TeraRelay channels publish one small hidden manifest after all physical
@@ -2751,7 +2806,7 @@ async fn cmd_upload_file_inner(
         }
 
         let chunks: Vec<_> = manifest_chunks.into_values().collect();
-        let manifest = crate::commands::logical_files::LogicalFileManifestV1 {
+        let mut manifest = crate::commands::logical_files::LogicalFileManifestV1 {
             schema_version: crate::commands::logical_files::MANIFEST_SCHEMA_VERSION,
             file_id: file_id.clone(),
             logical_channel_id: logical_channel_id.clone(),
@@ -2760,7 +2815,10 @@ async fn cmd_upload_file_inner(
             mime_type: mime_guess::from_path(&file_name)
                 .first()
                 .map(|mime| mime.essence_str().to_string()),
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: journal
+                .snapshot
+                .created_at
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
             whole_sha256: whole_sha256.clone(),
             chunks,
         };
@@ -2779,7 +2837,14 @@ async fn cmd_upload_file_inner(
             None
         };
         published_manifest_id = Some(match existing_manifest {
-            Some(id) => id,
+            Some((id, originally_created)) => {
+                // A pre-upgrade checkpoint may have lacked a creation time.
+                // An already-published Telegram manifest is authoritative:
+                // retaining its timestamp avoids changing file creation
+                // metadata on a post-crash local publication retry.
+                manifest.created_at = originally_created;
+                id
+            },
             None => upload_logical_manifest_document(
                 &client, &app_handle, &manifest, &peer,
             ).await.map_err(|error| {
@@ -2789,17 +2854,38 @@ async fn cmd_upload_file_inner(
             })?,
         });
 
-        let persist_result = {
+        // Persist the Telegram-accepted manifest ID before indexing locally:
+        // retry and exact owned-message cleanup must not lose a successful
+        // remote publication when the following SQLite operation fails.
+        journal.record_manifest_message_id(
+            published_manifest_id.ok_or("Accepted manifest ID missing")?,
+        )?;
+
+        // Publish the ordinary upload into the mounted Drive immediately.
+        // The manifest and its Drive directory entry share one SQLite
+        // savepoint; a partial local publication must not be acknowledged.
+        let visible_entry = {
             let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
-            crate::commands::logical_files::persist_manifest(&conn, &manifest)
-        };
-        if let Err(error) = persist_result {
-            // The remote manifest is authoritative and can rebuild this cache
-            // on the next listing/restart, so do not turn a completed upload
-            // into a duplicate-producing retry.
-            log::warn!(
-                "Remote TeraRelay manifest was published but local cache update failed: {}",
-                error
+            crate::commands::drive_metadata::publish_completed_upload_to_drive(&conn, &manifest)
+        }
+        .map_err(|error| format!(
+            "Telegram accepted the uploaded file, but local Drive indexing failed: {error}. Retry to recover the upload without losing its remote chunks."
+        ))?;
+        // Kernel notifications are emitted after the DB lock is released.
+        if let Some((parent, name, new_folder_name, entry_id)) = visible_entry {
+            if let Some(folder_name) = new_folder_name {
+                crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                    &app_handle,
+                    None,
+                    &folder_name,
+                    None,
+                );
+            }
+            crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                &app_handle,
+                Some(&parent),
+                &name,
+                Some(&entry_id),
             );
         }
     }
@@ -2879,6 +2965,7 @@ async fn send_uploaded_part(
     file_name: String,
     caption: String,
     peer: &Peer,
+    mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<i64, String> {
     let input_peer = match peer {
         Peer::User(u) => {
@@ -2928,9 +3015,9 @@ async fn send_uploaded_part(
     let max_ms = net_config.retry_max_backoff_ms();
     let respect_flood = net_config.should_respect_flood_wait();
     let random_id = rand::random::<i64>();
-    let mut last_err = String::new();
+    let mut retries_left = max_retries;
 
-    for attempt in 0..=max_retries {
+    loop {
         let request = tl::functions::messages::SendMedia {
             silent: false,
             background: false,
@@ -2988,36 +3075,30 @@ async fn send_uploaded_part(
             }
             Err(e) => {
                 let err = map_error(e);
-                log::warn!(
-                    "send uploaded document attempt {}/{}: {}",
-                    attempt + 1,
-                    max_retries + 1,
-                    err
-                );
-
-                if respect_flood && err.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        last_err = err;
-                        continue;
-                    }
+                let Some(delay) = transfer_retry_delay(
+                    &err,
+                    respect_flood,
+                    &mut retries_left,
+                    max_retries,
+                    base_ms,
+                    max_ms,
+                ) else {
+                    return Err(format!(
+                        "Upload send failed after {} network attempts: {}",
+                        max_retries + 1,
+                        err
+                    ));
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = cancel_rx.changed() => return Err("Transfer cancelled".to_string()),
                 }
-
-                last_err = err;
-                if attempt < max_retries {
-                    let delay = backoff_ms(attempt, base_ms, max_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                if *cancel_rx.borrow() {
+                    return Err("Transfer cancelled".to_string());
                 }
             }
         }
     }
-
-    Err(format!(
-        "Upload send failed after {} attempts: {}",
-        max_retries + 1,
-        last_err
-    ))
 }
 
 async fn find_logical_manifest_message_ids(
@@ -3046,7 +3127,7 @@ async fn matching_upload_manifest(
     peer: &Peer,
     manifest: &crate::commands::logical_files::LogicalFileManifestV1,
     known_message_id: Option<i64>,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<(i64, i64)>, String> {
     let ids = match known_message_id {
         Some(id) => {
             vec![i32::try_from(id).map_err(|_| "Invalid saved manifest message ID".to_string())?]
@@ -3067,9 +3148,10 @@ async fn matching_upload_manifest(
         .await?;
         // Retry time is not file identity. All data, order and checksum fields
         // must still agree before an already-published manifest is accepted.
+        let originally_created = existing.created_at;
         existing.created_at = manifest.created_at;
         if &existing == manifest {
-            return Ok(Some(i64::from(message.id())));
+            return Ok(Some((i64::from(message.id()), originally_created)));
         }
     }
     Ok(None)
@@ -3290,6 +3372,10 @@ pub(crate) async fn resolve_parts(
 }
 
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri IPC command arguments and injected states are frontend API contracts"
+)]
 pub async fn initiate_upload(
     path: String,
     folder_id: Option<i64>,
@@ -3607,8 +3693,62 @@ pub(crate) async fn delete_file_inner(
     Ok(true)
 }
 
+fn download_throttle_delay(
+    received: u64,
+    confirmed: u64,
+    elapsed: f64,
+    limit: u64,
+) -> std::time::Duration {
+    if limit == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let network_bytes = received.saturating_sub(confirmed);
+    let seconds = (network_bytes as f64 / limit as f64 - elapsed.max(0.001)).clamp(0.0, 5.0);
+    std::time::Duration::from_secs_f64(seconds)
+}
+
+/// An error stops new work, but in-flight workers unwind before output reuse.
+async fn drain_download_tasks<S, F, Fut>(
+    stream: S,
+    limit: usize,
+    mut operation: F,
+) -> Result<(), String>
+where
+    S: futures::Stream,
+    F: FnMut(S::Item) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use futures::StreamExt;
+    let failure = std::sync::Mutex::new(None);
+    stream
+        .for_each_concurrent(limit, |item| {
+            let task = operation(item);
+            let failure = &failure;
+            async move {
+                if failure.lock().unwrap().is_some() {
+                    return;
+                }
+                if let Err(error) = task.await {
+                    let mut first = failure.lock().unwrap();
+                    if first.is_none() {
+                        *first = Some(error);
+                    }
+                }
+            }
+        })
+        .await;
+    match failure.into_inner().unwrap() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Downloads one part into its byte region [region_start, region_start + expected_len)
 /// of the destination file, with per-chunk cancellation, retry and throttling.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Split-part worker carries explicit byte region, integrity and cancellation context"
+)]
 async fn download_part_to_region(
     client: &grammers_client::Client,
     media: &Media,
@@ -3623,17 +3763,12 @@ async fn download_part_to_region(
     tid: &str,
     net_config: &NetworkConfig,
     started: std::time::Instant,
+    confirmed: u64,
+    output: &crate::download_output::DownloadOutput,
 ) -> Result<(), String> {
     use sha2::Digest;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(save_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(region_start))
-        .await
-        .map_err(|e| e.to_string())?;
+    let _ = save_path;
 
     let mut download_iter = client.iter_download(media);
     let mut written: u64 = 0;
@@ -3651,29 +3786,21 @@ async fn download_part_to_region(
             }
             Err(e) => {
                 let err = map_error(&e);
-                if retry_budget > 0 {
-                    retry_budget -= 1;
-                    log::warn!(
-                        "Download chunk error part {}/{} (retries left: {}): {}",
-                        part_no,
-                        part_count,
-                        retry_budget,
-                        err
-                    );
-                    let delay = backoff_ms(
-                        0,
-                        net_config.retry_base_backoff_ms(),
-                        net_config.retry_max_backoff_ms(),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                if let Some(delay) = transfer_retry_delay(
+                    &err,
+                    net_config.should_respect_flood_wait(),
+                    &mut retry_budget,
+                    net_config.retry_attempts(),
+                    net_config.retry_base_backoff_ms(),
+                    net_config.retry_max_backoff_ms(),
+                ) {
+                    wait_for_transfer_retry(delay, cancelled, tid).await?;
                     continue;
                 }
-                return Err(format!("Download chunk error: {}", err));
+                return Err(format!("Download chunk error: {err}"));
             }
         };
-        tokio::io::AsyncWriteExt::write_all(&mut file, &bytes)
-            .await
-            .map_err(|e| e.to_string())?;
+        output.write_region(region_start + written, &bytes).await?;
         if let Some(h) = hasher.as_mut() {
             h.update(&bytes);
         }
@@ -3682,17 +3809,14 @@ async fn download_part_to_region(
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
             + bytes.len() as u64;
 
-        let dl_limit = net_config.download_limit_bytes_per_sec();
-        if dl_limit > 0 {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let rate = total_so_far as f64 / elapsed;
-            if rate > dl_limit as f64 {
-                let ideal_elapsed = total_so_far as f64 / dl_limit as f64;
-                let sleep_ms = ((ideal_elapsed - elapsed) * 1000.0) as u64;
-                if sleep_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms.min(5000))).await;
-                }
-            }
+        let delay = download_throttle_delay(
+            total_so_far,
+            confirmed,
+            started.elapsed().as_secs_f64(),
+            net_config.download_limit_bytes_per_sec(),
+        );
+        if !delay.is_zero() {
+            wait_for_transfer_retry(delay, cancelled, tid).await?;
         }
     }
 
@@ -3713,10 +3837,6 @@ async fn download_part_to_region(
         }
     }
 
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|e| e.to_string())?;
-    file.sync_all().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3724,6 +3844,10 @@ async fn download_part_to_region(
 /// destination file. Progress and speed are reported by a single 250ms task
 /// reading the shared byte counter, so they stay accurate regardless of how
 /// the parts interleave. Returns the total bytes downloaded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parallel transfer orchestration keeps explicit progress and cancellation context"
+)]
 async fn download_parts_parallel(
     client: &grammers_client::Client,
     cancelled: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
@@ -3733,6 +3857,7 @@ async fn download_parts_parallel(
     save_path: &str,
     parts: &[(Media, Option<u64>, Option<String>)],
     total_size: u64,
+    output: &crate::download_output::DownloadOutput,
 ) -> Result<u64, String> {
     // Byte regions per part; every split part is a document with a known size
     let mut jobs: Vec<(usize, &Media, u64, u64, Option<&str>)> = Vec::with_capacity(parts.len());
@@ -3744,13 +3869,16 @@ async fn download_parts_parallel(
     }
 
     // Preallocate so each part can write straight into its region
-    let file = tokio::fs::File::create(save_path)
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(save_path)
         .await
         .map_err(|e| e.to_string())?;
     file.set_len(total_size).await.map_err(|e| e.to_string())?;
     drop(file);
 
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let confirmed = output.confirmed_bytes();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(confirmed));
     let started = std::time::Instant::now();
 
     let emitter = if !tid.is_empty() {
@@ -3758,20 +3886,15 @@ async fn download_parts_parallel(
         let emit_tid = tid.to_string();
         let emit_handle = app_handle.clone();
         Some(tokio::spawn(async move {
-            let mut last_bytes: u64 = 0;
+            let mut progress =
+                DownloadProgress::new(emit_counter.load(std::sync::atomic::Ordering::Relaxed));
             let mut last_time = std::time::Instant::now();
-            let mut speed_smoother = SpeedWindow::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last_time).as_secs_f64();
-                let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
-                let percent = if total_size > 0 {
-                    ((current as f64 / total_size as f64) * 100.0).min(99.0) as u8
-                } else {
-                    0
-                };
+                let (percent, speed) = progress.update(current, total_size, dt);
                 let _ = emit_handle.emit(
                     "download-progress",
                     ProgressPayload {
@@ -3782,7 +3905,6 @@ async fn download_parts_parallel(
                         speed_bytes_per_sec: speed,
                     },
                 );
-                last_bytes = current;
                 last_time = now;
                 if current >= total_size {
                     break;
@@ -3793,13 +3915,17 @@ async fn download_parts_parallel(
         None
     };
 
-    use futures::TryStreamExt;
     let part_count = parts.len();
-    let result: Result<(), String> = futures::stream::iter(jobs.into_iter().map(Ok::<_, String>))
-        .try_for_each_concurrent(download_parallel_parts(), |(i, media, start, len, hash)| {
+    let result = drain_download_tasks(
+        futures::stream::iter(jobs),
+        download_parallel_parts(),
+        |(i, media, start, len, hash)| {
             let counter = counter.clone();
             let cancelled = cancelled.clone();
             async move {
+                if output.is_region_confirmed(start, len) {
+                    return Ok(());
+                }
                 download_part_to_region(
                     client,
                     media,
@@ -3814,11 +3940,15 @@ async fn download_parts_parallel(
                     tid,
                     net_config,
                     started,
+                    confirmed,
+                    output,
                 )
-                .await
+                .await?;
+                output.confirm_region(start, len).await
             }
-        })
-        .await;
+        },
+    )
+    .await;
 
     if let Some(t) = emitter {
         t.abort();
@@ -4007,12 +4137,18 @@ async fn build_download_lane_pool(
     let desired = boost_download_connection_limit();
     let params = ConnectionParams::default();
     let mut lanes = Vec::with_capacity(desired);
+    // Every boosted lane must obey the same mandatory proxy as the main
+    // Telegram connection. Resolve its host through the OS just once.
+    let proxy_url = match net_config.effective_proxy_url_checked()? {
+        Some(proxy) => Some(crate::commands::auth::resolve_telegram_proxy_url(proxy).await?),
+        None => None,
+    };
 
     for lane_index in 0..desired {
-        let server = if let Some(proxy) = net_config.effective_proxy_url() {
+        let server = if let Some(proxy) = &proxy_url {
             ServerAddr::Proxied {
                 address: endpoint,
-                proxy,
+                proxy: proxy.clone(),
             }
         } else {
             ServerAddr::Tcp { address: endpoint }
@@ -4101,12 +4237,32 @@ fn adapt_download_lanes(
     next
 }
 
+async fn wait_for_transfer_retry(
+    delay: std::time::Duration,
+    cancelled: &Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    tid: &str,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if cancelled.read().await.contains(tid) {
+            return Err("Transfer cancelled".to_string());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
+    }
+}
+
 async fn download_boost_chunk_raw(
     sender: SharedDownloadSender,
     location: tl::enums::InputFileLocation,
     offset: u64,
     expected_len: usize,
     net_config: &NetworkConfig,
+    cancelled: &Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    tid: &str,
 ) -> Result<Vec<u8>, String> {
     let mut retries_left = net_config.retry_attempts();
 
@@ -4142,32 +4298,20 @@ async fn download_boost_chunk_raw(
             }
             Err(error) => {
                 let mapped = map_error(error);
-                if net_config.should_respect_flood_wait()
-                    && (mapped.starts_with("FLOOD_WAIT_")
-                        || mapped.starts_with("FLOOD_PREMIUM_WAIT_"))
-                {
-                    let seconds = mapped
-                        .rsplit('_')
-                        .next()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    if seconds > 0 && retries_left > 0 {
-                        retries_left -= 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(seconds.min(300))).await;
-                        continue;
-                    }
-                }
-                if retries_left == 0 {
+                if mapped.contains("FILE_REFERENCE") {
                     return Err(mapped);
                 }
-                retries_left -= 1;
-                let attempt = net_config.retry_attempts().saturating_sub(retries_left);
-                let delay = backoff_ms(
-                    attempt,
+                let Some(delay) = transfer_retry_delay(
+                    &mapped,
+                    net_config.should_respect_flood_wait(),
+                    &mut retries_left,
+                    net_config.retry_attempts(),
                     net_config.retry_base_backoff_ms(),
                     net_config.retry_max_backoff_ms(),
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                ) else {
+                    return Err(mapped);
+                };
+                wait_for_transfer_retry(delay, cancelled, tid).await?;
             }
         }
     }
@@ -4175,6 +4319,10 @@ async fn download_boost_chunk_raw(
 
 /// Existing high-level Grammers parallel downloader retained as a reliability
 /// fallback when dedicated Boost lanes cannot be established.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Legacy shared-client fallback preserves transfer and retry call contracts"
+)]
 async fn download_single_document_boost_shared_client(
     client: &grammers_client::Client,
     media: &Media,
@@ -4185,12 +4333,15 @@ async fn download_single_document_boost_shared_client(
     net_config: &NetworkConfig,
     app_handle: &tauri::AppHandle,
     tid: &str,
+    output: &crate::download_output::DownloadOutput,
 ) -> Result<u64, String> {
     if expected_len == 0 {
         return Err("TeraRelay Boost requires a known document size".to_string());
     }
 
-    let file = tokio::fs::File::create(save_path)
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(save_path)
         .await
         .map_err(|e| e.to_string())?;
     file.set_len(expected_len)
@@ -4203,7 +4354,8 @@ async fn download_single_document_boost_shared_client(
     let workers = boost_download_workers()
         .min(chunk_count.max(1) as usize)
         .max(1);
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let confirmed = output.confirmed_bytes();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(confirmed));
     let started = std::time::Instant::now();
 
     log::info!(
@@ -4218,16 +4370,15 @@ async fn download_single_document_boost_shared_client(
         let emit_tid = tid.to_string();
         let emit_handle = app_handle.clone();
         Some(tokio::spawn(async move {
-            let mut last_bytes = 0u64;
+            let mut progress =
+                DownloadProgress::new(emit_counter.load(std::sync::atomic::Ordering::Relaxed));
             let mut last_time = std::time::Instant::now();
-            let mut speed_smoother = SpeedWindow::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last_time).as_secs_f64();
-                let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
-                let percent = ((current as f64 / expected_len as f64) * 100.0).min(99.0) as u8;
+                let (percent, speed) = progress.update(current, expected_len, dt);
                 let _ = emit_handle.emit(
                     "download-progress",
                     ProgressPayload {
@@ -4238,7 +4389,6 @@ async fn download_single_document_boost_shared_client(
                         speed_bytes_per_sec: speed,
                     },
                 );
-                last_bytes = current;
                 last_time = now;
                 if current >= expected_len {
                     break;
@@ -4249,103 +4399,99 @@ async fn download_single_document_boost_shared_client(
         None
     };
 
-    use futures::TryStreamExt;
-    let result: Result<(), String> = futures::stream::iter((0..chunk_count).map(Ok::<u64, String>))
-        .try_for_each_concurrent(workers, |chunk_index| {
+    let result = drain_download_tasks(
+        futures::stream::iter((0..chunk_count).step_by(BOOST_DOWNLOAD_ADAPT_CHUNKS as usize)),
+        workers,
+        |block_start| {
             let counter = counter.clone();
             async move {
                 if cancelled.read().await.contains(tid) {
                     return Err("Transfer cancelled".to_string());
                 }
 
-                let offset = chunk_index * chunk_size;
-                let expected_chunk_len = (expected_len - offset).min(chunk_size) as usize;
-                let skip = i32::try_from(chunk_index)
-                    .map_err(|_| "Boost download chunk index overflow".to_string())?;
-                let mut retries_left = net_config.retry_attempts();
+                let block_end = (block_start + BOOST_DOWNLOAD_ADAPT_CHUNKS).min(chunk_count);
+                let region_offset = block_start * chunk_size;
+                let region_len =
+                    (expected_len - region_offset).min(BOOST_DOWNLOAD_ADAPT_CHUNKS * chunk_size);
+                if output.is_region_confirmed(region_offset, region_len) {
+                    return Ok(());
+                }
+                for chunk_index in block_start..block_end {
+                    let offset = chunk_index * chunk_size;
+                    let expected_chunk_len = (expected_len - offset).min(chunk_size) as usize;
+                    let skip = i32::try_from(chunk_index)
+                        .map_err(|_| "Boost download chunk index overflow".to_string())?;
+                    let mut retries_left = net_config.retry_attempts();
 
-                let bytes = loop {
-                    if cancelled.read().await.contains(tid) {
-                        return Err("Transfer cancelled".to_string());
-                    }
-
-                    let mut download = client
-                        .iter_download(media)
-                        .chunk_size(BOOST_DOWNLOAD_CHUNK_SIZE)
-                        .skip_chunks(skip);
-
-                    match download.next().await {
-                        Ok(Some(bytes)) => break bytes,
-                        Ok(None) => {
-                            return Err(format!(
-                                "TeraRelay Boost returned no data for chunk {}",
-                                chunk_index + 1
-                            ));
+                    let bytes = loop {
+                        if cancelled.read().await.contains(tid) {
+                            return Err("Transfer cancelled".to_string());
                         }
-                        Err(error) => {
-                            let mapped = map_error(error);
-                            if retries_left == 0 {
+
+                        let mut download = client
+                            .iter_download(media)
+                            .chunk_size(BOOST_DOWNLOAD_CHUNK_SIZE)
+                            .skip_chunks(skip);
+
+                        match download.next().await {
+                            Ok(Some(bytes)) => break bytes,
+                            Ok(None) => {
                                 return Err(format!(
-                                    "TeraRelay Boost chunk {} failed: {}",
-                                    chunk_index + 1,
-                                    mapped
+                                    "TeraRelay Boost returned no data for chunk {}",
+                                    chunk_index + 1
                                 ));
                             }
-                            retries_left -= 1;
-                            let delay = backoff_ms(
-                                net_config.retry_attempts().saturating_sub(retries_left),
-                                net_config.retry_base_backoff_ms(),
-                                net_config.retry_max_backoff_ms(),
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            Err(error) => {
+                                let mapped = map_error(error);
+                                let Some(delay) = transfer_retry_delay(
+                                    &mapped,
+                                    net_config.should_respect_flood_wait(),
+                                    &mut retries_left,
+                                    net_config.retry_attempts(),
+                                    net_config.retry_base_backoff_ms(),
+                                    net_config.retry_max_backoff_ms(),
+                                ) else {
+                                    return Err(format!(
+                                        "TeraRelay Boost chunk {} failed: {}",
+                                        chunk_index + 1,
+                                        mapped
+                                    ));
+                                };
+                                wait_for_transfer_retry(delay, cancelled, tid).await?;
+                            }
                         }
+                    };
+
+                    if bytes.len() != expected_chunk_len {
+                        return Err(format!(
+                            "Incomplete TeraRelay Boost chunk {}: expected {} bytes, received {}",
+                            chunk_index + 1,
+                            expected_chunk_len,
+                            bytes.len()
+                        ));
                     }
-                };
 
-                if bytes.len() != expected_chunk_len {
-                    return Err(format!(
-                        "Incomplete TeraRelay Boost chunk {}: expected {} bytes, received {}",
-                        chunk_index + 1,
-                        expected_chunk_len,
-                        bytes.len()
-                    ));
-                }
+                    output.write_region(offset, &bytes).await?;
 
-                let mut output = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(save_path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                tokio::io::AsyncSeekExt::seek(&mut output, std::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                tokio::io::AsyncWriteExt::write_all(&mut output, &bytes)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let total_so_far = counter
-                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
-                    + bytes.len() as u64;
-                let dl_limit = net_config.download_limit_bytes_per_sec();
-                if dl_limit > 0 {
-                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                    let rate = total_so_far as f64 / elapsed;
-                    if rate > dl_limit as f64 {
-                        let ideal_elapsed = total_so_far as f64 / dl_limit as f64;
-                        let sleep_ms = ((ideal_elapsed - elapsed) * 1000.0) as u64;
-                        if sleep_ms > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                sleep_ms.min(5000),
-                            ))
-                            .await;
-                        }
+                    let total_so_far = counter
+                        .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                        + bytes.len() as u64;
+                    let delay = download_throttle_delay(
+                        total_so_far,
+                        confirmed,
+                        started.elapsed().as_secs_f64(),
+                        net_config.download_limit_bytes_per_sec(),
+                    );
+                    if !delay.is_zero() {
+                        wait_for_transfer_retry(delay, cancelled, tid).await?;
                     }
                 }
-
+                output.confirm_region(region_offset, region_len).await?;
                 Ok(())
             }
-        })
-        .await;
+        },
+    )
+    .await;
 
     if let Some(task) = emitter {
         task.abort();
@@ -4384,6 +4530,10 @@ async fn download_single_document_boost_shared_client(
 /// TeraRelay Boost V2: dedicated file-transfer sessions on the document's
 /// Telegram media DC. The already-authorized account session is reused; no
 /// interactive login or TDLib state is involved.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Dedicated Telegram media-DC transfer contract keeps session and integrity context"
+)]
 async fn download_single_document_boost(
     client: &grammers_client::Client,
     state: &TelegramState,
@@ -4395,12 +4545,17 @@ async fn download_single_document_boost(
     net_config: &NetworkConfig,
     app_handle: &tauri::AppHandle,
     tid: &str,
+    output: &crate::download_output::DownloadOutput,
+    peer: &Peer,
+    message_id: i32,
 ) -> Result<u64, String> {
     if expected_len == 0 {
         return Err("TeraRelay Boost requires a known document size".to_string());
     }
 
-    let (pool, location) = match build_download_lane_pool(client, state, media, net_config).await {
+    let (pool, mut location) = match build_download_lane_pool(client, state, media, net_config)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             log::warn!(
@@ -4417,12 +4572,15 @@ async fn download_single_document_boost(
                 net_config,
                 app_handle,
                 tid,
+                output,
             )
             .await;
         }
     };
 
-    let file = tokio::fs::File::create(save_path)
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(save_path)
         .await
         .map_err(|e| e.to_string())?;
     file.set_len(expected_len)
@@ -4437,10 +4595,12 @@ async fn download_single_document_boost(
         .min(max_lanes)
         .min(chunk_count.max(1) as usize)
         .max(1);
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let confirmed = output.confirmed_bytes();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(confirmed));
     let started = std::time::Instant::now();
     let mut previous_stage_speed: Option<f64> = None;
     let mut next_chunk = 0u64;
+    let mut reference_refreshes = 0;
 
     log::info!(
         "Download transport: TeraRelay Boost V2, dc={}, endpoint={}, lanes={}/{}, chunk={} KiB, bytes={}",
@@ -4457,16 +4617,15 @@ async fn download_single_document_boost(
         let emit_tid = tid.to_string();
         let emit_handle = app_handle.clone();
         Some(tokio::spawn(async move {
-            let mut last_bytes = 0u64;
+            let mut progress =
+                DownloadProgress::new(emit_counter.load(std::sync::atomic::Ordering::Relaxed));
             let mut last_time = std::time::Instant::now();
-            let mut speed_smoother = SpeedWindow::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let current = emit_counter.load(std::sync::atomic::Ordering::Relaxed);
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last_time).as_secs_f64();
-                let speed = speed_smoother.update(current.saturating_sub(last_bytes), dt);
-                let percent = ((current as f64 / expected_len as f64) * 100.0).min(99.0) as u8;
+                let (percent, speed) = progress.update(current, expected_len, dt);
                 let _ = emit_handle.emit(
                     "download-progress",
                     ProgressPayload {
@@ -4477,7 +4636,6 @@ async fn download_single_document_boost(
                         speed_bytes_per_sec: speed,
                     },
                 );
-                last_bytes = current;
                 last_time = now;
                 if current >= expected_len {
                     break;
@@ -4488,7 +4646,6 @@ async fn download_single_document_boost(
         None
     };
 
-    use futures::TryStreamExt;
     let result: Result<(), String> = async {
         while next_chunk < chunk_count {
             if cancelled.read().await.contains(tid) {
@@ -4496,12 +4653,17 @@ async fn download_single_document_boost(
             }
 
             let stage_end = (next_chunk + BOOST_DOWNLOAD_ADAPT_CHUNKS).min(chunk_count);
+            let region_offset = next_chunk * chunk_size;
+            let region_len = (expected_len - region_offset).min(BOOST_DOWNLOAD_ADAPT_CHUNKS * chunk_size);
+            if output.is_region_confirmed(region_offset, region_len) {
+                next_chunk = stage_end;
+                continue;
+            }
             let stage_started = std::time::Instant::now();
             let before = counter.load(std::sync::atomic::Ordering::Relaxed);
             let lanes_for_stage = active_lanes;
 
-            futures::stream::iter((next_chunk..stage_end).map(Ok::<u64, String>))
-                .try_for_each_concurrent(lanes_for_stage, |chunk_index| {
+            let stage_result = drain_download_tasks(futures::stream::iter(next_chunk..stage_end), lanes_for_stage, |chunk_index| {
                     let sender =
                         pool.lanes[(chunk_index as usize) % lanes_for_stage].clone();
                     let location = location.clone();
@@ -4520,23 +4682,12 @@ async fn download_single_document_boost(
                             offset,
                             expected_chunk_len,
                             net_config,
+                            cancelled,
+                            tid,
                         )
                         .await?;
 
-                        let mut output = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(save_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        tokio::io::AsyncSeekExt::seek(
-                            &mut output,
-                            std::io::SeekFrom::Start(offset),
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        tokio::io::AsyncWriteExt::write_all(&mut output, &bytes)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        output.write_region(offset, &bytes).await?;
 
                         let total_so_far = counter
                             .fetch_add(
@@ -4545,27 +4696,37 @@ async fn download_single_document_boost(
                             )
                             + bytes.len() as u64;
 
-                        let dl_limit = net_config.download_limit_bytes_per_sec();
-                        if dl_limit > 0 {
-                            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                            let rate = total_so_far as f64 / elapsed;
-                            if rate > dl_limit as f64 {
-                                let ideal_elapsed = total_so_far as f64 / dl_limit as f64;
-                                let sleep_ms = ((ideal_elapsed - elapsed) * 1000.0) as u64;
-                                if sleep_ms > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        sleep_ms.min(5000),
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
+                        let delay = download_throttle_delay(total_so_far, confirmed, started.elapsed().as_secs_f64(), net_config.download_limit_bytes_per_sec());
+                        if !delay.is_zero() { wait_for_transfer_retry(delay, cancelled, tid).await?; }
 
                         Ok(())
                     }
                 })
-                .await?;
+                .await;
+            if let Err(error) = stage_result {
+                if error.contains("FILE_REFERENCE") && reference_refreshes < 2 {
+                    let fresh = client.get_messages_by_id(peer, &[message_id])
+                        .await.map_err(map_error)?
+                        .into_iter().flatten().next()
+                        .and_then(|message| message.media())
+                        .ok_or_else(|| "Telegram document disappeared while refreshing its reference".to_string())?;
+                    let stable = |media: &Media| {
+                        let Media::Document(document) = media else { return None; };
+                        let Some(tl::enums::Document::Document(raw)) = document.raw.document.as_ref() else { return None; };
+                        Some((raw.id, raw.dc_id, document.size() as u64))
+                    };
+                    if stable(&fresh) != stable(media) {
+                        return Err("Telegram document changed while downloading. Select it as a new download.".to_string());
+                    }
+                    location = boost_document_location(&fresh)?.1;
+                    reference_refreshes += 1;
+                    counter.store(before, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                return Err(error);
+            }
 
+            output.confirm_region(region_offset, region_len).await?;
             let after = counter.load(std::sync::atomic::Ordering::Relaxed);
             let stage_bytes = after.saturating_sub(before);
             let stage_seconds = stage_started.elapsed().as_secs_f64().max(0.001);
@@ -4850,13 +5011,38 @@ pub async fn cmd_download_file(
 
     bw_state.try_reserve_down(total_size)?;
 
-    let mut output = crate::download_output::DownloadOutput::create(&actual_save_path, &tid)
-        .await
-        .map_err(|error| {
-            bw_state.release_down(total_size);
-            error
-        })?;
+    // Bind durable data to stable Telegram document IDs and sizes. File
+    // references rotate, so they deliberately stay out of the resume identity.
+    let remote_identity = if !use_tdlib {
+        parts
+            .iter()
+            .map(|(media, size, hash)| {
+                let Media::Document(document) = media else {
+                    return None;
+                };
+                let Some(tl::enums::Document::Document(raw)) = document.raw.document.as_ref()
+                else {
+                    return None;
+                };
+                let size = size.filter(|size| *size > 0)?;
+                Some((raw.id, raw.dc_id, size, hash.clone()))
+            })
+            .collect::<Option<Vec<_>>>()
+    } else {
+        None
+    };
+    let output_result = if let Some(documents) = remote_identity {
+        let identity =
+            serde_json::to_string(&(folder_id, &part_ids, documents)).map_err(|e| e.to_string())?;
+        crate::download_output::DownloadOutput::create_resumable(&actual_save_path, &tid, identity)
+            .await
+    } else {
+        crate::download_output::DownloadOutput::create(&actual_save_path, &tid).await
+    };
+    let mut output = output_result.inspect_err(|_| bw_state.release_down(total_size))?;
     let staged_save_path = output.path().to_string();
+
+    let confirmed_bytes = output.confirmed_bytes().min(total_size);
 
     // Emit start
     if !tid.is_empty() {
@@ -4864,8 +5050,12 @@ pub async fn cmd_download_file(
             "download-progress",
             ProgressPayload {
                 id: tid.clone(),
-                percent: 0,
-                uploaded_bytes: 0,
+                percent: if total_size > 0 {
+                    ((confirmed_bytes as f64 / total_size as f64) * 100.0).min(99.0) as u8
+                } else {
+                    0
+                },
+                uploaded_bytes: confirmed_bytes,
                 total_bytes: total_size,
                 speed_bytes_per_sec: 0,
             },
@@ -4982,8 +5172,10 @@ pub async fn cmd_download_file(
             destination,
             staged_save_path.clone(),
             chunks,
-            counter,
-            network_counter,
+            crate::tdlib_fast::FastDownloadCounters {
+                acknowledged: counter,
+                network: network_counter,
+            },
             cancel_rx,
             false,
         )
@@ -5033,6 +5225,9 @@ pub async fn cmd_download_file(
             &net_config,
             &app_handle,
             &tid,
+            &output,
+            &peer,
+            part_ids[0],
         )
         .await
         {
@@ -5066,6 +5261,7 @@ pub async fn cmd_download_file(
             &staged_save_path,
             &parts,
             total_size,
+            &output,
         )
         .await
         {
@@ -5112,19 +5308,22 @@ pub async fn cmd_download_file(
                 }
                 Err(e) => {
                     let err = map_error(&e);
-                    if chunk_retry_budget > 0 {
-                        chunk_retry_budget -= 1;
-                        log::warn!(
-                            "Download chunk error (retries left: {}): {}",
-                            chunk_retry_budget,
-                            err
-                        );
-                        let delay = backoff_ms(
-                            0,
-                            net_config.retry_base_backoff_ms(),
-                            net_config.retry_max_backoff_ms(),
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    if let Some(delay) = transfer_retry_delay(
+                        &err,
+                        net_config.should_respect_flood_wait(),
+                        &mut chunk_retry_budget,
+                        net_config.retry_attempts(),
+                        net_config.retry_base_backoff_ms(),
+                        net_config.retry_max_backoff_ms(),
+                    ) {
+                        if let Err(error) =
+                            wait_for_transfer_retry(delay, &state.cancelled_transfers, &tid).await
+                        {
+                            let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+                            state.cancelled_transfers.write().await.remove(&tid);
+                            bw_state.release_down(total_size);
+                            return Err(error);
+                        }
                         continue;
                     }
                     drop(file);
@@ -5229,10 +5428,10 @@ pub async fn cmd_download_file(
             ));
         }
     }
-    output.publish().await.map_err(|error| {
-        bw_state.release_down(total_size);
-        error
-    })?;
+    output
+        .publish()
+        .await
+        .inspect_err(|_| bw_state.release_down(total_size))?;
 
     log::info!(
         "Download completed to cache path {} ({} bytes)",
@@ -5626,8 +5825,8 @@ pub async fn cmd_get_files(
 
     // Part messages of split files, keyed by (base name, total parts):
     // (idx, message id, part size, mime, created_at)
-    let mut part_groups: HashMap<(String, u32), Vec<(u32, i64, u64, Option<String>, String)>> =
-        HashMap::new();
+    type MultipartPartGroup = Vec<(u32, i64, u64, Option<String>, String)>;
+    let mut part_groups: HashMap<(String, u32), MultipartPartGroup> = HashMap::new();
 
     let mut msgs = client.iter_messages(&peer);
     while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
@@ -5852,7 +6051,7 @@ pub async fn cmd_get_files(
 
     // iter_messages yields newest first (descending message id); keep that
     // order with collapsed entries positioned by their first part.
-    files.sort_by(|a, b| b.id.cmp(&a.id));
+    files.sort_by_key(|file| std::cmp::Reverse(file.id));
 
     // Collapse version stacks only after logical-file manifests have rebuilt
     // stable file identities. The stack anchor preserves chronological position
@@ -6014,10 +6213,11 @@ pub async fn cmd_scan_folders(
                 log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
                 // Strategy 1: Title
-                if {
+                let is_tera_folder = {
                     let lower = name.to_lowercase();
                     lower.contains("[tr]") || lower.contains("[td]")
-                } {
+                };
+                if is_tera_folder {
                     log::info!(" -> MATCH via Title: {}", name);
                     let display_name = name
                         .replace(" [TR]", "")
@@ -6153,24 +6353,85 @@ pub async fn cmd_zip_folder(folder_path: String) -> Result<String, String> {
             .into_iter()
             .filter_entry(|entry| entry.path() != archive_dir)
         {
-            let entry = entry.map_err(|e| format!("Failed to read folder entry: {e}"))?;
+            let entry = entry.map_err(|e| {
+                #[cfg(target_os = "linux")]
+                if e.io_error().and_then(std::io::Error::raw_os_error) == Some(libc::ENOTCONN) {
+                    let path = e.path().map(|p| p.display().to_string()).unwrap_or_default();
+                    return format!(
+                        "Cannot read disconnected filesystem '{}'. Reconnect or unmount that filesystem, then retry the folder upload. No files were skipped. ({e})",
+                        path
+                    );
+                }
+                format!("Failed to read folder entry: {e}. No files were skipped.")
+            })?;
             let path = entry.path();
-            let relative = path.strip_prefix(&src_owned).unwrap_or(path);
+            if path == src_owned {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&src_owned)
+                .map_err(|e| format!("Invalid archive entry '{}': {e}", path.display()))?;
+            // ZIP names use forward slashes even when the source is on Windows.
+            // Reject unrepresentable names rather than silently merging distinct paths.
+            let name = relative
+                .components()
+                .map(|part| {
+                    part.as_os_str().to_str().ok_or_else(|| {
+                        format!("Cannot archive non-UTF-8 entry '{}'", path.display())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join("/");
+            let kind = entry.file_type();
 
-            if path.is_file() {
-                let name = relative.to_string_lossy().to_string();
+            if kind.is_symlink() {
+                // Store the link itself; never read outside the selected folder or
+                // traverse directory links. Dangling links are valid archive entries.
+                let target = std::fs::read_link(path)
+                    .map_err(|e| format!("Failed to read link '{}': {e}", name))?;
+                let target = target.to_str().ok_or_else(|| {
+                    format!("Cannot archive non-UTF-8 link target '{}'", name)
+                })?;
+                #[cfg(target_os = "windows")]
+                let target = target.replace('\\', "/");
+                zip_writer
+                    .add_symlink(&name, target, options)
+                    .map_err(|e| format!("Failed to add link '{}': {e}", name))?;
+            } else if kind.is_file() {
+                let mut open = std::fs::OpenOptions::new();
+                open.read(true);
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    open.custom_flags(libc::O_NOFOLLOW);
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    // FILE_FLAG_OPEN_REPARSE_POINT: do not follow a replaced link.
+                    open.custom_flags(0x00200000);
+                }
+                let mut f = open
+                    .open(path)
+                    .map_err(|e| format!("Failed to open '{}': {}", name, e))?;
+                if !f.metadata().map_err(|e| format!("Failed to inspect '{}': {e}", name))?.is_file() {
+                    return Err(format!("Archive entry '{}' changed during upload", name));
+                }
                 zip_writer
                     .start_file(&name, options)
                     .map_err(|e| format!("Failed to add '{}': {}", name, e))?;
-                let mut f = std::fs::File::open(path)
-                    .map_err(|e| format!("Failed to open '{}': {}", name, e))?;
                 std::io::copy(&mut f, &mut zip_writer)
                     .map_err(|e| format!("Failed to write '{}': {}", name, e))?;
-            } else if path.is_dir() && path != src_owned {
-                let dir_name = format!("{}/", relative.to_string_lossy());
+            } else if kind.is_dir() {
+                let dir_name = format!("{name}/");
                 zip_writer
                     .add_directory(&dir_name, options)
                     .map_err(|e| format!("Failed to add dir '{}': {}", dir_name, e))?;
+            } else {
+                return Err(format!(
+                    "Unsupported folder entry '{}': only files, directories, and symbolic links can be archived",
+                    name
+                ));
             }
         }
 
@@ -6195,6 +6456,12 @@ pub async fn cmd_zip_folder(folder_path: String) -> Result<String, String> {
         }
     };
 
+    if let Err(error) = register_temporary_output(&zip_path) {
+        // Never return an output the application cannot clean up.
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_dir(&zip_dir);
+        return Err(error);
+    }
     log::info!(
         "Zipped '{}' -> '{}' ({} bytes)",
         folder_name,
@@ -6205,7 +6472,90 @@ pub async fn cmd_zip_folder(folder_path: String) -> Result<String, String> {
     Ok(zip_path_str)
 }
 
-/// Delete a temporary zip file created by cmd_zip_folder.
+/// Validate both temporary-output formats used by the callers of
+/// cmd_delete_temp_zip. Merely being inside the system temp directory is not
+/// proof that a file belongs to TeraRelay, and must not grant delete authority.
+/// Folder uploads produce <temp>/terarelay-zip-<32 hex>/<name>.zip; archive
+/// previews produce <temp>/archive_extract_<current pid>_<nonce>_<name>.
+fn permitted_temporary_cleanup_parent(
+    path: &std::path::Path,
+    temp_root: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let name = path
+        .file_name()
+        .and_then(|part| part.to_str())
+        .ok_or_else(|| "Invalid temporary output filename".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Temporary output has no parent directory".to_string())?
+        .canonicalize()
+        .map_err(|e| format!("Invalid temporary output directory: {e}"))?;
+
+    if parent == temp_root {
+        let prefix = format!("archive_extract_{}_", std::process::id());
+        let valid = name
+            .strip_prefix(&prefix)
+            .and_then(|remaining| remaining.split_once('_'))
+            .is_some_and(|(nonce, entry_name)| {
+                !entry_name.is_empty() && nonce.parse::<u64>().is_ok()
+            });
+        return if valid {
+            Ok(None)
+        } else {
+            Err("Refusing to delete an unrelated temporary file".to_string())
+        };
+    }
+
+    let valid_archive_parent = parent
+        .parent()
+        .is_some_and(|grandparent| grandparent == temp_root)
+        && parent
+            .file_name()
+            .and_then(|part| part.to_str())
+            .and_then(|part| part.strip_prefix("terarelay-zip-"))
+            .is_some_and(|nonce| {
+                nonce.len() == 32 && nonce.bytes().all(|ch| ch.is_ascii_hexdigit())
+            });
+
+    if valid_archive_parent && path.extension().is_some_and(|ext| ext == "zip") {
+        return Ok(Some(parent));
+    }
+
+    Err("Refusing to delete an unrelated temporary file".to_string())
+}
+
+/// Register an output already created by one of the two known producers.
+/// Cleanup refuses lookalike paths that were not created by this process.
+pub(crate) fn register_temporary_output(path: &std::path::Path) -> Result<(), String> {
+    let tmp = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve temp directory: {e}"))?;
+    let valid_parent = permitted_temporary_cleanup_parent(path, &tmp)?;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot inspect temporary output: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("Refusing to register a symlink or non-file output".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve temporary output: {e}"))?;
+    if canonical.parent() != Some(valid_parent.as_deref().unwrap_or(&tmp)) {
+        return Err(
+            "Refusing to register a temporary output outside its owner directory".to_string(),
+        );
+    }
+    let mut registered = owned_temp_outputs()
+        .lock()
+        .map_err(|_| "Temporary output ownership store is unavailable".to_string())?;
+    registered.retain(|known| known.is_file());
+    if registered.len() >= MAX_OWNED_TEMP_OUTPUTS && !registered.contains(&canonical) {
+        return Err("Too many pending temporary outputs".to_string());
+    }
+    registered.insert(canonical);
+    Ok(())
+}
+
+/// Delete only a TeraRelay-owned folder-upload ZIP or extracted archive entry.
 #[tauri::command]
 pub async fn cmd_delete_temp_zip(path: String) -> Result<(), String> {
     let path_clone = path.clone();
@@ -6214,30 +6564,43 @@ pub async fn cmd_delete_temp_zip(path: String) -> Result<(), String> {
         if !p.exists() {
             return Ok(());
         }
-        let canonical_p = p
-            .canonicalize()
-            .map_err(|e| format!("Invalid path: {}", e))?;
         let tmp = std::env::temp_dir()
             .canonicalize()
-            .map_err(|e| format!("Could not resolve temp directory: {}", e))?;
-        if !canonical_p.starts_with(&tmp) {
-            return Err("Refusing to delete file outside temp directory".to_string());
+            .map_err(|e| format!("Could not resolve temp directory: {e}"))?;
+        let owned_zip_parent = permitted_temporary_cleanup_parent(p, &tmp)?;
+        let metadata = std::fs::symlink_metadata(p)
+            .map_err(|e| format!("Failed to inspect temporary output: {e}"))?;
+        if !metadata.file_type().is_file() {
+            return Err("Refusing to delete a symlink or non-file temporary output".to_string());
+        }
+        let canonical_p = p
+            .canonicalize()
+            .map_err(|e| format!("Invalid temporary output path: {e}"))?;
+        let actual_parent = canonical_p
+            .parent()
+            .ok_or_else(|| "Temporary output has no resolved parent".to_string())?;
+        if actual_parent != owned_zip_parent.as_deref().unwrap_or(&tmp) {
+            return Err(
+                "Refusing to delete temporary output outside its owner directory".to_string(),
+            );
+        }
+
+        let mut registered = owned_temp_outputs()
+            .lock()
+            .map_err(|_| "Temporary output ownership store is unavailable".to_string())?;
+        if !registered.contains(&canonical_p) {
+            return Err("Refusing to delete an unregistered temporary output".to_string());
         }
         std::fs::remove_file(&canonical_p).map_err(|e| e.to_string())?;
-        if let Some(parent) = canonical_p.parent() {
-            if parent
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("terarelay-zip-"))
-            {
-                let _ = std::fs::remove_dir(parent);
-            }
+        registered.remove(&canonical_p);
+        if let Some(parent) = owned_zip_parent {
+            let _ = std::fs::remove_dir(parent);
         }
-        log::info!("Cleaned up temp zip: {}", path_clone);
+        log::info!("Cleaned up TeraRelay temporary output: {}", path_clone);
         Ok(())
     })
     .await
-    .map_err(|e| format!("Task panicked: {}", e))?
+    .map_err(|e| format!("Task panicked: {e}"))?
 }
 
 #[cfg(test)]
@@ -6246,6 +6609,77 @@ mod focused_transfer_tests {
     use std::collections::VecDeque;
     use std::io::Read;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn resumed_terabyte_cache_does_not_consume_the_network_throttle_budget() {
+        let cached = 1_000_000_000_000;
+        assert_eq!(
+            download_throttle_delay(cached + 1_048_576, cached, 1.0, 1_048_576),
+            Duration::ZERO
+        );
+        assert_eq!(
+            download_throttle_delay(cached + 1_048_576, cached, 0.5, 1_048_576),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            download_throttle_delay(cached, cached, 0.001, 1),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_download_drains_its_pending_sibling_before_returning() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let failed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let trigger = release.clone();
+        let failure_signal = failed.clone();
+        let count = writes.clone();
+        let mut operation = tokio::spawn(async move {
+            drain_download_tasks(futures::stream::iter([0, 1]), 2, |index| {
+                let release = release.clone();
+                let entered = entered.clone();
+                let failed = failed.clone();
+                let writes = writes.clone();
+                async move {
+                    if index == 0 {
+                        entered.notified().await;
+                        failed.notify_one();
+                        return Err("first worker failed".to_string());
+                    }
+                    entered.notify_one();
+                    release.notified().await;
+                    writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+            })
+            .await
+        });
+        failure_signal.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut operation)
+                .await
+                .is_err(),
+            "Returned before the pending sibling unwound"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        trigger.notify_one();
+        assert_eq!(operation.await.unwrap().unwrap_err(), "first worker failed");
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resumed_terabyte_cache_is_not_counted_as_new_network_traffic() {
+        let cached = 1_000_000_000_000;
+        let new_bytes = 1024 * 1024;
+        let mut progress = DownloadProgress::new(cached);
+        progress.window.samples.front_mut().unwrap().0 -= Duration::from_secs(1);
+        let (percent, speed) = progress.update(cached + new_bytes, 10_000_000_000_000, 1.0);
+        assert_eq!(percent, 10);
+        assert!(speed > 900_000 && speed <= new_bytes);
+        assert_eq!(progress.window.total, new_bytes);
+    }
 
     #[test]
     fn bursty_network_updates_keep_a_measured_average_between_reports() {
@@ -6298,9 +6732,110 @@ mod focused_transfer_tests {
         fn drop(&mut self) {
             for path in &self.archives {
                 let _ = std::fs::remove_file(path);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn temporary_cleanup_preserves_unrelated_temp_files_and_cleans_own_outputs() {
+        let fixture = Fixture {
+            root: std::env::temp_dir().join(format!(
+                "terarelay-cleanup-qa-{:016x}",
+                rand::random::<u64>()
+            )),
+            archives: Vec::new(),
+        };
+        std::fs::create_dir_all(&fixture.root).unwrap();
+        let unrelated = fixture.root.join("unrelated.zip");
+        std::fs::write(&unrelated, b"unrelated user temp data").unwrap();
+        assert!(cmd_delete_temp_zip(unrelated.to_string_lossy().into())
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"unrelated user temp data",
+            "Deleting an unrelated temp file would be irreversible data loss"
+        );
+
+        // A directory with a lookalike but invalid ZIP owner ID is not enough.
+        let lookalike = fixture.root.join("terarelay-zip-not-random");
+        std::fs::create_dir(&lookalike).unwrap();
+        let lookalike_file = lookalike.join("unowned.zip");
+        std::fs::write(&lookalike_file, b"unowned archive").unwrap();
+        assert!(cmd_delete_temp_zip(lookalike_file.to_string_lossy().into())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&lookalike_file).unwrap(), b"unowned archive");
+
+        // The real folder-upload producer must still be able to clean its own ZIP.
+        let source = fixture.root.join("upload-folder");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("data.txt"), b"folder archive fixture").unwrap();
+        let zip = cmd_zip_folder(source.to_string_lossy().into())
+            .await
+            .unwrap();
+        let zip_path = std::path::Path::new(&zip);
+        assert!(zip_path.is_file());
+        let owned_parent = zip_path.parent().unwrap().to_path_buf();
+        cmd_delete_temp_zip(zip).await.unwrap();
+        assert!(
+            !owned_parent.exists(),
+            "Owned ZIP and its directory must be removed"
+        );
+
+        // The archive viewer writes a single temporary file directly in temp.
+        let extracted = std::env::temp_dir().join(format!(
+            "archive_extract_{}_{}_fixture.txt",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&extracted, b"archive extraction fixture").unwrap();
+        assert!(
+            cmd_delete_temp_zip(extracted.to_string_lossy().into())
+                .await
+                .is_err(),
+            "A matching filename alone must not authorize deletion"
+        );
+        assert_eq!(
+            std::fs::read(&extracted).unwrap(),
+            b"archive extraction fixture"
+        );
+        register_temporary_output(&extracted).unwrap();
+        cmd_delete_temp_zip(extracted.to_string_lossy().into())
+            .await
+            .unwrap();
+        assert!(!extracted.exists(), "Owned extracted entry must be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temporary_cleanup_rejects_symlink_even_inside_owned_zip_directory() {
+        let fixture = Fixture {
+            root: std::env::temp_dir().join(format!(
+                "terarelay-cleanup-symlink-qa-{:016x}",
+                rand::random::<u64>()
+            )),
+            archives: Vec::new(),
+        };
+        std::fs::create_dir_all(&fixture.root).unwrap();
+        let target = fixture.root.join("valuable.txt");
+        std::fs::write(&target, b"preserve").unwrap();
+        let fake_owned_dir =
+            std::env::temp_dir().join(format!("terarelay-zip-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&fake_owned_dir).unwrap();
+        let link = fake_owned_dir.join("other.zip");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(register_temporary_output(&link).is_err());
+        assert!(cmd_delete_temp_zip(link.to_string_lossy().into())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir(&fake_owned_dir).unwrap();
     }
 
     #[tokio::test]
@@ -6359,6 +6894,103 @@ mod focused_transfer_tests {
         assert_eq!(suffix, last);
         assert_eq!(entry.read(&mut [0]).unwrap(), 0);
         println!("PASS actual folder ZIP64 round trip: {size} bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn folder_archives_preserve_links_without_reading_their_targets() {
+        let mut fixture = Fixture {
+            root: std::env::temp_dir()
+                .join(format!("terarelay-links-qa-{}", rand::random::<u64>())),
+            archives: Vec::new(),
+        };
+        let selected = fixture.root.join("selected");
+        std::fs::create_dir_all(selected.join("empty")).unwrap();
+        std::fs::write(fixture.root.join("outside.txt"), b"outside contents").unwrap();
+        std::fs::write(selected.join("data.txt"), b"selected contents").unwrap();
+        std::os::unix::fs::symlink("../outside.txt", selected.join("outside-link")).unwrap();
+        std::os::unix::fs::symlink("missing", selected.join("dangling-link")).unwrap();
+        std::os::unix::fs::symlink(".", selected.join("directory-link")).unwrap();
+        let path = cmd_zip_folder(selected.to_string_lossy().into())
+            .await
+            .unwrap();
+        fixture.archives.push(path.clone().into());
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut names: Vec<String> = archive
+            .file_names()
+            .map(|name| name.expect("valid ZIP entry name").into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "dangling-link",
+                "data.txt",
+                "directory-link",
+                "empty/",
+                "outside-link"
+            ]
+        );
+        for (name, target) in [
+            ("outside-link", "../outside.txt"),
+            ("dangling-link", "missing"),
+            ("directory-link", "."),
+        ] {
+            let mut entry = archive.by_name(name).unwrap();
+            assert_eq!(entry.unix_mode().unwrap() & 0o170000, 0o120000);
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, target);
+        }
+        let mut contents = String::new();
+        archive
+            .by_name("data.txt")
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "selected contents");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn folder_archives_reject_special_entries_without_leaving_partial_archives() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut fixture = Fixture {
+            root: std::env::temp_dir()
+                .join(format!("terarelay-special-qa-{}", rand::random::<u64>())),
+            archives: Vec::new(),
+        };
+        std::fs::create_dir_all(&fixture.root).unwrap();
+        std::fs::write(fixture.root.join("normal.txt"), b"keep me").unwrap();
+        let fifo = fixture.root.join("pipe");
+        let encoded = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let result = cmd_zip_folder(fixture.root.to_string_lossy().into()).await;
+        if let Ok(path) = &result {
+            fixture.archives.push(path.clone().into());
+        }
+        let error = result.expect_err("A FIFO must not silently disappear from the archive");
+        assert!(error.contains("pipe") && error.contains("Unsupported"));
+        assert_eq!(
+            std::fs::read(fixture.root.join("normal.txt")).unwrap(),
+            b"keep me"
+        );
+        let zip_name = format!(
+            "{}.zip",
+            fixture.root.file_name().unwrap().to_str().unwrap()
+        );
+        for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("terarelay-zip-")
+            {
+                assert!(
+                    !entry.path().join(&zip_name).exists(),
+                    "Partial archive was left behind"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6722,13 +7354,398 @@ struct RemoteProgressPayload {
     total_bytes: u64,
 }
 
+/// A resumed HTTP response must describe exactly the missing suffix of the
+/// original object. A 206 alone is not proof of offset/length alignment.
+fn remote_upload_status_allowed(status: reqwest::StatusCode, resume_requested: bool) -> bool {
+    if resume_requested {
+        status == reqwest::StatusCode::OK || status == reqwest::StatusCode::PARTIAL_CONTENT
+    } else {
+        status == reqwest::StatusCode::OK
+    }
+}
+
+fn remote_upload_content_range_matches(header: Option<&str>, start: u64, total: u64) -> bool {
+    let Some(spec) = header.and_then(|value| value.strip_prefix("bytes ")) else {
+        return false;
+    };
+    let Some((range, length)) = spec.split_once('/') else {
+        return false;
+    };
+    let Some((first, last)) = range.split_once('-') else {
+        return false;
+    };
+    match (
+        first.parse::<u64>(),
+        last.parse::<u64>(),
+        length.parse::<u64>(),
+    ) {
+        (Ok(first), Ok(last), Ok(length)) => {
+            first == start && last >= first && last < length && length == total
+        }
+        _ => false,
+    }
+}
+
+/// Stage URL imports in an application-owned private directory. The transfer
+/// ID alone must never be interpolated into a system temporary path: a caller
+/// could otherwise inject path separators, or a local symlink could turn
+/// File::create into a write to an unrelated file. The URL is included in the
+/// hashed key so changing an import's source cannot reuse a different URL's
+/// partially downloaded bytes.
+fn remote_upload_private_staging_path(
+    cache_root: &std::path::Path,
+    transfer_id: &str,
+    url: &str,
+    strong_etag: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    use sha2::Digest;
+    if transfer_id.is_empty()
+        || transfer_id.len() > 128
+        || !transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Remote upload transfer ID is invalid".into());
+    }
+    std::fs::create_dir_all(cache_root)
+        .map_err(|e| format!("Cannot prepare remote upload cache root: {e}"))?;
+    let private = cache_root.join("remote-upload-staging");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(&private) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!(
+                    "Cannot create private remote upload staging: {error}"
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = std::fs::create_dir(&private) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("Cannot create remote upload staging: {error}"));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&private)
+        .map_err(|e| format!("Cannot verify remote upload staging: {e}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("Remote upload staging is not a private directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("Remote upload staging directory has unsafe permissions".into());
+        }
+    }
+    let identity =
+        serde_json::to_vec(&(transfer_id, url, strong_etag)).map_err(|e| e.to_string())?;
+    let digest = sha2::Sha256::digest(identity);
+    Ok(private.join(format!("{digest:x}.part")))
+}
+
+/// Never reuse, overwrite, or delete an untrusted filesystem object when
+/// resuming an interrupted HTTP import. Existing staging content must be one
+/// ordinary private regular file, never a symlink or a hardlinked alias.
+fn checked_remote_upload_stage(
+    path: &std::path::Path,
+) -> Result<Option<std::fs::Metadata>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Cannot inspect remote upload stage: {e}")),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("Remote upload staging path is not a regular private file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("Remote upload staging file has unsafe links or permissions".into());
+        }
+    }
+    Ok(Some(metadata))
+}
+
+async fn open_remote_upload_stage(
+    path: &std::path::Path,
+    existing: bool,
+    truncate: bool,
+    append: bool,
+) -> Result<tokio::fs::File, String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).write(true);
+    if !existing {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|e| format!("Cannot open private remote upload stage: {e}"))?;
+    let opened = file.metadata().await.map_err(|e| e.to_string())?;
+    if !opened.is_file() {
+        return Err("Remote upload stage is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if opened.nlink() != 1 || opened.permissions().mode() & 0o077 != 0 {
+            return Err("Remote upload stage became unsafe while opening".into());
+        }
+    }
+    if truncate {
+        file.set_len(0)
+            .await
+            .map_err(|e| format!("Cannot clear private remote upload stage: {e}"))?;
+    }
+    if append {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::End(0))
+            .await
+            .map_err(|e| format!("Cannot seek resumed remote upload stage: {e}"))?;
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+mod remote_upload_staging_tests {
+    use super::{
+        checked_remote_upload_stage, open_remote_upload_stage, remote_upload_content_range_matches,
+        remote_upload_private_staging_path, remote_upload_status_allowed,
+    };
+    use std::path::PathBuf;
+
+    fn scratch() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-url-stage-qa-{}-{}",
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn url_import_uses_normal_recoverable_upload_not_an_independent_raw_send() {
+        let source = include_str!("fs.rs");
+        let url_command = source
+            .rsplit_once("\npub async fn cmd_upload_from_url(")
+            .unwrap()
+            .1
+            .split_once("\n#[cfg(test)]\nmod split_tests")
+            .unwrap()
+            .0;
+        assert_eq!(url_command.matches("cmd_upload_file_inner(").count(), 1);
+        assert!(!url_command.contains(".upload_stream("));
+        assert!(!url_command.contains(".send_message("));
+        assert!(url_command.contains("Some(transfer_id.clone())"));
+        assert!(url_command.contains("Some(file_name)"));
+        assert!(url_command.contains("Some(\"boost\".to_string())"));
+        assert!(url_command.contains("checked_remote_upload_stage(&temp_file_path)"));
+    }
+
+    #[test]
+    fn remote_import_staging_rejects_untrusted_ids_and_isolates_remote_versions() {
+        let root = scratch();
+        for id in [
+            "",
+            "../escape",
+            "sub/path",
+            "file.name",
+            "a\\b",
+            "a".repeat(129).as_str(),
+        ] {
+            assert!(
+                remote_upload_private_staging_path(&root, id, "https://example.org/a", None)
+                    .is_err()
+            );
+        }
+        let first = remote_upload_private_staging_path(
+            &root,
+            "transfer-42",
+            "https://example.org/a",
+            Some("\"etag-A\""),
+        )
+        .unwrap();
+        let retry = remote_upload_private_staging_path(
+            &root,
+            "transfer-42",
+            "https://example.org/a",
+            Some("\"etag-A\""),
+        )
+        .unwrap();
+        let new_version = remote_upload_private_staging_path(
+            &root,
+            "transfer-42",
+            "https://example.org/a",
+            Some("\"etag-B\""),
+        )
+        .unwrap();
+        let new_source = remote_upload_private_staging_path(
+            &root,
+            "transfer-42",
+            "https://example.org/b",
+            Some("\"etag-A\""),
+        )
+        .unwrap();
+        assert_eq!(first, retry);
+        assert_ne!(first, new_version);
+        assert_ne!(first, new_source);
+        assert!(first.starts_with(root.join("remote-upload-staging")));
+        assert!(!first.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_import_content_range_requires_exact_suffix_and_total() {
+        use reqwest::StatusCode;
+        assert!(remote_upload_status_allowed(StatusCode::OK, false));
+        assert!(remote_upload_status_allowed(StatusCode::OK, true));
+        assert!(remote_upload_status_allowed(
+            StatusCode::PARTIAL_CONTENT,
+            true
+        ));
+        for status in [
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::NO_CONTENT,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!remote_upload_status_allowed(status, false));
+        }
+        assert!(!remote_upload_status_allowed(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            true
+        ));
+        assert!(!remote_upload_status_allowed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            true
+        ));
+        assert!(remote_upload_content_range_matches(
+            Some("bytes 5-9/10"),
+            5,
+            10
+        ));
+        for header in [
+            None,
+            Some("bytes 4-9/10"),
+            Some("bytes 5-10/11"),
+            Some("bytes 5-9/11"),
+            Some("bytes 5-4/10"),
+            Some("bytes 5-10/10"),
+            Some("bytes */10"),
+            Some("bytes 5-9/*"),
+            Some("items 5-9/10"),
+        ] {
+            assert!(!remote_upload_content_range_matches(header, 5, 10));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_import_existing_stage_is_exclusive_private_and_never_follows_symlinks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = scratch();
+        let path = remote_upload_private_staging_path(
+            &root,
+            "transfer-99",
+            "https://example.org/file",
+            Some("\"etag\""),
+        )
+        .unwrap();
+        assert!(checked_remote_upload_stage(&path).unwrap().is_none());
+        let mut first = open_remote_upload_stage(&path, false, false, false)
+            .await
+            .unwrap();
+        first.write_all(b"begin").await.unwrap();
+        first.flush().await.unwrap();
+        drop(first);
+        assert!(checked_remote_upload_stage(&path).unwrap().is_some());
+        assert!(open_remote_upload_stage(&path, false, false, false)
+            .await
+            .is_err());
+
+        let mut resumed = open_remote_upload_stage(&path, true, false, true)
+            .await
+            .unwrap();
+        resumed.write_all(b"-end").await.unwrap();
+        resumed.flush().await.unwrap();
+        drop(resumed);
+        assert_eq!(std::fs::read(&path).unwrap(), b"begin-end");
+        let mut overwrite = open_remote_upload_stage(&path, true, true, false)
+            .await
+            .unwrap();
+        overwrite.write_all(b"safe").await.unwrap();
+        overwrite.flush().await.unwrap();
+        drop(overwrite);
+        assert_eq!(std::fs::read(&path).unwrap(), b"safe");
+
+        let mut read_only = open_remote_upload_stage(&path, true, false, false)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        read_only.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"safe");
+        drop(read_only);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let outside = root.join("unrelated-file");
+            std::fs::write(&outside, b"must never change").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            symlink(&outside, &path).unwrap();
+            assert!(checked_remote_upload_stage(&path).is_err());
+            assert!(open_remote_upload_stage(&path, true, true, false)
+                .await
+                .is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"must never change");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::hard_link(&outside, &path).unwrap();
+            assert!(checked_remote_upload_stage(&path).is_err());
+            assert!(open_remote_upload_stage(&path, true, true, false)
+                .await
+                .is_err());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"too public").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(checked_remote_upload_stage(&path).is_err());
+            std::fs::remove_file(&path).unwrap();
+
+            let staging = root.join("remote-upload-staging");
+            std::fs::remove_dir(&staging).unwrap();
+            symlink(&outside, &staging).unwrap();
+            assert!(remote_upload_private_staging_path(
+                &root,
+                "transfer-99",
+                "https://example.org/file",
+                None
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"must never change");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri remote-import IPC parameters and injected states define the command API"
+)]
 pub async fn cmd_upload_from_url(
     url: String,
     folder_id: Option<i64>,
     transfer_id: String,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
+    tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
     db_pool: State<'_, DbConnection>,
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
@@ -6737,6 +7754,11 @@ pub async fn cmd_upload_from_url(
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, folder_id)?;
     }
+    use tauri::Manager;
+    let cache_root = app_handle
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Cannot locate private remote upload cache: {e}"))?;
 
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -6763,7 +7785,36 @@ pub async fn cmd_upload_from_url(
     let client = client_builder.build().map_err(|e| e.to_string())?;
 
     let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    res.error_for_status_ref()
+        .map_err(|e| format!("Remote URL rejected the download: {e}"))?;
+    if !remote_upload_status_allowed(res.status(), false) {
+        return Err(format!(
+            "Remote URL returned unexpected HTTP status {}",
+            res.status()
+        ));
+    }
     let headers = res.headers();
+    let strong_etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|header| header.to_str().ok())
+        .filter(|etag| {
+            etag.len() >= 2
+                && etag.len() <= 512
+                && etag.starts_with('"')
+                && etag.ends_with('"')
+                && etag.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        })
+        .map(str::to_owned);
+    let temp_file_path = remote_upload_private_staging_path(
+        &cache_root,
+        &transfer_id,
+        &url,
+        strong_etag.as_deref(),
+    )?;
+    let temp_dir = temp_file_path
+        .parent()
+        .ok_or("Remote upload stage has no parent")?
+        .to_path_buf();
 
     // Reject HTML pages — they're download gateways, not actual files
     if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
@@ -6788,7 +7839,7 @@ pub async fn cmd_upload_from_url(
             {
                 // filename*=UTF-8''percent%20encoded
                 if let Some((_charset, value)) = encoded.split_once('\'') {
-                    let value = value.split('\'').last().unwrap_or(value);
+                    let value = value.split('\'').next_back().unwrap_or(value);
                     urlencoding::decode(value)
                         .ok()
                         .filter(|s| !s.is_empty())
@@ -6811,8 +7862,9 @@ pub async fn cmd_upload_from_url(
         .get(reqwest::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-
-    let temp_dir = std::env::temp_dir();
+    // Fail before reserving bandwidth or writing to a hostile pre-existing
+    // staging object. A symlink/hardlink is never an owned download.
+    let previous_stage = checked_remote_upload_stage(&temp_file_path)?;
 
     if let Some(sz) = known_size {
         if sz > 2_147_483_648 {
@@ -6855,7 +7907,6 @@ pub async fn cmd_upload_from_url(
         },
     );
 
-    let temp_file_path = temp_dir.join(format!("tg_drive_{}.tmp", transfer_id));
     let temp_file_str = temp_file_path.to_string_lossy().to_string();
 
     let mut downloaded = 0u64;
@@ -6867,27 +7918,30 @@ pub async fn cmd_upload_from_url(
         }
     }
 
-    if temp_file_path.exists() {
-        if range_supported && known_size.is_some() {
-            if let Ok(metadata) = std::fs::metadata(&temp_file_path) {
-                downloaded = metadata.len();
-                let sz = known_size.unwrap();
-                if downloaded >= sz {
-                    downloaded = sz;
-                }
-            }
-        } else {
-            // No resumption without both range support and a known total size
-            let _ = std::fs::remove_file(&temp_file_path);
+    // Inspect the exact owned stage without following symlinks. If the
+    // HTTP origin cannot support an exact byte resume, safely truncate our
+    // private regular file after opening (never unlink an unknown path).
+    if let (Some(metadata), true, Some(sz), Some(_)) = (
+        &previous_stage,
+        range_supported,
+        known_size,
+        strong_etag.as_deref(),
+    ) {
+        if metadata.len() <= sz {
+            downloaded = metadata.len();
         }
     }
 
-    let need_download = known_size.map_or(true, |sz| downloaded < sz);
+    let need_download = known_size.is_none_or(|sz| downloaded < sz);
 
     let stream_res = if downloaded > 0 && need_download {
         let req = client
             .get(&url)
-            .header(reqwest::header::RANGE, format!("bytes={}-", downloaded));
+            .header(reqwest::header::RANGE, format!("bytes={}-", downloaded))
+            .header(
+                reqwest::header::IF_RANGE,
+                strong_etag.as_deref().unwrap_or_default(),
+            );
         match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -6902,13 +7956,56 @@ pub async fn cmd_upload_from_url(
         res
     };
 
+    // Only a valid 206 may append. A Range request returning 200 can safely
+    // restart from byte zero, but 416/403/500 and other responses must not
+    // truncate a legitimate checkpoint and upload an error body as the file.
+    if !remote_upload_status_allowed(stream_res.status(), downloaded > 0 && need_download) {
+        if let Some(sz) = known_size {
+            bw_state.release_down(sz);
+            bw_state.release_up(sz);
+        }
+        return Err(format!(
+            "HTTP download returned status {}; keeping the existing private partial file",
+            stream_res.status()
+        ));
+    }
+    if stream_res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|kind| kind.to_ascii_lowercase().contains("text/html"))
+    {
+        if let Some(sz) = known_size {
+            bw_state.release_down(sz);
+            bw_state.release_up(sz);
+        }
+        return Err("HTTP download returned an HTML page instead of a file".into());
+    }
+
     let mut file = if downloaded > 0 && need_download {
         let status = stream_res.status();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&temp_file_path)
+            let content_range = stream_res
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok());
+            let response_etag = stream_res
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok());
+            if !remote_upload_content_range_matches(
+                content_range,
+                downloaded,
+                known_size.unwrap_or(0),
+            ) || response_etag.is_some_and(|received| Some(received) != strong_etag.as_deref())
+            {
+                if let Some(sz) = known_size {
+                    bw_state.release_down(sz);
+                    bw_state.release_up(sz);
+                }
+                return Err("HTTP resume returned mismatched Content-Range or ETag; refusing to mix remote file versions".into());
+            }
+            match open_remote_upload_stage(&temp_file_path, previous_stage.is_some(), false, true)
                 .await
             {
                 Ok(f) => f,
@@ -6922,7 +8019,9 @@ pub async fn cmd_upload_from_url(
             }
         } else {
             downloaded = 0;
-            match tokio::fs::File::create(&temp_file_path).await {
+            match open_remote_upload_stage(&temp_file_path, previous_stage.is_some(), true, false)
+                .await
+            {
                 Ok(f) => f,
                 Err(e) => {
                     if let Some(sz) = known_size {
@@ -6934,9 +8033,7 @@ pub async fn cmd_upload_from_url(
             }
         }
     } else if !need_download {
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(&temp_file_path)
+        match open_remote_upload_stage(&temp_file_path, previous_stage.is_some(), false, false)
             .await
         {
             Ok(f) => f,
@@ -6949,7 +8046,8 @@ pub async fn cmd_upload_from_url(
             }
         }
     } else {
-        match tokio::fs::File::create(&temp_file_path).await {
+        match open_remote_upload_stage(&temp_file_path, previous_stage.is_some(), true, false).await
+        {
             Ok(f) => f,
             Err(e) => {
                 if let Some(sz) = known_size {
@@ -7013,7 +8111,7 @@ pub async fn cmd_upload_from_url(
             let now = std::time::Instant::now();
             let dt = now.duration_since(last_emit_time).as_secs_f64();
             let emit_total = known_size.unwrap_or(downloaded);
-            let emit_done = known_size.map_or(false, |sz| downloaded >= sz);
+            let emit_done = known_size.is_some_and(|sz| downloaded >= sz);
             if dt >= 0.25 || emit_done {
                 let speed = if dt > 0.0 {
                     ((downloaded - last_emit_bytes) as f64 / dt) as u64
@@ -7092,28 +8190,47 @@ pub async fn cmd_upload_from_url(
         let _ = tokio::fs::remove_file(&temp_file_path).await;
         return Err("Downloaded file is empty".to_string());
     }
+    if let Some(expected_size) = known_size {
+        if actual_size != expected_size {
+            return Err(format!(
+                "Downloaded file length did not match the server's Content-Length (expected {expected_size} bytes, got {actual_size}). Retrying will reuse or redownload the incomplete stage."
+            ));
+        }
+    }
 
     if actual_size > 2_147_483_648 {
         let _ = tokio::fs::remove_file(&temp_file_path).await;
         return Err("Downloaded file exceeds 2GB Telegram limit.".to_string());
     }
 
-    // Reserve upload bandwidth based on the real file size (handles both known and unknown upfront)
-    if let Err(e) = bw_state.try_reserve_up(actual_size) {
-        let _ = tokio::fs::remove_file(&temp_file_path).await;
-        return Err(e);
+    // URL downloads are only a staging source. Send the complete, validated
+    // file through the SAME recoverable chunk uploader as normal files: one
+    // stable logical ID, a hidden cross-device manifest, atomic local Drive
+    // publication and post-commit FUSE invalidation. Never run a second raw
+    // Telegram send path or pre-reserve bandwidth that the uploader reserves.
+    if state
+        .cancelled_transfers
+        .read()
+        .await
+        .contains(&transfer_id)
+    {
+        state.cancelled_transfers.write().await.remove(&transfer_id);
+        return Err("Transfer cancelled".to_string());
     }
-
-    let client_opt = { state.client.lock().await.clone() };
-    let client = match client_opt {
-        Some(c) => c,
-        None => {
-            bw_state.release_up(actual_size);
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
-            return Err("Client not connected".to_string());
-        }
-    };
-
+    checked_remote_upload_stage(&temp_file_path)?
+        .ok_or_else(|| "Completed remote download stage is missing".to_string())?;
+    let file_name = server_filename.unwrap_or_else(|| {
+        reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "remote_file".to_string())
+    });
     let _ = app_handle.emit(
         "remote-upload-progress",
         RemoteProgressPayload {
@@ -7126,208 +8243,45 @@ pub async fn cmd_upload_from_url(
         },
     );
 
-    let (mut reader, file_size, bytes_counter) = match ProgressReader::new(&temp_file_str).await {
-        Ok(res) => res,
-        Err(e) => {
-            bw_state.release_up(actual_size);
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
-            return Err(e);
-        }
-    };
-
-    let cancelled = state.cancelled_transfers.clone();
-    let progress_tid = transfer_id.clone();
-    let progress_handle = app_handle.clone();
-    let progress_counter = bytes_counter.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut last_bytes: u64 = 0;
-        let mut last_time = std::time::Instant::now();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
-            let now = std::time::Instant::now();
-            let dt = now.duration_since(last_time).as_secs_f64();
-            let speed = if dt > 0.0 {
-                ((current - last_bytes) as f64 / dt) as u64
-            } else {
-                0
-            };
-            let percent = if file_size > 0 {
-                ((current as f64 / file_size as f64) * 100.0).min(99.0) as u8
-            } else {
-                0
-            };
-
-            let _ = progress_handle.emit(
-                "remote-upload-progress",
-                RemoteProgressPayload {
-                    id: progress_tid.clone(),
-                    phase: "uploading",
-                    percent,
-                    speed,
-                    uploaded_bytes: current,
-                    total_bytes: file_size,
-                },
-            );
-
-            last_bytes = current;
-            last_time = now;
-
-            if current >= file_size {
-                break;
-            }
-            if cancelled.read().await.contains(&progress_tid) {
-                break;
-            }
-        }
-    });
-
-    if state
-        .cancelled_transfers
-        .read()
-        .await
-        .contains(&transfer_id)
-    {
-        state.cancelled_transfers.write().await.remove(&transfer_id);
-        progress_task.abort();
-        bw_state.release_up(actual_size);
-        let _ = tokio::fs::remove_file(&temp_file_path).await;
-        return Err("Transfer cancelled".to_string());
-    }
-
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    get_upload_cancellations()
-        .lock()
-        .unwrap()
-        .insert(transfer_id.clone(), cancel_tx);
-
-    let client_clone = client.clone();
-    let file_name = server_filename.unwrap_or_else(|| {
-        reqwest::Url::parse(&url)
-            .ok()
-            .and_then(|u| {
-                u.path_segments()
-                    .and_then(|segs| segs.last())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "remote_file".to_string())
-    });
-
-    let mut upload_task = tokio::spawn(async move {
-        client_clone
-            .upload_stream(&mut reader, file_size as usize, file_name)
-            .await
-    });
-
-    let uploaded_file = {
-        tokio::select! {
-            res = &mut upload_task => {
-                get_upload_cancellations().lock().unwrap().remove(&transfer_id);
-                match res {
-                    Ok(Ok(file)) => file,
-                    Ok(Err(e)) => {
-                        bw_state.release_up(actual_size);
-                        progress_task.abort();
-                        let _ = tokio::fs::remove_file(&temp_file_path).await;
-                        return Err(map_error(e));
-                    }
-                    Err(e) => {
-                        bw_state.release_up(actual_size);
-                        progress_task.abort();
-                        let _ = tokio::fs::remove_file(&temp_file_path).await;
-                        return Err(format!("Task join error: {}", e));
-                    }
-                }
-            }
-            _ = cancel_rx.changed() => {
-                log::info!("Aborting remote upload task for transfer ID: {}", transfer_id);
-                upload_task.abort();
-                state.cancelled_transfers.write().await.remove(&transfer_id);
-                progress_task.abort();
-                bw_state.release_up(actual_size);
-                let _ = tokio::fs::remove_file(&temp_file_path).await;
-                return Err("Transfer cancelled".to_string());
-            }
-        }
-    };
-
-    progress_task.abort();
-
-    let message = InputMessage::new().text("").file(uploaded_file);
-
-    let peer = match resolve_peer(&client, folder_id, &state.peer_cache).await {
-        Ok(p) => p,
-        Err(e) => {
-            bw_state.release_up(actual_size);
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
-            return Err(e);
-        }
-    };
-
-    let max_retries = net_config.retry_attempts();
-    let base_ms = net_config.retry_base_backoff_ms();
-    let max_ms = net_config.retry_max_backoff_ms();
-    let respect_flood = net_config.should_respect_flood_wait();
-    let mut last_err = String::new();
-    let mut send_success = false;
-
-    for attempt in 0..=max_retries {
-        match client.send_message(&peer, message.clone()).await {
-            Ok(_) => {
-                send_success = true;
-                break;
-            }
-            Err(e) => {
-                let err = map_error(e);
-                log::warn!(
-                    "send_message attempt {}/{}: {}",
-                    attempt + 1,
-                    max_retries + 1,
-                    err
-                );
-
-                if respect_flood && err.starts_with("FLOOD_WAIT_") {
-                    if let Ok(secs) = err.trim_start_matches("FLOOD_WAIT_").parse::<u64>() {
-                        let wait = secs.min(300);
-                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                        last_err = err;
-                        continue;
-                    }
-                }
-
-                last_err = err;
-                if attempt < max_retries {
-                    let delay = backoff_ms(attempt, base_ms, max_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-            }
-        }
-    }
-
+    // Boost has no external TDLib-setup dependency, and is the existing
+    // authenticated Grammers-based transfer lane on desktop and mobile.
+    // Failed transfers retain this *private* stage so the unchanged transfer
+    // ID can reuse its verified Telegram chunks on retry. Delete the stage
+    // only after the normal upload journal has reached success.
+    let result = cmd_upload_file_inner(
+        temp_file_str,
+        folder_id,
+        Some(transfer_id.clone()),
+        Some("boost".to_string()),
+        None,
+        None,
+        Some(file_name),
+        app_handle.clone(),
+        state,
+        tdlib_state,
+        db_pool,
+        bw_state,
+        net_config,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+        "Remote download is staged, but the recoverable Telegram upload did not finish: {error}"
+    )
+    })?;
     let _ = tokio::fs::remove_file(&temp_file_path).await;
-
-    if send_success {
-        let _ = app_handle.emit(
-            "remote-upload-progress",
-            RemoteProgressPayload {
-                id: transfer_id,
-                phase: "uploading",
-                percent: 100,
-                speed: 0,
-                uploaded_bytes: actual_size,
-                total_bytes: actual_size,
-            },
-        );
-        Ok("File uploaded successfully".to_string())
-    } else {
-        bw_state.release_up(actual_size);
-        Err(format!(
-            "Upload failed after {} attempts: {}",
-            max_retries + 1,
-            last_err
-        ))
-    }
+    let _ = app_handle.emit(
+        "remote-upload-progress",
+        RemoteProgressPayload {
+            id: transfer_id,
+            phase: "uploading",
+            percent: 100,
+            speed: 0,
+            uploaded_bytes: actual_size,
+            total_bytes: actual_size,
+        },
+    );
+    Ok(result.message)
 }
 
 #[cfg(test)]
@@ -7430,7 +8384,7 @@ mod split_tests {
         // evenly divisible by limit, otherwise upload.getFile returns LIMIT_INVALID.
         const GRAMMERS_MAX_INNER_MESSAGE_SIZE: i32 = 1_044_448;
         const TELEGRAM_DOWNLOAD_WINDOW: i32 = 1024 * 1024;
-        assert!(BOOST_RAW_DOWNLOAD_CHUNK_SIZE < GRAMMERS_MAX_INNER_MESSAGE_SIZE);
+        const { assert!(BOOST_RAW_DOWNLOAD_CHUNK_SIZE < GRAMMERS_MAX_INNER_MESSAGE_SIZE) };
         assert_eq!(BOOST_RAW_DOWNLOAD_CHUNK_SIZE % (4 * 1024), 0);
         assert_eq!(TELEGRAM_DOWNLOAD_WINDOW % BOOST_RAW_DOWNLOAD_CHUNK_SIZE, 0);
     }

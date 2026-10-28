@@ -56,8 +56,13 @@ requireText(
 );
 requireText(
   mount,
-  'pending.id == *id',
-  'portable File identities must continue resolving while a new file is pending',
+  'DriveNodeId::Pending(id) => drive_pending_by_id(conn, id)',
+  'portable Pending identities must resolve by their exact pending ID',
+);
+requireText(
+  mount,
+  'crate::drive_lookup::pending_for_file(conn, id)',
+  'portable File identities must resolve their pending overlay before the remote file',
 );
 requireText(
   mount,
@@ -130,7 +135,7 @@ const callbackFailureBody = windowsProvider.slice(callbackFailureStart, callback
 requireText(callbackFailureBody, 'info.FileSize', 'Windows hydration failure acknowledgement must derive a safe range from CfAPI callback metadata');
 requireText(callbackFailureBody, 'align_provider_read_range', 'Windows hydration failure acknowledgement must use the same 4 KiB alignment rules as success');
 requireText(windowsProvider, 'let failure_range = callback_failure_range(', 'Windows fetch callback must prepare failure completion before Drive identity lookup');
-requireText(windowsProvider, 'read_versioned', 'Windows multi-chunk hydration must stay pinned to one backing-content version');
+requireText(windowsProvider, '.read_snapshot_versioned(&id, &metadata, offset, take)', 'Windows multi-chunk hydration must pin the original backing-content and pending-write metadata snapshot');
 requireText(windowsProvider, 'VolumeDosName', 'Windows rename callback must normalize CfAPI volume-relative target paths');
 requireText(windowsProvider, 'windows_volume_target_path', 'Windows rename callback must convert volume-relative targets before Drive path resolution');
 requireText(core, 'pub fn windows_volume_target_path(', 'portable tests must cover CfAPI rename target normalization');

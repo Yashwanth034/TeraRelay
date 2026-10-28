@@ -226,6 +226,13 @@ pub struct UploadCheckpoint {
     pub source: SourceIdentity,
     pub part_size: u64,
     pub logical_file_id: Option<String>,
+    /// Bound to the transfer ID on first upload. Older checkpoints omit this;
+    /// their verified chunks can still resume with the name chosen at reopen.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// First upload's manifest creation timestamp, retained across retries.
+    #[serde(default)]
+    pub created_at: Option<i64>,
     #[serde(skip)]
     pub chunks: BTreeMap<u32, ManifestChunkV1>,
     pub manifest_message_id: Option<i64>,
@@ -287,17 +294,30 @@ impl UploadJournal {
         folder_id: Option<i64>,
         part_size: u64,
         file_id: Option<String>,
+        display_name: &str,
     ) -> Result<Self, String> {
+        if display_name.is_empty() {
+            return Err("Upload display name cannot be empty".into());
+        }
         let source = source_identity(path).await?;
-        let identity =
-            serde_json::to_vec(&(transfer_id, path, folder_id)).map_err(|e| e.to_string())?;
-        let key = format!("{:x}", Sha256::digest(&identity));
+        // Without a stable transfer ID there is no safe way to tell a new
+        // upload from a retry. Never reuse a completed file's logical ID just
+        // because its local path and destination happen to be unchanged.
+        let key = if transfer_id.trim().is_empty() {
+            format!("upload-once-{:032x}", rand::random::<u128>())
+        } else {
+            let identity =
+                serde_json::to_vec(&(transfer_id, path, folder_id)).map_err(|e| e.to_string())?;
+            format!("{:x}", Sha256::digest(&identity))
+        };
         let mut resumed = false;
         let mut snapshot = UploadCheckpoint {
             schema_version: 1,
             source: source.clone(),
             part_size,
             logical_file_id: file_id,
+            display_name: Some(display_name.to_owned()),
+            created_at: Some(chrono::Utc::now().timestamp()),
             chunks: BTreeMap::new(),
             manifest_message_id: None,
             completed: false,
@@ -325,6 +345,16 @@ impl UploadJournal {
                 if snapshot.part_size != part_size {
                     return Err("Upload part layout changed. Restore the previous part-size setting or select the file as a new upload.".to_string());
                 }
+                if snapshot.created_at.is_some_and(|created| created <= 0) {
+                    return Err("Saved upload has an invalid creation timestamp".to_string());
+                }
+                if snapshot
+                    .display_name
+                    .as_deref()
+                    .is_some_and(|saved| saved != display_name)
+                {
+                    return Err("Upload filename changed since this transfer was saved. Restore its original filename or add it as a new upload.".to_string());
+                }
                 let mut parts = conn.prepare("SELECT chunk FROM upload_checkpoint_chunks WHERE checkpoint_id = ? ORDER BY part_index").map_err(|e| e.to_string())?;
                 parts.bind((1, key.as_str())).map_err(|e| e.to_string())?;
                 while parts.next().map_err(|e| e.to_string())? == sqlite::State::Row {
@@ -333,6 +363,17 @@ impl UploadJournal {
                         .map_err(|e| format!("Invalid saved upload part: {e}"))?;
                     validate_chunk(&snapshot, &chunk)?;
                     snapshot.chunks.insert(chunk.index, chunk);
+                }
+                drop(parts);
+                drop(statement);
+                // Upgrade older checkpoints before more network activity.
+                // Legacy records omitted the chosen name and first upload time.
+                if snapshot.display_name.is_none() || snapshot.created_at.is_none() {
+                    snapshot.display_name = Some(display_name.to_owned());
+                    snapshot
+                        .created_at
+                        .get_or_insert_with(|| chrono::Utc::now().timestamp());
+                    save_checkpoint(&conn, &key, &snapshot)?;
                 }
             } else {
                 save_checkpoint(&conn, &key, &snapshot)?;
@@ -382,6 +423,24 @@ impl UploadJournal {
             return Err(error);
         }
         self.snapshot.chunks = chunks;
+        Ok(())
+    }
+
+    /// Remember the accepted Telegram manifest *before* local Drive indexing.
+    ///
+    /// Publishing the kernel-visible file can fail after Telegram accepted its
+    /// manifest. Without this durable checkpoint the next retry has to scan
+    /// Telegram to rediscover the manifest, and an isolated QA cleanup may
+    /// miss the last remote document. This does not mark the upload complete.
+    pub fn record_manifest_message_id(&mut self, manifest_message_id: i64) -> Result<(), String> {
+        if manifest_message_id <= 0 || manifest_message_id > i64::from(i32::MAX) {
+            return Err("Invalid accepted Telegram manifest message ID".into());
+        }
+        let mut next = self.snapshot.clone();
+        next.manifest_message_id = Some(manifest_message_id);
+        let conn = self.db.lock().map_err(|_| "DB poisoned".to_string())?;
+        save_checkpoint(&conn, &self.key, &next)?;
+        self.snapshot = next;
         Ok(())
     }
 
@@ -517,10 +576,17 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let db = Arc::new(Mutex::new(sqlite::open(&db_path).unwrap()));
-            let mut journal =
-                UploadJournal::open(db, path, "transfer-1", Some(42), 10, Some("a".repeat(32)))
-                    .await
-                    .unwrap();
+            let mut journal = UploadJournal::open(
+                db,
+                path,
+                "transfer-1",
+                Some(42),
+                10,
+                Some("a".repeat(32)),
+                "movie.bin",
+            )
+            .await
+            .unwrap();
             journal
                 .record(ManifestChunkV1 {
                     index: 1,
@@ -539,6 +605,7 @@ mod tests {
                 Some(42),
                 10,
                 Some("c".repeat(32)),
+                "movie.bin",
             )
             .await
             .unwrap();
@@ -554,19 +621,301 @@ mod tests {
                 .await
                 .unwrap_err()
                 .contains("Upload source changed"));
+            assert!(UploadJournal::open(
+                db.clone(),
+                path,
+                "transfer-1",
+                Some(42),
+                10,
+                None,
+                "movie.bin"
+            )
+            .await
+            .err()
+            .unwrap()
+            .contains("Upload source changed"));
             assert!(
-                UploadJournal::open(db.clone(), path, "transfer-1", Some(42), 10, None)
-                    .await
-                    .err()
-                    .unwrap()
-                    .contains("Upload source changed")
-            );
-            assert!(
-                UploadJournal::open(db, path, "transfer-2", Some(42), 10, None)
+                UploadJournal::open(db, path, "transfer-2", Some(42), 10, None, "movie.bin")
                     .await
                     .is_ok()
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_manifest_checkpoint_survives_local_publish_failure_and_retry() {
+        let directory = scratch();
+        let path = directory.join("accepted-manifest.bin");
+        std::fs::write(&path, b"one small private upload").unwrap();
+        let path = path.to_str().unwrap();
+        let db_file = directory.join("upload.db");
+        {
+            let db = Arc::new(Mutex::new(sqlite::open(&db_file).unwrap()));
+            let mut journal = UploadJournal::open(
+                db,
+                path,
+                "accepted-manifest",
+                Some(42),
+                1024,
+                Some("a".repeat(32)),
+                "accepted-manifest.bin",
+            )
+            .await
+            .unwrap();
+            journal
+                .record(ManifestChunkV1 {
+                    index: 1,
+                    message_id: 1801,
+                    size: 24,
+                    sha256: None,
+                })
+                .unwrap();
+            assert!(journal.record_manifest_message_id(0).is_err());
+            assert!(journal
+                .record_manifest_message_id(i64::from(i32::MAX) + 1)
+                .is_err());
+            assert_eq!(journal.snapshot.manifest_message_id, None);
+            journal.record_manifest_message_id(1802).unwrap();
+            assert!(
+                !journal.snapshot.completed,
+                "Remote acceptance is not local completion"
+            );
+        }
+        {
+            let db = Arc::new(Mutex::new(sqlite::open(&db_file).unwrap()));
+            let resumed = UploadJournal::open(
+                db,
+                path,
+                "accepted-manifest",
+                Some(42),
+                1024,
+                Some("b".repeat(32)),
+                "accepted-manifest.bin",
+            )
+            .await
+            .unwrap();
+            assert!(resumed.resumed);
+            assert_eq!(
+                resumed.snapshot.logical_file_id.as_deref(),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            );
+            assert_eq!(resumed.snapshot.manifest_message_id, Some(1802));
+            assert_eq!(resumed.snapshot.chunks[&1].message_id, 1801);
+            assert!(!resumed.snapshot.completed);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_resume_binds_name_before_reusing_saved_remote_chunks() {
+        let dir = scratch();
+        let file = dir.join("original.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let path = file.to_str().unwrap();
+        let db = Arc::new(Mutex::new(sqlite::open(":memory:").unwrap()));
+        let mut initial = UploadJournal::open(
+            db.clone(),
+            path,
+            "keep-name",
+            Some(91),
+            10,
+            Some("f".repeat(32)),
+            "Original.bin",
+        )
+        .await
+        .unwrap();
+        initial
+            .record(ManifestChunkV1 {
+                index: 1,
+                message_id: 8123,
+                size: 10,
+                sha256: None,
+            })
+            .unwrap();
+        let key = initial.key.clone();
+        let created_at = initial.snapshot.created_at;
+        assert!(created_at.unwrap() > 0);
+        drop(initial);
+
+        let same = UploadJournal::open(
+            db.clone(),
+            path,
+            "keep-name",
+            Some(91),
+            10,
+            Some("e".repeat(32)),
+            "Original.bin",
+        )
+        .await
+        .unwrap();
+        assert!(same.resumed);
+        assert_eq!(
+            same.snapshot.logical_file_id.as_deref(),
+            Some("ffffffffffffffffffffffffffffffff")
+        );
+        assert_eq!(same.snapshot.display_name.as_deref(), Some("Original.bin"));
+        assert_eq!(same.snapshot.created_at, created_at);
+        assert_eq!(same.snapshot.chunks[&1].message_id, 8123);
+        drop(same);
+
+        let error = UploadJournal::open(
+            db.clone(),
+            path,
+            "keep-name",
+            Some(91),
+            10,
+            Some("a".repeat(32)),
+            "Changed.bin",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("filename changed"), "{error}");
+        let conn = db.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT state FROM upload_checkpoints WHERE id=?1")
+            .unwrap();
+        statement.bind((1, key.as_str())).unwrap();
+        assert_eq!(statement.next().unwrap(), sqlite::State::Row);
+        let state: UploadCheckpoint =
+            serde_json::from_str(&statement.read::<String, _>(0).unwrap()).unwrap();
+        assert_eq!(state.display_name.as_deref(), Some("Original.bin"));
+        drop(statement);
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_checkpoint_adds_name_without_losing_saved_parts() {
+        let dir = scratch();
+        let file = dir.join("legacy.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let path = file.to_str().unwrap();
+        let db = Arc::new(Mutex::new(sqlite::open(":memory:").unwrap()));
+        let mut journal = UploadJournal::open(
+            db.clone(),
+            path,
+            "old-checkpoint",
+            Some(91),
+            10,
+            None,
+            "Legacy.bin",
+        )
+        .await
+        .unwrap();
+        journal
+            .record(ManifestChunkV1 {
+                index: 1,
+                message_id: 444,
+                size: 10,
+                sha256: None,
+            })
+            .unwrap();
+        let key = journal.key.clone();
+        drop(journal);
+        {
+            let conn = db.lock().unwrap();
+            let mut statement = conn
+                .prepare("SELECT state FROM upload_checkpoints WHERE id=?1")
+                .unwrap();
+            statement.bind((1, key.as_str())).unwrap();
+            assert_eq!(statement.next().unwrap(), sqlite::State::Row);
+            let mut original: Value =
+                serde_json::from_str(&statement.read::<String, _>(0).unwrap()).unwrap();
+            drop(statement);
+            original.as_object_mut().unwrap().remove("display_name");
+            original.as_object_mut().unwrap().remove("created_at");
+            // Store literal legacy JSON with both fields ABSENT, not null:
+            // serde defaults must accept an actual pre-upgrade checkpoint.
+            let text = serde_json::to_string(&original).unwrap();
+            let mut update = conn
+                .prepare("UPDATE upload_checkpoints SET state=?1 WHERE id=?2")
+                .unwrap();
+            update.bind((1, text.as_str())).unwrap();
+            update.bind((2, key.as_str())).unwrap();
+            update.next().unwrap();
+        }
+        let recovered = UploadJournal::open(
+            db.clone(),
+            path,
+            "old-checkpoint",
+            Some(91),
+            10,
+            None,
+            "Recovered.bin",
+        )
+        .await
+        .unwrap();
+        assert!(recovered.resumed);
+        assert_eq!(recovered.snapshot.chunks[&1].message_id, 444);
+        assert_eq!(
+            recovered.snapshot.display_name.as_deref(),
+            Some("Recovered.bin")
+        );
+        drop(recovered);
+        let error = UploadJournal::open(
+            db.clone(),
+            path,
+            "old-checkpoint",
+            Some(91),
+            10,
+            None,
+            "Other.bin",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("filename changed"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_transfer_id_cannot_reuse_previous_completed_upload_identity() {
+        let dir = scratch();
+        let file = dir.join("same.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let path = file.to_str().unwrap();
+        let db = Arc::new(Mutex::new(sqlite::open(":memory:").unwrap()));
+        let mut first = UploadJournal::open(
+            db.clone(),
+            path,
+            "",
+            Some(91),
+            10,
+            Some("a".repeat(32)),
+            "same.bin",
+        )
+        .await
+        .unwrap();
+        first
+            .record(ManifestChunkV1 {
+                index: 1,
+                message_id: 2345,
+                size: 10,
+                sha256: None,
+            })
+            .unwrap();
+        first.complete(Some(3333)).unwrap();
+        let first_key = first.key.clone();
+        drop(first);
+
+        let second = UploadJournal::open(
+            db.clone(),
+            path,
+            "",
+            Some(91),
+            10,
+            Some("b".repeat(32)),
+            "same.bin",
+        )
+        .await
+        .unwrap();
+        assert!(!second.resumed);
+        assert_ne!(second.key, first_key);
+        assert_eq!(second.snapshot.logical_file_id, Some("b".repeat(32)));
+        assert!(second.snapshot.chunks.is_empty());
+        assert_eq!(second.snapshot.manifest_message_id, None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

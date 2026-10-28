@@ -669,8 +669,16 @@ export function AdaptiveMediaPlayer({
             if (expected === null || expected <= 3 || !Number.isFinite(video.duration)
                 || video.duration >= expected - 2) return;
             if (nativeOriginalRetryRef.current >= 1) {
-                setNativeError('The video decoder could not load the complete file. Use Retry playback.');
-                setNativePhase('error');
+                // WebKit may misread a valid moov-at-end HTTP MP4 as a
+                // 20-200ms clip even after a fresh decoder restart. Once
+                // confirmed twice, use the existing streamed fMP4 recovery
+                // rather than telling the user to retry the same broken URL.
+                if (transcodeCapsRef.current?.available && !memoryMediaUrl) {
+                    handleProgressiveDetected();
+                } else {
+                    setNativeError('The video decoder could not load the complete file. Use Retry playback.');
+                    setNativePhase('error');
+                }
                 return;
             }
             nativeOriginalRetryRef.current += 1;
@@ -686,7 +694,8 @@ export function AdaptiveMediaPlayer({
             setNativeDecoderRevision(n => n + 1);
         }, 2500);
         return () => clearTimeout(timer);
-    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision, nativePhase]);
+    }, [fmp4StreamUrl, useFallback, playbackMode, nativeDecoderRevision, nativePhase,
+        memoryMediaUrl, handleProgressiveDetected]);
 
     // A native decoder can keep the first 200ms media fragment as the entire
     // duration even after fetching the fully completed, independently ranged

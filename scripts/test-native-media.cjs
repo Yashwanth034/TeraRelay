@@ -202,7 +202,7 @@ async function runBrowser(url) {
   // Identical packets, but moov metadata moved to the start. Isolate
   // WebKitGTK's short-duration failure on moov-at-end HTTP responses.
   execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',single,'-c','copy','-movflags','+faststart',faststart]);
-  execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',source,'-map','0:v:0','-map','0:2','-c','copy','-movflags','frag_keyframe+empty_moov+default_base_moof','-frag_duration','2000000','-f','mp4',remux]);
+  execFileSync('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',source,'-map','0:v:0','-map','0:2','-c','copy','-movflags','frag_keyframe+empty_moov+default_base_moof+global_sidx','-frag_duration','2000000','-f','mp4',remux]);
   await appRequire('esbuild').build({
     stdin: { contents: entry, resolveDir: path.join(root, 'app'), sourcefile: 'native-qa.tsx', loader: 'tsx' },
     bundle: true, outfile: path.join(tmp, 'player.js'), nodePaths: [path.join(root, 'app/node_modules')],

@@ -308,7 +308,7 @@ async fn run_fmp4_remux_at(
         .arg("-ac")
         .arg("2")
         .arg("-movflags")
-        .arg("frag_keyframe+empty_moov+default_base_moof")
+        .arg("frag_keyframe+empty_moov+default_base_moof+global_sidx")
         .arg("-frag_duration")
         .arg("2000000")
         .arg("-flush_packets")

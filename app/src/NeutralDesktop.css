@@ -1,0 +1,262 @@
+/* UIArc-inspired neutral desktop surfaces. Original implementation; native scroll.
+   Keep this layer separate from legacy component geometry for a bounded rollback. */
+:root {
+  --tr-on-primary: #141414;
+  --tr-canvas: var(--color-telegram-bg);
+  --tr-panel: var(--color-telegram-surface);
+  --tr-panel-strong: var(--color-telegram-surface);
+  --tr-panel-soft: color-mix(in srgb, var(--color-telegram-text) 3%, var(--tr-panel));
+  --tr-control: color-mix(in srgb, var(--color-telegram-text) 4%, var(--tr-panel));
+  --tr-control-hover: color-mix(in srgb, var(--color-telegram-text) 8%, var(--tr-panel));
+  --tr-border-soft: var(--color-telegram-border);
+  --tr-border-strong: color-mix(in srgb, var(--color-telegram-text) 22%, var(--tr-panel));
+  --tr-primary-soft: color-mix(in srgb, var(--color-telegram-primary) 9%, var(--tr-panel));
+  --tr-secondary-soft: var(--tr-control);
+  --tr-focus-ring: color-mix(in srgb, var(--color-telegram-primary) 36%, transparent);
+  --tr-shadow-panel: none;
+  --tr-shadow-float: 0 12px 36px #0003;
+  --tr-radius-panel: 12px;
+  --tr-radius-control: 8px;
+  --tr-ease: cubic-bezier(.2, .8, .2, 1);
+}
+:root.light {
+  --tr-on-primary: #ffffff;
+  --tr-canvas: var(--color-telegram-bg);
+  --tr-panel: var(--color-telegram-surface);
+  --tr-panel-strong: var(--color-telegram-surface);
+  --tr-panel-soft: color-mix(in srgb, var(--color-telegram-text) 2%, var(--tr-panel));
+  --tr-control: color-mix(in srgb, var(--color-telegram-text) 3%, var(--tr-panel));
+  --tr-control-hover: color-mix(in srgb, var(--color-telegram-text) 6%, var(--tr-panel));
+  --tr-border-soft: var(--color-telegram-border);
+  --tr-shadow-panel: none;
+  --tr-shadow-float: 0 12px 36px #0002;
+}
+
+/* No full-height glass layers behind scrolling content. */
+.terarelay-shell,
+:root.light .terarelay-shell,
+.auth-gradient,
+:root.light .auth-gradient {
+  background: var(--tr-canvas);
+}
+.terarelay-shell { padding: 8px; gap: 8px; }
+.terarelay-shell::before,
+.tr-sidebar::before,
+.terarelay-auth-stage::before,
+.terarelay-auth-stage::after,
+.tr-library-folder-cover__glow,
+.tr-empty-state__orb { display: none; }
+
+.tr-sidebar, .tr-main-panel, .tr-topbar, .tr-transfer-dock,
+.tr-channel-toolbar, .tr-channel-composer, .tr-surface--glass,
+.tr-popover, .tr-modal, .tr-side-panel, .tr-file-quick-actions,
+.tr-media-details, .glass, .auth-glass, .glass-input,
+:root.light .tr-sidebar, :root.light .tr-main-panel,
+:root.light .tr-topbar, :root.light .tr-transfer-dock,
+:root.light .glass, :root.light .auth-glass, :root.light .glass-input {
+  background: var(--tr-panel);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.tr-sidebar, .tr-main-panel { box-shadow: none; border-radius: 12px; }
+.tr-topbar {
+  height: auto;
+  min-height: 64px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  box-shadow: none;
+  border-color: var(--tr-border-soft);
+}
+.tr-topbar__identity { min-width: 0; flex: 0 1 150px; }
+.tr-topbar__search { flex: 1 1 200px; min-width: 0; width: auto; max-width: 430px; }
+.tr-topbar > div:last-child { flex: 1 1 auto; flex-wrap: wrap; }
+.tr-topbar__actions { flex-shrink: 0; border-radius: 9px; }
+.tr-topbar__title { font-size: 15px; font-weight: 600; letter-spacing: -.02em; }
+.tr-topbar__eyebrow { color: var(--color-telegram-subtext); letter-spacing: .01em; }
+.tr-sidebar-footer, .tr-modal-header, .tr-modal-footer,
+.tr-transfer-header, .tr-settings-body, .tr-channel-feed,
+.tr-file-explorer { background: transparent; }
+.tr-brand-mark, .terarelay-auth-brand img { filter: none; }
+.tr-brand-name { font-weight: 600; }
+.tr-sidebar-item {
+  min-height: 36px;
+  border-radius: 7px;
+  font-size: 13px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.tr-sidebar-item:hover { transform: none; background: var(--tr-control); }
+.tr-sidebar-item--active {
+  color: var(--color-telegram-text);
+  border-color: transparent;
+  background: var(--tr-control-hover);
+  box-shadow: none;
+}
+.tr-sidebar-item--active::before { display: none; }
+.tr-sidebar-item--active > svg:first-child { color: currentColor; filter: none; }
+.tr-group-tab { border-radius: 7px; background: transparent; box-shadow: none; }
+.tr-group-tab:hover { transform: none; }
+.tr-group-tab--active {
+  background: var(--tr-control-hover);
+  color: var(--color-telegram-text);
+  border-color: var(--tr-border-soft);
+  box-shadow: none;
+}
+
+.tr-button, .tr-icon-button, .tr-choice-chip,
+.tr-library-sort, .tr-modal-close, .tr-menu-item {
+  border-radius: 8px;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.tr-button:hover:not(:disabled), .tr-icon-button:hover:not(:disabled),
+.tr-modal-option:hover:not(:disabled), .tr-transfer-item:hover,
+.tr-transfer-item button:hover, .tr-file-card:hover { transform: none; }
+.tr-button--primary, .tr-button--primary:hover:not(:disabled),
+.terarelay-primary-action, .terarelay-primary-action:hover {
+  color: var(--tr-on-primary);
+  background: var(--color-telegram-primary);
+  border-color: transparent;
+  box-shadow: none;
+  filter: none;
+}
+.bg-telegram-primary,
+.tr-library-select--active,
+.tr-file-select--active {
+  color: var(--tr-on-primary);
+}
+.bg-telegram-primary .text-white { color: var(--tr-on-primary); }
+.tr-button--secondary, .tr-button--ghost,
+.tr-icon-button, .tr-choice-chip, .tr-modal-input,
+.tr-topbar__search input, .tr-channel-search input {
+  box-shadow: none;
+}
+.tr-icon-button--active, .tr-icon-button--primary,
+.tr-choice-chip--active, .tr-library-sort--active {
+  background: var(--tr-control-hover);
+  color: var(--color-telegram-text);
+  border-color: var(--tr-border-strong);
+  box-shadow: none;
+}
+.tr-popover, .tr-modal, .tr-side-panel {
+  border: 1px solid var(--tr-border-strong);
+  box-shadow: var(--tr-shadow-float);
+  border-radius: 12px;
+}
+.tr-modal-backdrop, .tr-side-panel-backdrop {
+  background: #0008;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.tr-modal-option, .tr-setting-row, .tr-setting-row:hover {
+  border-radius: 10px;
+  background: var(--tr-panel-soft);
+  box-shadow: none;
+}
+.tr-settings-modal { min-height: min(540px, calc(100dvh - 24px)); max-height: calc(100dvh - 24px); }
+.tr-settings-body { min-height: 0; overflow-y: auto; }
+.tr-settings-tab { border-radius: 7px; }
+.tr-settings-tab--active {
+  color: var(--color-telegram-text);
+  background: var(--tr-control-hover);
+  border-color: var(--tr-border-soft);
+}
+.tr-settings-tab--active::after { display: none; }
+.tr-setting-section-title { font-size: 11px; font-weight: 600; letter-spacing: .06em; }
+.tr-modal-input:focus, .glass-input:focus,
+.tr-topbar__search input:focus, .tr-channel-search input:focus {
+  border-color: var(--tr-border-strong);
+  box-shadow: 0 0 0 2px var(--tr-focus-ring);
+}
+.terarelay-shell :focus-visible,
+.tr-modal :focus-visible,
+.tr-popover :focus-visible {
+  outline: 2px solid var(--color-telegram-primary);
+  outline-offset: 2px;
+}
+
+.tr-library-card, .tr-library-card:hover,
+.tr-file-card, .tr-file-card:hover, :root.light .tr-file-card {
+  background: var(--tr-panel);
+  box-shadow: none;
+  border-radius: 10px;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.tr-library-card--selected, .tr-library-card--selected:hover {
+  border-color: var(--color-telegram-primary);
+  box-shadow: inset 0 0 0 1px var(--color-telegram-primary);
+}
+.tr-library-card__media, .tr-library-folder-cover,
+.tr-library-card__footer, .tr-library-list-header,
+.tr-empty-state__visual, .tr-empty-state__card,
+.tr-media-details__preview {
+  background: var(--tr-panel-soft);
+}
+.tr-library-upload-card, .tr-library-upload-card:hover,
+.tr-library-list-upload, .tr-library-list-upload:hover,
+.tr-transfer-item, .tr-transfer-item:hover,
+.tr-file-row, .tr-version-group, .tr-version-group--expanded {
+  background: var(--tr-panel-soft);
+  box-shadow: none;
+}
+.tr-library-list-row { border-radius: 6px; }
+.tr-library-list-row--selected, .tr-file-row--selected {
+  background: var(--tr-control-hover);
+  border-color: var(--tr-border-strong);
+  box-shadow: none;
+}
+.tr-library-card__actions, .tr-library-select,
+.tr-media-thumb__play, .tr-media-thumb__type {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.tr-media-thumb, .tr-media-thumb:hover { box-shadow: none; }
+.tr-transfer-dock { box-shadow: var(--tr-shadow-float); border-radius: 12px; }
+.tr-empty-state__icon, .terarelay-mini-mark,
+.terarelay-auth-story, :root.light .terarelay-auth-story,
+.terarelay-auth-points > div {
+  color: var(--color-telegram-text);
+  background: var(--tr-panel);
+  border-color: var(--tr-border-soft);
+  box-shadow: none;
+}
+.terarelay-auth-story::before { display: none; }
+
+/* Native scrollbars remain draggable and keyboard scrolling stays platform-native.
+   Masks are enabled only on the small sidebar; large virtual lists keep zero mask cost. */
+.tr-native-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--tr-border-strong) transparent;
+}
+.tr-native-scroll::-webkit-scrollbar { width: 7px; height: 7px; }
+.tr-native-scroll::-webkit-scrollbar-thumb {
+  background: var(--tr-border-strong);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 7px;
+}
+.tr-native-scroll:hover::-webkit-scrollbar-thumb,
+.tr-native-scroll[data-scroll-active]::-webkit-scrollbar-thumb {
+  background-color: var(--color-telegram-subtext);
+}
+.tr-sidebar-scroll {
+  --tr-scroll-top: 0px;
+  --tr-scroll-bottom: 0px;
+  mask-image: linear-gradient(to bottom, transparent,
+    #000 var(--tr-scroll-top), #000 calc(100% - var(--tr-scroll-bottom)), transparent);
+  -webkit-mask-image: linear-gradient(to bottom, transparent,
+    #000 var(--tr-scroll-top), #000 calc(100% - var(--tr-scroll-bottom)), transparent);
+}
+:root.light ::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:hover { background-color: var(--color-telegram-subtext); }
+.performance-mode .tr-sidebar-scroll { mask-image: none; -webkit-mask-image: none; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
+}
+@media (max-width: 900px) {
+  .terarelay-shell { padding: 4px; gap: 4px; }
+}

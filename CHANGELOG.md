@@ -4,6 +4,13 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-29
+
+- Replace the default blue/glass desktop treatment with neutral dark and light surfaces, clearer selected states, and readable primary controls across custom themes.
+- Improve large-library scrolling and grid/list switching by reusing locale-aware filename sorting, enabling only the visible virtualizer, and attaching viewport measurement after asynchronous loading.
+- Keep native scrolling, add lightweight sidebar overflow fades, respect reduced motion/performance mode, and prevent toolbar overlap in narrow desktop windows.
+- Show the normal opening screen while restoring a saved Telegram session. Keep retry and optional phone sign-in available for real connection/credential errors and prolonged connections without clearing the saved login.
+
 ## [0.2.1] - 2026-10-28
 
 - Preserve saved Telegram account sessions across normal launches, Linux background startup, and transient connection failures. Show recoverable connection status rather than incorrectly requesting phone sign-in; never create an empty session during automatic restoration.

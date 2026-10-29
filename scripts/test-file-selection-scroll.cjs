@@ -67,6 +67,8 @@ function mount(name, imports = {}) {
         });
       },
       measureElement() {},
+      scrollToOffset() {},
+      measure() {},
     }) },
     'lucide-react': primitive, 'framer-motion': { motion: primitive },
     'react-i18next': { useTranslation: () => ({ t: key => key === 'files.select_all' ? 'Select All' : key }) },
@@ -110,6 +112,40 @@ const props = {
   onFileClick() {}, onToggleSelection() {}, onDownload() {}, onDownloadAll() {}, onPreview() {},
   onDelete() {}, onRename() {}, onFileMove() {}, onManualUpload() {}, onFolderUpload() {},
 };
+test('library starts observing its viewport after async files arrive', () => {
+  const harness = mount('FileExplorer');
+  const input = { ...props, viewMode: 'grid', cardScale: 1, onCardScaleChange() {}, showFolderUpload: false };
+  harness.render({ ...input, loading: true, files: [] });
+  assert.equal(harness.observers.filter(o => !o.disconnected).length, 0);
+  harness.render(input);
+  assert.equal(harness.observers.filter(o => !o.disconnected).length, 1,
+    'The loaded grid must measure and observe its real viewport');
+});
+test('only the visible library layout enables a virtualizer', () => {
+  let options = [];
+  const harness = mount('FileExplorer', { '@tanstack/react-virtual': { useVirtualizer: value => {
+    options.push(value);
+    return { getTotalSize: () => 0, getVirtualItems: () => [], scrollToOffset() {}, measure() {} };
+  } } });
+  const input = { ...props, viewMode: 'grid', cardScale: 1, onCardScaleChange() {} };
+  harness.render(input);
+  assert.deepEqual(options.map(o => o.enabled), [true, false]);
+  options = [];
+  harness.render({ ...input, viewMode: 'list' });
+  assert.deepEqual(options.map(o => o.enabled), [false, true]);
+});
+test('changing language updates natural filename ordering without changing files', () => {
+  let language = 'en';
+  const harness = mount('FileExplorer', {
+    '../../../context/SettingsContext': { useSettings: () => ({ settings: { language } }) },
+  });
+  const files = [{ ...file, id: 1, name: 'ä.txt' }, { ...file, id: 2, name: 'z.txt' }];
+  const input = { ...props, files, viewMode: 'grid', cardScale: 1, onCardScaleChange() {} };
+  const names = tree => nodes(tree, node => node.props.file && node.props.onContextMenu).map(node => node.props.file.name);
+  assert.deepEqual(names(harness.render(input)), ['ä.txt', 'z.txt']);
+  language = 'sv';
+  assert.deepEqual(names(harness.render(input)), ['z.txt', 'ä.txt']);
+});
 test('channel has no empty selection affordance before selection starts', () => {
   assert.equal(byClass(mount('ChannelFeed').render(props), 'tr-file-select').length, 0);
 });

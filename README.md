@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1"><strong>Download v0.2.1</strong></a>
+  <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><strong>Download the latest release</strong></a>
   ·
   <a href="#quick-start">Quick start</a>
   ·
@@ -52,9 +52,9 @@ TeraRelay uses your own Telegram account. File data is stored through Telegram; 
 
 **Important:** Telegram cloud chats are **not end-to-end encrypted**. Encrypt sensitive files yourself before uploading. TeraRelay does not change Telegram's security model. See [Security](SECURITY.md).
 
-## Download v0.2.1
+## Download the latest release
 
-The current published release is **v0.2.1**. Choose the package that matches your device:
+Choose the package that matches your device:
 
 | Platform | Available release files | Notes |
 | --- | --- | --- |
@@ -65,7 +65,7 @@ The current published release is **v0.2.1**. Choose the package that matches you
 | **Android ARM64** | Signed `.apk`, `.aab` | Install the APK directly; AAB is for distribution workflows |
 | **iOS** | No public installable package | Simulator CI passed; App Store/device distribution requires Apple credentials |
 
-**[Get TeraRelay v0.2.1 from GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1)**
+**[Get the latest TeraRelay release from GitHub](https://github.com/Yashwanth034/TeraRelay/releases/latest)**
 
 The release includes `SHA256SUMS.txt` to verify downloaded files, signed desktop updater payloads, and a signed Android update manifest. **An updater signature is not the same as operating-system code signing.** Windows/macOS security prompts may appear.
 
@@ -73,7 +73,7 @@ Release builds and automated tests have passed; this does **not** mean the app h
 
 ## Quick start
 
-1. Download the [appropriate v0.2.1 package](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1) and install or launch it.
+1. Download the [appropriate release package](https://github.com/Yashwanth034/TeraRelay/releases/latest) and install or launch it.
 2. Sign in using your Telegram account. Phone, QR, and two-step verification flows are supported.
 3. Open **Personal Vault**, or create/join a TeraRelay channel.
 4. Upload a document or folder. Large-file parts are handled automatically.
@@ -92,20 +92,20 @@ For other workflows, use **Remote Import** for supported URLs and **TeraRelay Dr
 | **Remote Import** | Supported direct URLs, media pages, galleries, and torrents; quality or file selection where available, multi-link queues, and resumable acquisition |
 | **TeraRelay Drive** | Desktop file-manager integration, storage organization, metadata-based browsing, and recovery/backup tools |
 | **Device Continuity** | Reconcile Drive metadata across devices with conflict protection; it is not a replacement for separate device authentication |
-| **Desktop experience** | Background/tray mode, saved login recovery, themes and localization, plus signed in-app update payloads |
+| **Desktop experience** | Neutral desktop themes, native scrolling, background/tray mode, saved login recovery, localization, and signed in-app update payloads |
 
 ### Drive tools in the current app
 
 Beyond basic folders, the desktop app includes tools for organizing and checking Drive data: folder copy/mirror operations, collections and smart views, duplicate exploration, backup timelines, integrity checks, pending-write recovery, and diagnostic views. These are part of the current product—not a separate download.
 
-Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1) for distribution limits.
+Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/latest) for distribution limits.
 
-## What's improved in v0.2.1
+## What's improved in v0.2.2
 
-- **Login and reconnection:** restore saved Telegram authorization after restart or temporary network loss, with recoverable connection status instead of unnecessarily returning to sign-in.
-- **Playback and seeking:** improve WebKit media recovery and fragmented-MP4 handling. A completed progressive MP4 can be finalized as a seekable fast-start MP4 without re-encoding.
-- **Drive and transfers:** improve local-first organization, backups, recovery, file handling, and background startup/shutdown behavior.
-- **Dependency security and release checks:** update the affected Hickory/ringbuf dependency paths while retaining SOCKS proxy and torrent support; expand regression coverage and cross-platform validation.
+- **Neutral desktop appearance:** charcoal and white base themes, solid surfaces, restrained control states, and readable primary-button text for custom accent colors.
+- **Responsive browsing:** faster filename sorting, one active grid/list virtualizer, correct measurements after files load, and native scrolling with lightweight sidebar overflow hints.
+- **Comfortable interactions:** reduced-motion and performance-mode support, plus a toolbar that wraps cleanly in narrow desktop windows.
+- **Calmer startup:** normal saved-login restoration uses the opening screen. Real failures and prolonged connections retain recovery options without clearing the saved session.
 
 **Older release notes belong in the [full changelog](CHANGELOG.md)** rather than repeating entire past versions in this README.
 
@@ -152,7 +152,7 @@ cd ../..
 bash scripts/check-source.sh
 ```
 
-The v0.2.1 release passed its cross-platform CI and required production release workflow. Automated validation covers Linux, Windows, macOS, Android ARM64, and the iOS simulator; it is not a substitute for testing every device. [See CI](https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml).
+The cross-platform CI workflow builds and tests Linux, Windows, macOS, Android ARM64, and the iOS simulator. Production release builds also enforce dependency audits and updater signing; automated validation is not a substitute for testing every device. [See CI](https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml).
 
 ## Documentation and support
 

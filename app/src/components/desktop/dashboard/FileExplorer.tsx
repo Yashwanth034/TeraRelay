@@ -40,12 +40,12 @@ interface FileExplorerProps {
 }
 
 
-function useGridColumns(containerRef: React.RefObject<HTMLDivElement | null>) {
+function useGridColumns(containerRef: React.RefObject<HTMLDivElement | null>, ready: boolean) {
     const [columns, setColumns] = useState(4);
     const [containerWidth, setContainerWidth] = useState(800);
 
     useEffect(() => {
-        if (!containerRef.current) return;
+        if (!ready || !containerRef.current) return;
 
         const updateColumns = () => {
             const el = containerRef.current;
@@ -67,7 +67,7 @@ function useGridColumns(containerRef: React.RefObject<HTMLDivElement | null>) {
         const observer = new ResizeObserver(updateColumns);
         observer.observe(containerRef.current);
         return () => observer.disconnect();
-    }, [containerRef]);
+    }, [containerRef, ready]);
 
     return { columns, containerWidth };
 }
@@ -84,7 +84,7 @@ export function FileExplorer({
     const { settings } = useSettings();
 
     const parentRef = useRef<HTMLDivElement>(null);
-    const { columns: baseColumns, containerWidth } = useGridColumns(parentRef);
+    const { columns: baseColumns, containerWidth } = useGridColumns(parentRef, !loading && !error && files.length > 0);
 
     // Scale columns by cardScale: higher scale = fewer columns = larger cards
     const columns = Math.max(1, Math.round(baseColumns / cardScale));
@@ -105,11 +105,12 @@ export function FileExplorer({
     }, []);
 
     const sortedFiles = useMemo(() => {
+        const collator = new Intl.Collator(settings.language, { numeric: true, sensitivity: 'base' });
         return [...files].sort((a, b) => {
             let comparison = 0;
             switch (sortField) {
                 case 'name':
-                    comparison = a.name.localeCompare(b.name, settings.language, { numeric: true, sensitivity: 'base' });
+                    comparison = collator.compare(a.name, b.name);
                     break;
                 case 'size':
                     comparison = (a.size || 0) - (b.size || 0);
@@ -120,7 +121,7 @@ export function FileExplorer({
             }
             return sortDirection === 'asc' ? comparison : -comparison;
         });
-    }, [files, sortField, sortDirection]);
+    }, [files, sortField, sortDirection, settings.language]);
 
     const handlePreviewRequest = useCallback((file: TelegramFile) => {
         onPreview(file, sortedFiles);
@@ -147,6 +148,7 @@ export function FileExplorer({
 
 
     const gridVirtualizer = useVirtualizer({
+        enabled: viewMode === 'grid',
         count: gridRows.length,
         getScrollElement: () => parentRef.current,
         estimateSize: useCallback(() => cardHeight, [cardHeight]),
@@ -155,6 +157,7 @@ export function FileExplorer({
     });
 
     const listVirtualizer = useVirtualizer({
+        enabled: viewMode === 'list',
         count: listItems.length,
         getScrollElement: () => parentRef.current,
         estimateSize: () => 48,
@@ -214,7 +217,9 @@ export function FileExplorer({
     return (
         <div
             ref={parentRef}
-            className="tr-file-explorer flex-1 p-6 overflow-auto custom-scrollbar"
+            className="tr-file-explorer tr-native-scroll flex-1 p-6 overflow-auto custom-scrollbar"
+            tabIndex={0}
+            aria-label="Files"
         >
             {viewMode === 'grid' ? (
                 <>

@@ -212,7 +212,9 @@ export function ChannelFeed({
         >
             <div
                 ref={scrollRef}
-                className="tr-channel-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3"
+                className="tr-channel-scroll tr-native-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3"
+                tabIndex={0}
+                aria-label="Channel files"
                 style={{ paddingBottom: hasTransferPanel ? 88 : undefined }}
                 onScroll={(event) => {
                     const scroller = event.currentTarget;

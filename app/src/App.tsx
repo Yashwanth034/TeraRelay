@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, Suspense } from "react";
+import { MotionConfig } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -10,6 +11,7 @@ import { TeraRelayBrand } from "./components/shared/TeraRelayBrand";
 import { useDeviceContinuity } from "./hooks/useDeviceContinuity";
 import { usePlatform } from "./hooks/usePlatform";
 import "./App.css";
+import "./NeutralDesktop.css";
 
 const DesktopDashboard = React.lazy(() => import("./components/desktop/DesktopDashboard").then(m => ({ default: m.Dashboard })));
 // Vite requires a fully static import path for dynamic imports so it can
@@ -174,6 +176,16 @@ function AppContent() {
     };
   }, [manualSignIn, sessionRetryGeneration]);
 
+  // Give routine restoration time to finish without flashing recovery controls.
+  // A slow native request must still leave a way to retry or choose phone sign-in.
+  useEffect(() => {
+    if (authStatus !== "restoring" || sessionRecoveryDetail) return;
+    const timer = window.setTimeout(() => {
+      setSessionRecoveryDetail("Connecting is taking longer than usual. Your saved login is preserved; you can keep waiting or retry.");
+    }, 8_000);
+    return () => window.clearTimeout(timer);
+  }, [authStatus, sessionRecoveryDetail, sessionRetryGeneration]);
+
   useEffect(() => {
     if (authStatus !== "authenticated") {
       setContinuityUnlockDismissed(false);
@@ -240,8 +252,9 @@ function AppContent() {
     };
   }, []);
 
-  // Do not discard an existing account just because Telegram is temporarily offline.
-  if (authStatus === "restoring") {
+  // Recovery actions are for a reported problem, not a routine saved-session connection.
+  // Keep the saved account intact when Telegram is temporarily offline.
+  if (authStatus === "restoring" && sessionRecoveryDetail) {
     return (
       <main className="h-screen w-screen auth-gradient terarelay-auth-stage flex flex-col items-center justify-center gap-4 px-6 text-center">
         <TeraRelayBrand size="lg" showName={false} />
@@ -266,8 +279,8 @@ function AppContent() {
     );
   }
 
-  // Styled splash screen while verifying the session
-  if (authStatus === "loading") {
+  // Normal restoration has no recovery warning until an actual issue is reported.
+  if (authStatus === "loading" || authStatus === "restoring") {
     return (
       <main className="h-screen w-screen auth-gradient terarelay-auth-stage flex items-center justify-center">
         <div className="flex flex-col items-center gap-3">
@@ -280,6 +293,7 @@ function AppContent() {
   }
 
   return (
+    <MotionConfig reducedMotion={settings.performanceMode ? "always" : "user"}>
     <main className="absolute inset-0 text-telegram-text overflow-hidden selection:bg-telegram-primary/30">
       <Toaster theme={theme} position="bottom-center" closeButton />
       <AppUpdatePrompt />
@@ -317,6 +331,7 @@ function AppContent() {
         <AuthWizard onLogin={() => setAuthStatus("authenticated")} />
       )}
     </main>
+    </MotionConfig>
   );
 }
 

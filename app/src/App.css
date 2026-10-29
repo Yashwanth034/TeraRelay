@@ -1,32 +1,30 @@
 @import "tailwindcss";
 
-/* stylelint-disable at-rule-no-unknown */
-/* Dark Theme (Default) - Using Tailwind v4 @theme directive */
+/* Neutral base palettes. User themes override these tokens through themeEngine. */
 @theme {
-  --color-telegram-bg: #070a12;
-  --color-telegram-surface: #0d1320;
-  --color-telegram-primary: #8b7cff;
-  --color-telegram-secondary: #55d9e6;
-  --color-telegram-text: #f7f8fc;
-  --color-telegram-subtext: #8f99ad;
-  --color-telegram-border: rgba(151, 164, 190, 0.14);
+  --color-telegram-bg: #141414;
+  --color-telegram-surface: #1c1c1c;
+  --color-telegram-primary: #e5e5e5;
+  --color-telegram-secondary: #b7b7b7;
+  --color-telegram-text: #eeeeee;
+  --color-telegram-subtext: #a1a1a1;
+  --color-telegram-border: #333333;
   --color-telegram-hover: rgba(255, 255, 255, 0.055);
-  --color-telegram-glass-bg: #0d1320;
-  --color-telegram-glass-border: #aab5d0;
+  --color-telegram-glass-bg: #1c1c1c;
+  --color-telegram-glass-border: #777777;
 }
 
-/* Light Theme Overrides */
 :root.light {
-  --color-telegram-bg: #f5f6fb;
+  --color-telegram-bg: #f7f7f7;
   --color-telegram-surface: #ffffff;
-  --color-telegram-primary: #6657e8;
-  --color-telegram-secondary: #168f9e;
-  --color-telegram-text: #151827;
-  --color-telegram-subtext: #667085;
-  --color-telegram-border: rgba(35, 43, 67, 0.11);
-  --color-telegram-hover: rgba(67, 76, 110, 0.055);
+  --color-telegram-primary: #292929;
+  --color-telegram-secondary: #595959;
+  --color-telegram-text: #202020;
+  --color-telegram-subtext: #676767;
+  --color-telegram-border: #e3e3e3;
+  --color-telegram-hover: rgba(0, 0, 0, 0.045);
   --color-telegram-glass-bg: #ffffff;
-  --color-telegram-glass-border: #59627a;
+  --color-telegram-glass-border: #777777;
 }
 
 body,

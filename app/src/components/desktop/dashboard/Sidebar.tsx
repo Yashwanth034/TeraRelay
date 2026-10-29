@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
+import { useScrollAffordance } from '../../../hooks/useScrollAffordance';
 import { HardDrive, Folder, Plus, RefreshCw, LogOut, ChevronLeft, ChevronRight, Settings2, Trash2, Check, X, Eye, EyeOff, UserPlus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SidebarItem } from './SidebarItem';
@@ -131,6 +132,7 @@ export function Sidebar({
     isSyncing, isConnected, onSync, onLogout,
     onAssignFolderToGroup, onReorderFolders, onUpdateGroupOrder, onCreateGroup, onUpdateGroup, onDeleteGroup
 }: SidebarProps) {
+    const scrollRef = useRef<HTMLElement>(null);
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
     const { t } = useTranslation();
@@ -142,6 +144,8 @@ export function Sidebar({
     const [editingGroup, setEditingGroup] = useState<FolderGroup | null>(null); // null means creating
     const [groupName, setGroupName] = useState("");
     const [groupColor, setGroupColor] = useState("#3B82F6");
+    useScrollAffordance(scrollRef, !settings.sidebarCollapsed, `${activeGroupId}:${folders.length}:${groups.length}`);
+
 
     // DND Kit Sensors
     const sensors = useSensors(
@@ -417,7 +421,7 @@ export function Sidebar({
                 )}
 
                 {/* Scrollable folder list */}
-                <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto min-h-0">
+                <nav ref={scrollRef} aria-label="Library" tabIndex={0} className="tr-sidebar-scroll tr-native-scroll flex-1 px-2 py-4 space-y-1 overflow-y-auto min-h-0">
                     <SidebarItem
                         icon={HardDrive}
                         label="Personal Vault"

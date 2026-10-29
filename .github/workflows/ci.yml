@@ -80,6 +80,9 @@ jobs:
           scripts/test-remote-import-recovery-controls.cjs
           scripts/test-auth-query-isolation.cjs
           scripts/test-saved-session-restore.cjs
+          scripts/test-startup-presentation.cjs
+          scripts/test-scroll-affordance.cjs
+          scripts/test-theme-contrast.cjs
           scripts/test-focused-ui.cjs
           scripts/test-remote-import-background.cjs
           scripts/test-remote-import-batch-cancel.cjs

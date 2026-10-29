@@ -114,6 +114,7 @@ There is no separate TeraRelay cloud-storage account or remote file-storage back
 - Improve Drive organization, backup/recovery, transfers, playback, navigation and accessibility.
 - Upgrade vulnerable Hickory and ringbuf dependencies through narrow compatibility patches while preserving the Telegram session format, SOCKS proxies and torrent support.
 - Extend cross-platform CI with locked proxy/buffer regressions and bounded, serial media fixtures.
+- Improve WebKit media playback and seeking: preserve progressive fragmented-MP4 playback while processing is in progress, then finalize completed media as seekable fast-start MP4 without re-encoding.
 
 See the [v0.2.1 changelog](CHANGELOG.md#021---2026-10-28). Published packages and signing details are listed on [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/latest).
 
@@ -217,13 +218,13 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark conditions and limitation
 5. Use Personal Vault or create/join a TeraRelay channel.
 6. Upload and manage files normally; TeraRelay handles the Telegram storage details.
 
-### v0.2.0 platform notes
+### v0.2.1 platform notes
 
 - **Android:** ARM64 only.
 - **iOS:** simulator build validation only; physical-device/App Store distribution requires Apple signing/provisioning.
 - **Desktop signing:** Windows installers are unsigned for Authenticode. macOS packages are ad-hoc signed and not notarized; native File Provider distribution requires Apple provisioning. OS security prompts may appear.
 - **Update integrity:** desktop updater payloads and the Android update manifest have verified signatures. The release includes `SHA256SUMS.txt` for download checksums.
-- **Worldwide public sharing:** not enabled in v0.2.0. Desktop share links are local application features.
+- **Worldwide public sharing:** not enabled in v0.2.1. Desktop share links are local application features.
 
 ## Security model
 
@@ -272,16 +273,16 @@ cargo test --locked
 Repository hygiene:
 
 ```bash
-./scripts/check-source.sh
+bash scripts/check-source.sh
 ```
 
 Cross-platform CI also validates Linux, Windows, macOS, Android ARM64, and the iOS simulator.
 
 ## Project status
 
-The latest published stable version is listed on [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/latest). **v0.1.0** was the first public release.
+The latest published stable version is **v0.2.1**, available on [GitHub Releases](https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1). **v0.1.0** was the first public release.
 
-All seven CI jobs and all required release jobs passed for v0.2.0. The iOS App Store Connect release job was skipped because production Apple credentials were unavailable; iOS simulator validation passed.
+For v0.2.1, all **12 cross-platform CI jobs** and the required production release jobs passed. The release includes **24 assets** for Linux x86_64, Windows x64, macOS Apple Silicon/Intel, and signed Android ARM64, plus updater manifests, signatures, checksums, and legal notices. iOS simulator validation passed; physical-device/App Store distribution was not published because production Apple credentials are unavailable.
 
 Current limitations:
 

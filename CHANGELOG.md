@@ -15,6 +15,7 @@ All notable public changes to TeraRelay are documented here.
 - Fix Windows journal, completed-download, and pending Drive staging flushes to use writable handles without truncating saved bytes; explicitly enable NTFS sparse staging for large logical downloads.
 - Keep iOS SOCKS proxy hostname resolution on the native OS resolver, avoiding macOS-only SystemConfiguration APIs.
 - Make the native stream-port collision fixture distinguish a live listener from TCP TIME_WAIT left by a prior QA run.
+- Preserve progressive fragmented-MP4 playback during acquisition, then finalize completed media to seekable fast-start MP4 without re-encoding; harden WebKit playback recovery and bounded Windows FFmpeg cleanup.
 
 ## [0.2.0] - 2026-10-11
 
@@ -125,6 +126,7 @@ These measurements are test results, not guaranteed speeds. See [PERFORMANCE.md]
 - Worldwide public file sharing is not implemented
 - Cross-platform build/package validation is not exhaustive runtime/device testing
 
+[0.2.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.0

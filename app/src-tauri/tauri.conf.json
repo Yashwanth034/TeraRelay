@@ -16,7 +16,7 @@
     }
   },
   "productName": "TeraRelay",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "io.terarelay.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

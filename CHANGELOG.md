@@ -4,6 +4,17 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-30
+
+- Fix uploads to newly created Telegram channels when their per-channel message IDs overlap an older channel. Migrate the invalid global chunk-ID index without deleting existing Drive records or changing channel identities.
+- Make local manifest indexing atomic: a failed reindex leaves the previous verified file/chunk mappings intact so upload retries can recover already-published Telegram parts.
+- Keep existing TeraRelay channels discoverable after renaming their Telegram titles externally, using the stable backing ID instead of requiring the original `[TR]` title marker.
+- Remove completed-download SQLite resume and lease sidecars while preserving stages and journals for interrupted downloads; never discard partially downloaded bytes just to tidy a folder.
+- Recover from transient local HTTP 5xx video stream responses with FFmpeg 6.1-compatible bounded retry behavior. Show a concise actionable playback error and manual Retry instead of exposing verbose decoder logs.
+- Isolate Drive test query counters per test thread, preventing nondeterministic failures during parallel test runs.
+
+The patch does not auto-delete stale Drive folders or recreate Telegram content from a deleted channel. Users should verify orphaned channel data before removing any folder.
+
 ## [0.2.2] - 2026-10-29
 
 - Replace the default blue/glass desktop treatment with neutral dark and light surfaces, clearer selected states, and readable primary controls across custom themes.

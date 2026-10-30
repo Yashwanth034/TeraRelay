@@ -96,6 +96,7 @@ struct ResumeJournal {
     database: Mutex<sqlite::Connection>,
     lease: Mutex<sqlite::Connection>,
     journal_path: PathBuf,
+    lease_path: PathBuf,
     confirmed: AtomicU64,
 }
 
@@ -362,6 +363,7 @@ fn open_resume_journal(
         database: Mutex::new(database),
         lease: Mutex::new(lease),
         journal_path,
+        lease_path,
         confirmed: AtomicU64::new(confirmed),
     })
 }
@@ -640,6 +642,7 @@ impl DownloadOutput {
                     database,
                     lease,
                     journal_path,
+                    lease_path,
                     ..
                 } = resume;
                 drop(database);
@@ -649,6 +652,18 @@ impl DownloadOutput {
                     );
                 }
                 drop(lease);
+                // The exclusive SQLite lease is no longer needed after the
+                // completed destination is safely published. Its persistent
+                // .lock.sqlite file was previously left in the Downloads folder.
+                // Never remove this lease on pause/failure: resumability relies
+                // on preserving the journal and its matching stage.
+                if let Err(error) = std::fs::remove_file(&lease_path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!(
+                            "Completed download was saved but resume lock cleanup failed: {error}"
+                        );
+                    }
+                }
             }
         }
         #[cfg(unix)]
@@ -696,11 +711,20 @@ mod tests {
         .await
         .unwrap();
         let stage = output.path().to_owned();
+        let journal = output.resume.as_ref().unwrap().journal_path.clone();
+        let lock = output.resume.as_ref().unwrap().lease_path.clone();
         std::fs::write(&stage, b"goodparttail").unwrap();
+        assert!(journal.exists());
+        assert!(lock.exists());
         output.confirm_region(0, 8).await.unwrap();
         assert_eq!(output.confirmed_bytes(), 8);
         drop(output);
         assert!(Path::new(&stage).exists());
+        assert!(
+            journal.exists(),
+            "Interrupted downloads must remain resumable"
+        );
+        assert!(lock.exists(), "Interrupted downloads keep their lease path");
         let mut output = DownloadOutput::create_resumable(
             destination.to_str().unwrap(),
             "resume",
@@ -715,6 +739,15 @@ mod tests {
         output.confirm_region(8, 4).await.unwrap();
         output.publish().await.unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"goodparttail");
+        assert!(!Path::new(&stage).exists());
+        assert!(
+            !journal.exists(),
+            "Completed downloads must remove the journal"
+        );
+        assert!(
+            !lock.exists(),
+            "Completed downloads must remove the SQLite lock"
+        );
         drop(output);
         std::fs::remove_dir_all(dir).unwrap();
     }

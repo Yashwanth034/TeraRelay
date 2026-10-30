@@ -237,6 +237,23 @@ impl Default for Fmp4RemuxState {
 ///
 /// These flags produce an fMP4 that mp4box's `initializeSegmentation()` can
 /// handle, enabling full MSE playback.
+// Local Telegram streaming can return a transient 5xx while resolving or
+// re-fetching remote parts. Retry only transient transport failures, bounded
+// to avoid masking a permanently missing/invalid upload as an endless spinner.
+fn configure_http_input_retries(cmd: &mut tokio::process::Command, input_path: &Path) {
+    let source = input_path.to_string_lossy();
+    if source.starts_with("http://") || source.starts_with("https://") {
+        cmd.args([
+            "-rw_timeout",
+            "20000000",
+            "-reconnect_on_http_error",
+            "5xx",
+            "-reconnect_delay_max",
+            "2",
+        ]);
+    }
+}
+
 pub async fn run_fmp4_remux(
     ffmpeg_path: &Path,
     input_path: &Path,
@@ -275,9 +292,7 @@ async fn run_fmp4_remux_at(
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
     cmd.arg("-y");
     let input_name = input_path.to_string_lossy();
-    if input_name.starts_with("http://") || input_name.starts_with("https://") {
-        cmd.arg("-rw_timeout").arg("20000000");
-    }
+    configure_http_input_retries(&mut cmd, input_path);
     if let Some(anchor) = anchor {
         cmd.arg("-seek_timestamp")
             .arg("1")
@@ -1107,6 +1122,29 @@ async fn serve_fmp4(
 mod fmp4_cache_lifecycle_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn transient_http_remux_retries_are_bounded_and_not_enabled_for_local_files() {
+        let mut http = tokio::process::Command::new("ffmpeg");
+        configure_http_input_retries(&mut http, Path::new("http://127.0.0.1:4411/stream/12/35"));
+        let args: Vec<_> = http
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-reconnect_on_http_error", "5xx"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-reconnect_delay_max", "2"]));
+        // Ubuntu's FFmpeg 6.1 does not support the newer max_retries
+        // and delay_total_max options; do not break older packaged helpers.
+        assert!(!args.iter().any(|arg| arg == "-reconnect_max_retries"));
+        let mut local = tokio::process::Command::new("ffmpeg");
+        configure_http_input_retries(&mut local, Path::new("/tmp/video.mp4"));
+        assert_eq!(local.as_std().get_args().count(), 0);
+    }
 
     fn cache_fixture() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

@@ -1509,4 +1509,15 @@ test('custom movie controls remain in the fullscreen subtree', async () => {
   await callback('enterFullscreen', context)();
   assert.deepEqual(targets, ['container'], 'Only the video entered fullscreen and hid the timeline');
 });
+test('local stream 5xx errors are actionable, bounded, and conceal token values', () => {
+  const { describePlaybackError } = loader()(helpersPath);
+  const message = describePlaybackError(new Error('FFmpeg fMP4 remux failed: HTTP Server returned 5XX Server Error reply token=secret-123'));
+  assert.match(message, /HTTP 5xx/);
+  assert.match(message, /upload recovery/);
+  assert.doesNotMatch(message, /secret-123|FFmpeg fMP4 remux failed/);
+  assert.equal(describePlaybackError('token=sensitive info'), 'token=[redacted] info');
+  const player = fs.readFileSync(playerPath, 'utf8');
+  assert.match(player, /setFmp4RemuxError\(describePlaybackError\(error\)\)/);
+  assert.match(player, /aria-label="Retry video stream"/);
+});
 Promise.all(pendingTests).then(() => { process.exitCode = failures ? 1 : 0; });

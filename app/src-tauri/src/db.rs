@@ -41,6 +41,19 @@ fn configure_database_durability(conn: &sqlite::Connection) -> Result<(), String
     Ok(())
 }
 
+/// Migrate v0.2.2's invalid global message-ID uniqueness without touching
+/// existing chunk rows or changing any Telegram/Drive identity.
+fn migrate_chunk_message_index(conn: &sqlite::Connection) -> Result<(), sqlite::Error> {
+    // A message ID identifies a message only inside its Telegram channel.
+    // A file's own chunk uniqueness remains PRIMARY KEY(file_id, chunk_index),
+    // and validate_manifest rejects repeated message IDs within one file.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_logical_file_chunk_lookup
+             ON logical_file_chunks(file_id, message_id);
+         DROP INDEX IF EXISTS idx_logical_file_chunk_message;",
+    )
+}
+
 pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -147,8 +160,6 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
                     PRIMARY KEY(file_id, chunk_index),
                     FOREIGN KEY(file_id) REFERENCES logical_files(file_id) ON DELETE CASCADE
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_logical_file_chunk_message
-                    ON logical_file_chunks(message_id);
                 INSERT OR IGNORE INTO logical_channels (
                     logical_id,
                     backing_channel_id,
@@ -167,7 +178,7 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
                     CAST(strftime('%s','now') AS INTEGER),
                     CAST(strftime('%s','now') AS INTEGER)
                 FROM folder_metadata;",
-            ) {
+            ).and_then(|_| migrate_chunk_message_index(&conn)) {
                 Ok(_) => {
                     last_err.clear();
                     break;
@@ -200,6 +211,56 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_global_message_id_index_migrates_without_losing_chunks() {
+        let conn = sqlite::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE logical_file_chunks (
+                file_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                chunk_size INTEGER NOT NULL,
+                sha256 TEXT,
+                PRIMARY KEY(file_id, chunk_index)
+            );
+            CREATE UNIQUE INDEX idx_logical_file_chunk_message
+                ON logical_file_chunks(message_id);
+            INSERT INTO logical_file_chunks VALUES ('old-channel-file', 1, 7, 100, NULL);",
+        )
+        .unwrap();
+
+        // The previous v0.2.2 index prevents another channel using ID 7.
+        assert!(conn
+            .execute(
+                "INSERT INTO logical_file_chunks VALUES ('new-channel-file', 1, 7, 200, NULL);"
+            )
+            .is_err());
+
+        migrate_chunk_message_index(&conn).unwrap();
+        migrate_chunk_message_index(&conn).unwrap(); // safe on subsequent starts
+        conn.execute(
+            "INSERT INTO logical_file_chunks VALUES ('new-channel-file', 1, 7, 200, NULL);",
+        )
+        .unwrap();
+
+        let mut rows = conn.prepare(
+            "SELECT file_id, chunk_size FROM logical_file_chunks WHERE message_id=7 ORDER BY file_id"
+        ).unwrap();
+        assert_eq!(rows.next().unwrap(), sqlite::State::Row);
+        assert_eq!(rows.read::<String, _>(0).unwrap(), "new-channel-file");
+        assert_eq!(rows.read::<i64, _>(1).unwrap(), 200);
+        assert_eq!(rows.next().unwrap(), sqlite::State::Row);
+        assert_eq!(rows.read::<String, _>(0).unwrap(), "old-channel-file");
+        assert_eq!(rows.read::<i64, _>(1).unwrap(), 100);
+        assert_eq!(rows.next().unwrap(), sqlite::State::Done);
+        // A file cannot index the same chunk twice.
+        assert!(conn
+            .execute(
+                "INSERT INTO logical_file_chunks VALUES ('new-channel-file', 1, 8, 200, NULL);"
+            )
+            .is_err());
+    }
 
     #[test]
     fn database_durability_is_wal_full() {

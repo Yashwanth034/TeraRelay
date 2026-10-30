@@ -319,6 +319,19 @@ pub fn persist_manifest(
     manifest: &LogicalFileManifestV1,
 ) -> Result<(), String> {
     validate_manifest(manifest, None)?;
+    // A failed chunk insert must never leave a complete-looking logical_files
+    // record after the old chunks have been removed. The savepoint also nests
+    // correctly inside the caller's Drive sync transaction.
+    conn.execute("SAVEPOINT logical_manifest_cache_update")
+        .map_err(|error| error.to_string())?;
+    let result = persist_manifest_inner(conn, manifest);
+    crate::drive_posix::finish_savepoint(conn, "logical_manifest_cache_update", result)
+}
+
+fn persist_manifest_inner(
+    conn: &sqlite::Connection,
+    manifest: &LogicalFileManifestV1,
+) -> Result<(), String> {
     let first_message_id = manifest
         .chunks
         .first()
@@ -884,6 +897,49 @@ mod tests {
             stmt.read::<i64, _>(0).unwrap()
         };
         assert_eq!(chunk_count, first.chunks.len() as i64);
+    }
+
+    #[test]
+    fn failed_manifest_reindex_rolls_back_without_losing_existing_chunks() {
+        let conn = test_manifest_db();
+        let original = sample_manifest();
+        persist_manifest(&conn, &original).unwrap();
+
+        let mut updated = original.clone();
+        updated.original_name = "replacement.mp4".into();
+        updated.chunks[0].message_id = 301;
+        updated.chunks[1].message_id = 302;
+        conn.execute(
+            "CREATE TRIGGER reject_reindex_chunk BEFORE INSERT ON logical_file_chunks
+             WHEN NEW.message_id=302
+             BEGIN SELECT RAISE(ABORT, 'synthetic disk/index failure'); END;",
+        )
+        .unwrap();
+
+        assert!(persist_manifest(&conn, &updated).is_err());
+        assert_eq!(
+            cached_manifest_for_first_message(
+                &conn,
+                &original.logical_channel_id,
+                original.chunks[0].message_id,
+            )
+            .unwrap()
+            .unwrap(),
+            original,
+            "A failed reindex must preserve the old manifest and all its chunks",
+        );
+        conn.execute("DROP TRIGGER reject_reindex_chunk;").unwrap();
+        persist_manifest(&conn, &updated).unwrap();
+        assert_eq!(
+            cached_manifest_for_first_message(
+                &conn,
+                &updated.logical_channel_id,
+                updated.chunks[0].message_id
+            )
+            .unwrap()
+            .unwrap(),
+            updated,
+        );
     }
 
     #[test]

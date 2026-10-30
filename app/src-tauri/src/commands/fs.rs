@@ -6181,6 +6181,26 @@ pub async fn cmd_search_global(
     Ok(files)
 }
 
+// The backing Telegram title is not the stable TeraRelay identity. Users may
+// rename a channel in Telegram (removing [TR]) without deleting its storage.
+fn is_tera_channel_for_scan(title: &str, known_backing: bool) -> bool {
+    let lower = title.to_lowercase();
+    known_backing || lower.contains("[tr]") || lower.contains("[td]")
+}
+
+#[cfg(test)]
+mod channel_title_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn existing_channel_is_not_lost_after_external_telegram_rename() {
+        assert!(is_tera_channel_for_scan("Movie Collection", true));
+        assert!(is_tera_channel_for_scan("Movie Collection [TR]", false));
+        assert!(is_tera_channel_for_scan("Movie Collection [TD]", false));
+        assert!(!is_tera_channel_for_scan("Unrelated channel", false));
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_scan_folders(
     state: State<'_, TelegramState>,
@@ -6193,6 +6213,27 @@ pub async fn cmd_scan_folders(
         return crate::commands::folder_groups::cmd_get_enriched_folders(db_pool).await;
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
+
+    // Keep a snapshot of known backing IDs outside the Telegram network loop.
+    // An external title edit must not hide an existing TeraRelay channel just
+    // because its [TR] marker is no longer present in Telegram's title.
+    let known_backing_ids = {
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT backing_channel_id FROM logical_channels WHERE role != 'drive_storage'",
+            )
+            .map_err(|error: sqlite::Error| error.to_string())?;
+        let mut ids = std::collections::HashSet::new();
+        while let sqlite::State::Row = statement.next().map_err(|error| error.to_string())? {
+            ids.insert(
+                statement
+                    .read::<i64, _>(0)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        ids
+    };
 
     let mut folders = Vec::new();
     let mut dialogs = client.iter_dialogs();
@@ -6213,10 +6254,8 @@ pub async fn cmd_scan_folders(
                 log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
                 // Strategy 1: Title
-                let is_tera_folder = {
-                    let lower = name.to_lowercase();
-                    lower.contains("[tr]") || lower.contains("[td]")
-                };
+                let is_tera_folder =
+                    is_tera_channel_for_scan(&name, known_backing_ids.contains(&id));
                 if is_tera_folder {
                     log::info!(" -> MATCH via Title: {}", name);
                     let display_name = name

@@ -11,6 +11,16 @@ function containsTime(ranges: TimeRangesLike, time: number): boolean {
     return false;
 }
 
+// Keep transport diagnostics useful without exposing local stream credentials
+// or flooding the player with raw FFmpeg logs.
+export function describePlaybackError(error: unknown): string {
+    const raw = String(error).replace(/token=[^\s&]+/gi, 'token=[redacted]');
+    if (/Server returned 5XX|HTTP (?:error |status )?5\d\d|5XX Server Error/i.test(raw)) {
+        return 'TeraRelay could not read the video from its local stream (HTTP 5xx). The Telegram chunks may be unavailable or this upload may need indexing recovery. Retry the existing upload recovery, then retry playback; do not delete or upload another copy.';
+    }
+    return raw.length > 500 ? raw.slice(0, 497) + '...' : raw;
+}
+
 // Native media elements can become paused as a *consequence* of reaching the
 // end of a growing fMP4. That is not the user's pause intent: when the
 // completed ranged stream replaces it, resume playback unless the user

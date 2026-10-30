@@ -100,12 +100,15 @@ Beyond basic folders, the desktop app includes tools for organizing and checking
 
 Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/latest) for distribution limits.
 
-## What's improved in v0.2.2
+## What's improved in v0.2.3
 
-- **Neutral desktop appearance:** charcoal and white base themes, solid surfaces, restrained control states, and readable primary-button text for custom accent colors.
-- **Responsive browsing:** faster filename sorting, one active grid/list virtualizer, correct measurements after files load, and native scrolling with lightweight sidebar overflow hints.
-- **Comfortable interactions:** reduced-motion and performance-mode support, plus a toolbar that wraps cleanly in narrow desktop windows.
-- **Calmer startup:** normal saved-login restoration uses the opening screen. Real failures and prolonged connections retain recovery options without clearing the saved session.
+- **Reliable new-channel uploads:** Telegram message IDs may repeat across channels. The Drive index now migrates safely instead of rejecting a chunk belonging to another channel.
+- **Safe upload recovery:** a failed local reindex rolls back without losing existing chunk records, so Retry can recover the original Telegram upload rather than blindly uploading another copy.
+- **Cleaner completed downloads:** successful resumable downloads remove their SQLite journal/lease files; active or interrupted downloads still retain their private recovery data.
+- **Better video playback recovery:** HTTP 5xx stream failures have FFmpeg-compatible retries, a short diagnostic, and a manual retry action. Permanently missing Telegram chunks still require recovery.
+- **Stable renamed channels:** channels already registered in TeraRelay remain discoverable even if the Telegram title is edited outside the app.
+
+No stale or deleted-channel folders are automatically removed: verify the remote channel and preserve the data before reconciling duplicate Drive entries.
 
 **Older release notes belong in the [full changelog](CHANGELOG.md)** rather than repeating entire past versions in this README.
 

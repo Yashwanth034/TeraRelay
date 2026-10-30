@@ -7,7 +7,7 @@ import Hls from 'hls.js';
 import { TelegramFile, StreamingQuality, TranscodePrepareResult, TranscodeJobPhase, TranscodeCapabilities, MediaTrackInfo, MediaTrackProbe, QUALITY_LABELS, HLS_QUALITIES } from '../../../types';
 import { useAdaptiveStreaming } from '../../../hooks/useAdaptiveStreaming';
 import { QualitySelector } from '../../shared/QualitySelector';
-import { PlaybackTimeline, authorizeHlsChildRequestUrl, buildAuthenticatedHlsUrl, buildAuthenticatedRemuxUrl, buildAuthenticatedSubtitleUrl, chooseCompatibilityQuality, eligibleNativeMemoryMp4, fetchBoundedNativeMp4, nativeRemuxRevisionUrl, nativeProgressiveRevisionUrl, planPlaybackSeek, restoreCompatibilityPlayback, shouldDeferCompletedRemuxSeek, shouldRemuxAfterNativeDecoderFailure, shouldResumeAfterRemuxFinish, shiftSubtitleCues } from './playbackTimeline';
+import { PlaybackTimeline, authorizeHlsChildRequestUrl, buildAuthenticatedHlsUrl, buildAuthenticatedRemuxUrl, buildAuthenticatedSubtitleUrl, chooseCompatibilityQuality, describePlaybackError, eligibleNativeMemoryMp4, fetchBoundedNativeMp4, nativeRemuxRevisionUrl, nativeProgressiveRevisionUrl, planPlaybackSeek, restoreCompatibilityPlayback, shouldDeferCompletedRemuxSeek, shouldRemuxAfterNativeDecoderFailure, shouldResumeAfterRemuxFinish, shiftSubtitleCues } from './playbackTimeline';
 
 interface AdaptiveMediaPlayerProps {
     file: TelegramFile;
@@ -224,7 +224,7 @@ export function AdaptiveMediaPlayer({
                 throw new Error('fMP4 remux timed out after 10 minutes');
             } catch (error) {
                 if (gen !== remuxGenerationRef.current) return;
-                setFmp4RemuxError(String(error));
+                setFmp4RemuxError(describePlaybackError(error));
                 setFmp4Remuxing(false);
                 fmp4RemuxingRef.current = false;
             }
@@ -1594,6 +1594,14 @@ export function AdaptiveMediaPlayer({
                             <AlertTriangle className="w-10 h-10 text-red-400" />
                             <p className="text-sm text-red-400 font-medium">Playback Error</p>
                             <p className="text-xs text-white/40 text-center max-w-md">{displayError || 'Unknown error'}</p>
+                            {!isHlsMode && fmp4RemuxError && (
+                                <button type="button" onClick={() => handleProgressiveDetected()}
+                                    className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium"
+                                    aria-label="Retry video stream">
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                    Retry video stream
+                                </button>
+                            )}
                             {!isHlsMode && useFallback && !fmp4RemuxError && (
                                 <button type="button" onClick={retryNativePlayback} disabled={memoryLoading}
                                     className="mt-2 flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium disabled:opacity-40"

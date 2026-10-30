@@ -77,23 +77,26 @@ pub(super) struct FrozenV2Locations {
     parts: BTreeMap<u64, DriveObjectPartRecord>,
 }
 
+// Count queries per test thread: two independent fixtures must not alter
+// each other's assertions when cargo test runs them in parallel.
 #[cfg(test)]
-static FROZEN_V2_CAPTURE_QUERY_STEPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static FROZEN_V2_CAPTURE_QUERY_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 fn reset_frozen_v2_capture_query_steps() {
-    FROZEN_V2_CAPTURE_QUERY_STEPS.store(0, std::sync::atomic::Ordering::SeqCst);
+    FROZEN_V2_CAPTURE_QUERY_STEPS.with(|steps| steps.set(0));
 }
 
 #[cfg(test)]
 fn frozen_v2_capture_query_steps() -> usize {
-    FROZEN_V2_CAPTURE_QUERY_STEPS.load(std::sync::atomic::Ordering::SeqCst)
+    FROZEN_V2_CAPTURE_QUERY_STEPS.with(|steps| steps.get())
 }
 
 fn record_frozen_v2_capture_query_step() {
     #[cfg(test)]
-    FROZEN_V2_CAPTURE_QUERY_STEPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    FROZEN_V2_CAPTURE_QUERY_STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
 }
 
 fn retained_integer(stmt: &sqlite::Statement<'_>, field: &str) -> Result<i64, String> {

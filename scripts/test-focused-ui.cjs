@@ -315,6 +315,8 @@ function remuxHarness(options = {}) {
     setFmp4StreamUrl: value => { state.url = value; }, setRestartNonce: () => { state.reloads++; },
     shouldResumeAfterRemuxFinish: load(path.join(root,
       'app/src/components/desktop/dashboard/playbackTimeline.tsx')).shouldResumeAfterRemuxFinish,
+    describePlaybackError: load(path.join(root,
+      'app/src/components/desktop/dashboard/playbackTimeline.tsx')).describePlaybackError,
     buildAuthenticatedRemuxUrl: load(path.join(root,
       'app/src/components/desktop/dashboard/playbackTimeline.tsx')).buildAuthenticatedRemuxUrl,
     setTimeout: callback => { callback(); return 1; },

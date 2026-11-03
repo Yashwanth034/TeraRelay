@@ -149,6 +149,10 @@ jobs:
                   "args": "--config src-tauri/tauri.macos-signing.conf.json --target x86_64-apple-darwin" if macos_ready else "--target x86_64-apple-darwin",
               },
           ]
+          # Public release packages are Linux x64 only until native acceptance
+          # permits Windows/macOS distribution again. Keep CI source tests.
+          include = [target for target in include if target["name"] == "Linux x64"]
+          assert len(include) == 1, "Expected exactly one Linux release target"
           print(json.dumps({"include": include}, separators=(",", ":")))
           PY
           )"
@@ -160,10 +164,10 @@ jobs:
           {
             echo "### Signed release targets"
             echo "- Linux x64: ready"
-            echo "- Windows x64: $windows_ready"
-            echo "- macOS Apple Silicon/Intel: $macos_ready"
-            echo "- iOS App Store Connect: $ios_ready"
-            echo "- Android ARM64: validated by its mandatory signing step"
+            echo "- Windows x64: distribution withheld pending native acceptance"
+            echo "- macOS Apple Silicon/Intel: distribution withheld pending native acceptance"
+            echo "- iOS App Store Connect: publishing disabled"
+            echo "- Android ARM64: publishing disabled"
           } >> "$GITHUB_STEP_SUMMARY"
 
   desktop:
@@ -485,7 +489,9 @@ jobs:
           gh release upload "v$version" LICENSE THIRD_PARTY_NOTICES.md --clobber
 
   android:
-    name: Android release build
+    name: Android release build (publishing withheld)
+    # Do not upload APK/AAB or mobile-latest.json to GitHub Releases.
+    if: ${{ false }}
     needs: desktop
     runs-on: ubuntu-24.04
     defaults:
@@ -774,11 +780,12 @@ jobs:
           path: app/src-tauri/gen/apple/build/**/*
 
   ios-release:
-    name: iOS App Store Connect release
+    name: iOS App Store Connect release (publishing withheld)
     needs:
       - android
       - release-capabilities
-    if: needs.release-capabilities.outputs.ios_ready == 'true'
+    # Do not distribute or upload an IPA to App Store Connect during Linux-only releases.
+    if: ${{ false }}
     runs-on: macos-latest
     defaults:
       run:

@@ -54,26 +54,23 @@ TeraRelay uses your own Telegram account. File data is stored through Telegram; 
 
 ## Download the latest release
 
-Choose the package that matches your device:
+Choose the Linux package for your distribution:
 
 | Platform | Available release files | Notes |
 | --- | --- | --- |
 | **Linux x86_64** | `.deb`, `.rpm`, `.AppImage` | Choose the format for your distribution |
-| **Windows x64** | `.exe`, `.msi` | Installers are not Authenticode-signed |
-| **macOS Apple Silicon** | `.dmg`, `.app.tar.gz` | Not Apple-notarized |
-| **macOS Intel** | `.dmg`, `.app.tar.gz` | Not Apple-notarized |
-| **Android ARM64** | Signed `.apk`, `.aab` | Install the APK directly; AAB is for distribution workflows |
-| **iOS** | No public installable package | Simulator CI passed; App Store/device distribution requires Apple credentials |
+
+**Windows, macOS, Android, and iOS installers are not currently distributed.** Previous Windows/macOS/Android installers were withdrawn pending native installation and security testing. iOS has no public GitHub release package.
 
 **[Get the latest TeraRelay release from GitHub](https://github.com/Yashwanth034/TeraRelay/releases/latest)**
 
-The release includes `SHA256SUMS.txt` to verify downloaded files, signed desktop updater payloads, and a signed Android update manifest. **An updater signature is not the same as operating-system code signing.** Windows/macOS security prompts may appear.
+The current release includes `SHA256SUMS.txt` to verify downloaded Linux files and signed Linux desktop updater payloads. Android update manifests and Windows/macOS installers are withdrawn. **An updater signature is not the same as operating-system code signing.**
 
 Release builds and automated tests have passed; this does **not** mean the app has been exhaustively tested on every physical device or Telegram account.
 
 ## Quick start
 
-1. Download the [appropriate release package](https://github.com/Yashwanth034/TeraRelay/releases/latest) and install or launch it.
+1. Download a [Linux release package](https://github.com/Yashwanth034/TeraRelay/releases/latest) and install or launch it.
 2. Sign in using your Telegram account. Phone, QR, and two-step verification flows are supported.
 3. Open **Personal Vault**, or create/join a TeraRelay channel.
 4. Upload a document or folder. Large-file parts are handled automatically.

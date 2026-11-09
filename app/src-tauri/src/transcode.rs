@@ -2300,8 +2300,10 @@ async fn serve_hls_file(
     // Never read an entire encoded segment into memory. NamedFile streams
     // bounded chunks from the owned HLS cache and implements HTTP Range,
     // Content-Range and conditional request semantics for media seeking.
-    match actix_files::NamedFile::open_async(&file_path).await {
-        Ok(file) => {
+    // actix-files 0.7 uses synchronous open(); keep it off request workers.
+    let open_path = file_path.clone();
+    match tokio::task::spawn_blocking(move || actix_files::NamedFile::open(open_path)).await {
+        Ok(Ok(file)) => {
             let mut resp = file
                 .set_content_type(mime.parse().expect("static HLS MIME is valid"))
                 .into_response(&_req);
@@ -2322,8 +2324,16 @@ async fn serve_hls_file(
             );
             resp
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("Transcode: Failed to open HLS file {:?}: {}", file_path, e);
+            HttpResponse::InternalServerError().body("Failed to open file")
+        }
+        Err(e) => {
+            log::error!(
+                "Transcode: HLS blocking file-open task failed for {:?}: {}",
+                file_path,
+                e
+            );
             HttpResponse::InternalServerError().body("Failed to open file")
         }
     }
@@ -3003,7 +3013,8 @@ mod playback_manager_tests {
             .unwrap()
             .0;
         assert!(
-            handler.contains("NamedFile::open_async(")
+            handler.contains("tokio::task::spawn_blocking(")
+                && handler.contains("actix_files::NamedFile::open(")
                 && !handler.contains("std::fs::read(&file_path)"),
             "large cached HLS segments must stream from disk without eager full-file allocation"
         );

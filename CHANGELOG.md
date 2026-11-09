@@ -20,6 +20,11 @@ All notable public changes to TeraRelay are documented here.
 - Improve progressive HLS/fMP4 cleanup, remux, and seeking behavior across interrupted or completed playback sessions.
 - Add an in-player **Open with** menu for detected installed VLC and mpv players. The external player receives the authenticated local stream rather than requiring a second copy of the video.
 
+### Security
+- Update the locked Actix stack to patched `actix-files 0.7.4`, `actix-http 3.21.0`, and `actix-web 4.19.0` releases for the November 2026 RustSec advisories.
+- Update Tokio to `1.54.1`, avoiding the affected `1.52.3` I/O-safety constructors and the separate `1.54.0` interval race.
+- Keep disk-backed media file opens off Actix request workers after the `actix-files` API change.
+
 ### Validation
 - Extend focused UI, transfer-recovery, Drive range/read-recovery, and native-media regression coverage.
 - Public desktop release distribution for this version is Linux x86_64 only. Windows, macOS, Android, and iOS release builds/installers are withheld.

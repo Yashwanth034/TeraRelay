@@ -1165,9 +1165,12 @@ async fn serve_fmp4(
     }
 
     // Use NamedFile for automatic Range/Content-Range support and
-    // streaming from disk (no full-file memory load).
-    match actix_files::NamedFile::open_async(&safe_path).await {
-        Ok(f) => f
+    // streaming from disk (no full-file memory load). actix-files 0.7 exposes
+    // synchronous open(), so run the filesystem operation on Tokio's blocking
+    // pool rather than blocking an Actix request worker.
+    let open_path = safe_path.clone();
+    match tokio::task::spawn_blocking(move || actix_files::NamedFile::open(open_path)).await {
+        Ok(Ok(f)) => f
             .set_content_type("video/mp4".parse().unwrap())
             .into_response(&_req)
             .map_body(|_, body| HttpLeaseBody {
@@ -1175,8 +1178,16 @@ async fn serve_fmp4(
                 _lease: reader_lease,
             })
             .map_into_boxed_body(),
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("Failed to open fMP4 file {:?}: {}", safe_path, e);
+            HttpResponse::InternalServerError().body("Failed to read file")
+        }
+        Err(e) => {
+            log::error!(
+                "fMP4 blocking file-open task failed for {:?}: {}",
+                safe_path,
+                e
+            );
             HttpResponse::InternalServerError().body("Failed to read file")
         }
     }

@@ -137,7 +137,19 @@ fn qa_rich_media_metadata(file_name: &str) -> RichMediaMetadata {
     let is_dune = lower.contains("dune");
     let is_4k = lower.contains("2160p") || lower.contains("4k");
     let is_hdr = lower.contains("hdr");
-    let duration_secs = if is_dune { 9_960.0 } else { 10_140.0 };
+    // Keep the small generated QA media fixtures truthful. Other QA filenames
+    // retain the long movie presets used by the metadata presentation tests.
+    let duration_secs = if lower.contains("episode 01") {
+        3.0
+    } else if lower.contains("episode 02") {
+        4.0
+    } else if lower.contains("trailer") {
+        2.008
+    } else if is_dune {
+        9_960.0
+    } else {
+        10_140.0
+    };
 
     RichMediaMetadata {
         duration_secs: Some(duration_secs),
@@ -696,5 +708,26 @@ mod track_probe_tests {
             Some("5.1")
         );
         assert_eq!(metadata.subtitle_tracks.len(), 1);
+    }
+
+    #[test]
+    fn qa_generated_clip_metadata_preserves_the_fixture_durations() {
+        assert_eq!(
+            qa_rich_media_metadata("Episode 01.mp4").duration_secs,
+            Some(3.0)
+        );
+        assert_eq!(
+            qa_rich_media_metadata("Episode 02.mp4").duration_secs,
+            Some(4.0)
+        );
+        assert_eq!(
+            qa_rich_media_metadata("Trailer.mkv").duration_secs,
+            Some(2.008)
+        );
+        // Existing generic movie fixtures keep their established long presets.
+        assert_eq!(
+            qa_rich_media_metadata("Interstellar.2160p.HDR.mkv").duration_secs,
+            Some(10_140.0)
+        );
     }
 }

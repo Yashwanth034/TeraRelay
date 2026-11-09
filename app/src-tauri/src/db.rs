@@ -135,6 +135,17 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
                     created_at INTEGER NOT NULL,
                     joined_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS shared_channel_views (
+                    channel_id INTEGER PRIMARY KEY CHECK(channel_id < 0),
+                    logical_id TEXT NOT NULL UNIQUE,
+                    storage_channel_id INTEGER NOT NULL CHECK(storage_channel_id > 0),
+                    name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    deleted_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_shared_channel_storage
+                    ON shared_channel_views(storage_channel_id) WHERE deleted_at IS NULL;
                 CREATE TABLE IF NOT EXISTS logical_files (
                     file_id TEXT PRIMARY KEY,
                     logical_channel_id TEXT NOT NULL,
@@ -159,6 +170,11 @@ pub fn init_db(app: &AppHandle) -> Result<DbConnection, String> {
                     sha256 TEXT,
                     PRIMARY KEY(file_id, chunk_index),
                     FOREIGN KEY(file_id) REFERENCES logical_files(file_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS channel_file_listing_cache (
+                    folder_key TEXT PRIMARY KEY NOT NULL,
+                    files_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
                 );
                 INSERT OR IGNORE INTO logical_channels (
                     logical_id,

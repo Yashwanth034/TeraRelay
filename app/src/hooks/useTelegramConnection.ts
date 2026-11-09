@@ -20,6 +20,10 @@ export function useTelegramConnection(onLogoutParent: () => void) {
 
     const networkIsOnline = useNetworkStatus();
     const handleSyncFoldersRef = useRef<((silentParam?: boolean | unknown) => Promise<void>) | null>(null);
+    // Bootstrap the Telegram-backed registry on the first scan, including
+    // automatic startup scans. An explicit Sync can always refresh it later.
+    const sharedRegistryBootstrappedRef = useRef(false);
+    const restoredLogicalFoldersRef = useRef(new Set<number>());
 
     // Fetch groups list from DB
     const fetchGroups = useCallback(async () => {
@@ -40,68 +44,68 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 if (!checkId) {
                     _store = await load('settings.json');
                 }
-                setStore(_store);
-
-                // Fetch local-first SQLite enriched folders
-                let restoredFolders: TelegramFolder[] = [];
+                // Resolve the saved folder before enabling file queries. Otherwise
+                // startup can scan all of Saved Messages while a channel opens.
+                const savedFolder = _store.get<number | null>('activeFolderId').catch(() => null);
+                let restoredFolders: TelegramFolder[];
                 try {
                     const dbFolders = await invoke<TelegramFolder[]>('cmd_get_enriched_folders');
-                    if (dbFolders && dbFolders.length > 0) {
-                        restoredFolders = dbFolders;
-                    } else {
-                        const savedFolders = await _store.get<TelegramFolder[]>('folders');
-                        restoredFolders = savedFolders || [];
-                    }
+                    restoredFolders = dbFolders?.length
+                        ? dbFolders
+                        : await _store.get<TelegramFolder[]>('folders') || [];
                 } catch {
-                    const savedFolders = await _store.get<TelegramFolder[]>('folders');
-                    restoredFolders = savedFolders || [];
+                    restoredFolders = await _store.get<TelegramFolder[]>('folders') || [];
                 }
-                setFolders(restoredFolders);
-
-                // Fetch local-first SQLite groups
-                try {
-                    const list = await invoke<FolderGroup[]>('cmd_get_groups');
-                    setGroups(list);
-                } catch (e) {
-                    console.error("Failed to load groups:", e);
-                }
-
-                const savedActiveFolderId = await _store.get<number | null>('activeFolderId');
-                const validActiveFolderId = savedActiveFolderId !== null
-                    && savedActiveFolderId !== undefined
+                const savedActiveFolderId = await savedFolder;
+                const validActiveFolderId = savedActiveFolderId != null
                     && restoredFolders.some(folder => folder.id === savedActiveFolderId)
                     ? savedActiveFolderId
                     : null;
+
+                restoredLogicalFoldersRef.current = new Set(
+                    restoredFolders.filter(folder => !!folder.role).map(folder => folder.id),
+                );
+                setFolders(restoredFolders);
                 setActiveFolderId(validActiveFolderId);
+                setStore(_store);
+                void fetchGroups();
+
                 if (savedActiveFolderId !== validActiveFolderId) {
                     await _store.set('activeFolderId', validActiveFolderId);
                     await _store.save();
                 }
-
-                setIsConnected(true);
-                queryClient.invalidateQueries({ queryKey: ['files'] });
             } catch {
                 // store not available
             }
         };
         initStore();
-    }, [queryClient]);
+    }, [fetchGroups]);
 
     // Consolidated mount-sync + visibility-change listener
     useEffect(() => {
         if (!store || !isConnected) return;
 
-        const syncAndRefresh = async () => {
+        const syncAndRefresh = async (initial: boolean) => {
             if (!handleSyncFoldersRef.current) return;
             await handleSyncFoldersRef.current(true);
-            queryClient.invalidateQueries({ queryKey: ['files'] });
+            void queryClient.invalidateQueries({
+                queryKey: ['files'],
+                // Startup already loads the selected channel. Shared or not-yet
+                // indexed channels can change scope after the registry sync.
+                predicate: query => {
+                    const folderId = query.queryKey[1];
+                    return !initial || query.state.status === 'error'
+                        || (typeof folderId === 'number'
+                            && (folderId < 0 || !restoredLogicalFoldersRef.current.has(folderId)));
+                },
+            });
         };
 
-        syncAndRefresh();
+        void syncAndRefresh(true);
 
         const handleVisibilityChange = () => {
             if (document.visibilityState === 'visible') {
-                syncAndRefresh();
+                void syncAndRefresh(false);
             }
         };
 
@@ -126,7 +130,11 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             }
 
             await invoke('cmd_logout');
+            sharedRegistryBootstrappedRef.current = false;
             await invoke('cmd_clean_cache');
+            // A new Telegram login must not momentarily show the previous
+            // account's cached Premium/Free status.
+            queryClient.removeQueries({ queryKey: ['telegram-account-tier'] });
 
             // Keep the saved Telegram API ID/hash. They identify the application,
             // not the signed-in Telegram account, so the next login should only
@@ -147,6 +155,18 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         if (!store) return;
         setIsSyncing(true);
         try {
+            if (!silent || !sharedRegistryBootstrappedRef.current) {
+                // A new device must restore the remote registry BEFORE scanning
+                // physical channels, even on a silent startup refresh.
+                try {
+                    await invoke('cmd_drive_sync_metadata');
+                    sharedRegistryBootstrappedRef.current = true;
+                } catch (error) {
+                    if (!silent) {
+                        toast.warning('Shared-channel cross-device metadata could not be refreshed: ' + error);
+                    }
+                }
+            }
             const foundFolders = await invoke<TelegramFolder[]>('cmd_scan_folders');
             setFolders(foundFolders);
             await store.set('folders', foundFolders);
@@ -171,15 +191,28 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     // Keep the ref in sync
     handleSyncFoldersRef.current = handleSyncFolders;
 
-    const handleCreateFolder = async (name: string) => {
+    const publishSharedChannelRegistry = async () => {
+        try {
+            await invoke('cmd_drive_sync_metadata');
+        } catch (error) {
+            toast.warning('Shared channel saved locally, but cross-device synchronization is still pending: ' + error);
+        }
+    };
+
+    const handleCreateFolder = async (name: string, storageFolderId?: number) => {
         if (!store) return;
         try {
-            const newFolder = await invoke<TelegramFolder>('cmd_create_folder', { name });
+            const newFolder = storageFolderId === undefined
+                ? await invoke<TelegramFolder>('cmd_create_folder', { name })
+                : await invoke<TelegramFolder>('cmd_create_shared_folder', {
+                    name, storageFolderId,
+                });
             const updated = [...folders, newFolder];
             setFolders(updated);
             await store.set('folders', updated);
             await store.save();
-            toast.success(`Folder "${name}" created.`);
+            if (storageFolderId !== undefined) await publishSharedChannelRegistry();
+            toast.success(`Channel "${name}" created.`);
         } catch (e) {
             toast.error("Failed to create folder: " + e);
             throw e;
@@ -189,17 +222,21 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const handleFolderDelete = async (folderId: number, folderName: string) => {
         const folder = folders.find(f => f.id === folderId);
         const isMember = folder?.role === 'member';
+        const isShared = folderId < 0;
         if (!await confirm({
-            title: isMember ? "Leave TeraRelay Channel" : "Delete Channel",
-            message: isMember
-                ? `Leave "${folderName}"?\nYou will lose access to this TeraRelay channel, but the owner's stored files will not be deleted.`
-                : `Delete "${folderName}"?\nThis will permanently delete its backing Telegram channel and stored files.`,
-            confirmText: isMember ? "Leave Channel" : "Delete",
+            title: isShared ? "Remove Shared-Storage Channel" : isMember ? "Leave TeraRelay Channel" : "Delete Channel",
+            message: isShared
+                ? `Remove the empty shared-storage channel "${folderName}"?\nYour Telegram storage channel and other TeraRelay channels will NOT be deleted. Move or download this channel's files first.`
+                : isMember
+                    ? `Leave "${folderName}"?\nYou will lose access to this TeraRelay channel, but the owner's stored files will not be deleted.`
+                    : `Delete "${folderName}"?\nThis will permanently delete its backing Telegram channel and stored files.`,
+            confirmText: isShared ? "Remove Channel" : isMember ? "Leave Channel" : "Delete",
             variant: 'danger'
         })) return;
 
         try {
             await invoke('cmd_delete_folder', { folderId });
+            if (isShared) await publishSharedChannelRegistry();
             const updated = folders.filter(f => f.id !== folderId);
             setFolders(updated);
             if (store) {
@@ -241,6 +278,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
 
         try {
             await invoke('cmd_rename_folder', { folderId, newName });
+            if (folderId < 0) await publishSharedChannelRegistry();
             const updated = folders.map(f => f.id === folderId ? { ...f, name: newName } : f);
             setFolders(updated);
             if (store) {

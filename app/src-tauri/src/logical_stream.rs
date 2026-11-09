@@ -366,6 +366,38 @@ mod tests {
         assert!(part_ranges(&[u64::MAX, 1], 0, 1).is_none());
     }
 
+    #[test]
+    fn forty_gib_range_crosses_telegram_parts_without_32_bit_truncation() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let sizes = vec![2 * GIB; 24]; // 48 GiB logical movie; 24 physical parts
+        let start = 40 * GIB - 128;
+        let end = 40 * GIB + 3967; // exactly 4096 requested bytes
+        assert_eq!(
+            part_ranges(&sizes, start, end).unwrap(),
+            vec![
+                PartRange {
+                    index: 19,
+                    start: 2 * GIB - 128,
+                    length: 128
+                },
+                PartRange {
+                    index: 20,
+                    start: 0,
+                    length: 3968
+                },
+            ]
+        );
+        let random_seek = 45 * GIB + 123456;
+        assert_eq!(
+            part_ranges(&sizes, random_seek, random_seek + 65535).unwrap(),
+            vec![PartRange {
+                index: 22,
+                start: GIB + 123456,
+                length: 65536
+            }],
+        );
+    }
+
     #[actix_web::test]
     async fn exact_bytes_survive_transport_chunk_and_file_part_boundaries() {
         let data: [&[u8]; 3] = [b"abcde", b"fghi", b"jklmno"];

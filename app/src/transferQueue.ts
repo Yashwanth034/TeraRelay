@@ -38,6 +38,9 @@ function validateSavedQueue(kind: TransferQueueKind, value: unknown): void {
                 invalid(`item ${index + 1} has an invalid source path`);
             }
             if (!nonempty('path') && !nonempty('url')) invalid(`item ${index + 1} has no upload source`);
+            if (item.totalBytes !== undefined && (!Number.isSafeInteger(item.totalBytes) || (item.totalBytes as number) < 0)) {
+                invalid(`item ${index + 1} has an invalid expected upload size`);
+            }
             const versionId = (field: string) => item[field] === undefined ||
                 (typeof item[field] === 'string' && /^[0-9a-f]{32}$/.test(item[field] as string));
             if (!versionId('versionStackId') || !versionId('versionBaseFileId')) {
@@ -76,33 +79,104 @@ function validateSavedQueue(kind: TransferQueueKind, value: unknown): void {
             )) {
                 invalid(`item ${index + 1} has invalid TeraRelay Drive metadata`);
             }
+            const folderGroupFields = [
+                'uploadGroupId', 'uploadGroupName', 'uploadGroupRelativePath',
+                'uploadGroupFileCount', 'uploadGroupTotalBytes', 'uploadGroupSourceRoot',
+                'driveFolderDirectoryId',
+            ];
+            const groupFieldCount = folderGroupFields.filter(field => item[field] !== undefined).length;
+            if (groupFieldCount !== 0 && groupFieldCount !== folderGroupFields.length) {
+                invalid(`item ${index + 1} has incomplete folder-upload group metadata`);
+            }
+            if (groupFieldCount === folderGroupFields.length) {
+                const relative = item.uploadGroupRelativePath;
+                const sourceRoot = item.uploadGroupSourceRoot;
+                if (typeof item.uploadGroupId !== 'string' || item.uploadGroupId.length < 8 || item.uploadGroupId.length > 128
+                    || typeof item.uploadGroupName !== 'string' || !item.uploadGroupName.trim() || item.uploadGroupName.length > 255
+                    || typeof relative !== 'string' || !relative.trim() || relative.length > 4096
+                    || relative.startsWith('/') || relative.includes('\\\\')
+                    || relative.split('/').some(part => !part || part === '.' || part === '..')
+                    || !Number.isSafeInteger(item.uploadGroupFileCount) || (item.uploadGroupFileCount as number) < 1
+                    || (item.uploadGroupFileCount as number) > 10_000
+                    || !Number.isSafeInteger(item.uploadGroupTotalBytes) || (item.uploadGroupTotalBytes as number) < 0
+                    || (item.uploadGroupTotalBytes as number) > Number.MAX_SAFE_INTEGER
+                    || typeof sourceRoot !== 'string' || !sourceRoot.trim() || sourceRoot.length > 4096
+                    || !(sourceRoot.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sourceRoot) || sourceRoot.startsWith('\\\\'))
+                    || typeof item.driveFolderDirectoryId !== 'string' || !/^[0-9a-f]{32}$/.test(item.driveFolderDirectoryId)
+                    || item.folderId === null) {
+                    invalid(`item ${index + 1} has invalid folder-upload group metadata`);
+                }
+            }
+            if (item.driveFolderLogicalFileId !== undefined && (
+                groupFieldCount !== folderGroupFields.length
+                || typeof item.driveFolderLogicalFileId !== 'string'
+                || !/^[0-9a-f]{32}$/.test(item.driveFolderLogicalFileId)
+            )) {
+                invalid(`item ${index + 1} has invalid completed folder-upload metadata`);
+            }
         } else {
             // DownloadFileRequest accepts signed i32 message IDs; keep that existing contract.
             if (!Number.isSafeInteger(item.messageId) || (item.messageId as number) < -2147483648 ||
                 (item.messageId as number) > 2147483647) invalid(`item ${index + 1} has an invalid message ID`);
             if (!nonempty('filename')) invalid(`item ${index + 1} has no filename`);
             if (!optionalPath('savePath')) invalid(`item ${index + 1} has an invalid destination`);
+            if (item.noOverwrite !== undefined && typeof item.noOverwrite !== 'boolean') {
+                invalid(`item ${index + 1} has an invalid destination overwrite flag`);
+            }
         }
     }
 }
 
 function recoverable(item: TransferItem) {
+    // Folder groups retain terminal rows until the whole batch is dismissed or
+    // completed. This keeps success/cancel counts exact across app restarts.
+    const groupedUpload = 'uploadGroupId' in item && typeof item.uploadGroupId === 'string';
+    if (groupedUpload && (item.status === 'success' || item.status === 'cancelled')) return true;
     return item.status === 'pending' || item.status === 'uploading' ||
         item.status === 'downloading' || item.status === 'pausing' ||
         item.status === 'paused' || item.status === 'error';
 }
 
-function savedStatus(item: TransferItem): 'pending' | 'paused' | 'error' {
+function savedStatus(item: TransferItem): 'pending' | 'paused' | 'error' | 'success' | 'cancelled' {
+    if ('uploadGroupId' in item && typeof item.uploadGroupId === 'string'
+        && (item.status === 'success' || item.status === 'cancelled')) return item.status;
     if (item.status === 'error') return 'error';
     return item.status === 'paused' || item.status === 'pausing' ? 'paused' : 'pending';
 }
 
-export const normalizeUploadQueue: Normalize<QueueItem> = items => items.filter(recoverable).map(item => ({
+export const normalizeUploadQueue: Normalize<QueueItem> = items => {
+    const groups = new Map<string, QueueItem[]>();
+    for (const item of items) {
+        if (!item.uploadGroupId) continue;
+        const group = groups.get(item.uploadGroupId) ?? [];
+        group.push(item);
+        groups.set(item.uploadGroupId, group);
+    }
+    const fullyUploadedGroups = new Set(
+        [...groups.entries()]
+            .filter(([, group]) => group.length > 0 && group.every(item => item.status === 'success'))
+            .map(([id]) => id),
+    );
+    return items.filter(item =>
+        (!item.uploadGroupId || !fullyUploadedGroups.has(item.uploadGroupId)) && recoverable(item)
+    ).map(item => ({
     id: item.id,
     path: item.path || item.url || '',
     url: item.url,
     folderId: item.folderId,
     tempZipPath: item.tempZipPath,
+    uploadGroupId: item.uploadGroupId,
+    uploadGroupName: item.uploadGroupName,
+    uploadGroupRelativePath: item.uploadGroupRelativePath,
+    uploadGroupFileCount: item.uploadGroupFileCount,
+    uploadGroupTotalBytes: item.uploadGroupTotalBytes,
+    // Expected size is stable source metadata, unlike rolling uploadedBytes.
+    // Persist it only for folder groups: ordinary uploads learn their total
+    // from progress events and must not trigger metadata writes while running.
+    totalBytes: item.uploadGroupId ? item.totalBytes : undefined,
+    uploadGroupSourceRoot: item.uploadGroupSourceRoot,
+    driveFolderDirectoryId: item.driveFolderDirectoryId,
+    driveFolderLogicalFileId: item.driveFolderLogicalFileId,
     versionStackId: item.versionStackId,
     versionBaseFileId: item.versionBaseFileId,
     versionMakePrimary: item.versionMakePrimary,
@@ -119,7 +193,8 @@ export const normalizeUploadQueue: Normalize<QueueItem> = items => items.filter(
     remoteImportLogicalFileId: item.remoteImportLogicalFileId,
     status: savedStatus(item),
     ...(['error', 'paused', 'pausing'].includes(item.status) && item.error !== undefined ? { error: item.error } : {}),
-}));
+    }));
+};
 
 export const normalizeDownloadQueue: Normalize<DownloadItem> = items => items.filter(recoverable).map(item => ({
     id: item.id,
@@ -127,10 +202,27 @@ export const normalizeDownloadQueue: Normalize<DownloadItem> = items => items.fi
     filename: item.filename,
     folderId: item.folderId,
     savePath: item.savePath,
+    // Legacy queues did not distinguish generated paths from user choices.
+    noOverwrite: item.noOverwrite ?? (item.savePath ? true : undefined),
     transferEngine: item.transferEngine,
     status: savedStatus(item),
     ...(['error', 'paused', 'pausing'].includes(item.status) && item.error !== undefined ? { error: item.error } : {}),
 }));
+
+/** Reserve a destination in the same order as the bulk selection. */
+export function reserveBulkDownloadPath(dir: string, filename: string, usedPaths: Set<string>): string {
+    const separator = dir.includes('\\') ? '\\' : '/';
+    const prefix = dir.endsWith(separator) ? dir : dir + separator;
+    const dot = filename.lastIndexOf('.');
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const extension = dot > 0 ? filename.slice(dot) : '';
+    let destination = prefix + filename;
+    for (let suffix = 2; usedPaths.has(destination.toLowerCase()); suffix++) {
+        destination = prefix + stem + ' (' + suffix + ')' + extension;
+    }
+    usedPaths.add(destination.toLowerCase());
+    return destination;
+}
 
 export interface TransferQueuePersistence<T> {
     load(legacy: () => Promise<T[] | null | undefined>): Promise<T[]>;

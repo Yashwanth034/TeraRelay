@@ -398,7 +398,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: "TeraRelay v__VERSION__"
           releaseBody: "TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
@@ -421,7 +421,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: "TeraRelay v__VERSION__"
           releaseBody: "TeraRelay stores files larger than Telegram's single-document limit as one logical file with automatic chunking and reconstruction. See the README, platform packages, LICENSE, and THIRD_PARTY_NOTICES.md."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
@@ -721,7 +721,8 @@ jobs:
             ${{ env.ANDROID_RELEASE_DIR }}/mobile-latest.json.sig
 
   ios-simulator:
-    name: iOS simulator release validation
+    name: iOS simulator release validation (disabled for Linux-only releases)
+    if: ${{ false }}
     needs: release-security-gate
     runs-on: macos-latest
     defaults:

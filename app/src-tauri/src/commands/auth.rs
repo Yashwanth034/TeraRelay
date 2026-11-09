@@ -394,6 +394,9 @@ pub async fn cmd_logout(
         let _ = client.sign_out().await;
     }
 
+    // Clear process-local channel cache identity before another account can log in.
+    crate::commands::fs::clear_channel_listing_account_id();
+
     // 3. Clear State
     *state.client.lock().await = None;
     *state.session.lock().await = None;
@@ -402,6 +405,7 @@ pub async fn cmd_logout(
     *state.api_id.lock().await = None;
     *state.ephemeral_api_hash.lock().await = None;
     crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
+    crate::commands::shared_channels::clear_aliases();
     state.cancelled_transfers.write().await.clear();
 
     // 4. Remove Session File

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import faulthandler
 import hashlib
 import json
 import sys
 import time
+import traceback
+
+# Capture native TDLib/Python crashes before the Rust IPC pipe closes.
+# Rust keeps only a bounded private diagnostic tail; no request arguments
+# or Telegram credentials are intentionally printed.
+faulthandler.enable(file=sys.stderr, all_threads=True)
 from collections import deque
 from pathlib import Path
 
@@ -1046,6 +1053,7 @@ def main() -> int:
         worker = Worker(cfg)
         emit({"event": "started"})
     except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
         emit({"event": "fatal", "error": str(exc)})
         return 1
 
@@ -1063,13 +1071,16 @@ def main() -> int:
             if action in {"status", "prepare"}:
                 state = worker.advance_auth(float(request.get("timeout", 15)))
                 is_premium = None
+                account_id = None
                 if state == "ready":
                     me = worker.td.request({"@type": "getMe"}, timeout=15)
                     is_premium = bool(me.get("is_premium", False))
+                    account_id = int(me["id"]) if me.get("id") is not None else None
                 result = {
                     "auth_state": state,
                     "ready": state == "ready",
                     "is_premium": is_premium,
+                    "account_id": account_id,
                 }
             elif action == "qr_start":
                 result = worker.start_qr_auth()
@@ -1102,6 +1113,24 @@ def main() -> int:
             else:
                 raise RuntimeError(f"Unknown worker action: {action}")
 
+            # A freshly completed QR/phone login must advertise the same
+            # Premium/account capability as a later status/prepare call.
+            if (
+                action in {"qr_start", "qr_wait", "phone", "code", "password"}
+                and isinstance(result, dict)
+                and result.get("ready") is True
+            ):
+                try:
+                    me = worker.td.request({"@type": "getMe"}, timeout=15)
+                    result["is_premium"] = bool(me.get("is_premium", False))
+                    result["account_id"] = (
+                        int(me["id"]) if me.get("id") is not None else None
+                    )
+                except Exception:
+                    # Account capability is unknown, never assumed Premium.
+                    result["is_premium"] = None
+                    result["account_id"] = None
+
             emit(
                 {
                     "event": "result",
@@ -1111,6 +1140,7 @@ def main() -> int:
                 }
             )
         except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
             emit(
                 {
                     "event": "result",

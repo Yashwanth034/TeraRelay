@@ -125,9 +125,19 @@ fn prune_inactive_fmp4_cache(
     }
     Ok(removed)
 }
+#[path = "fmp4_cleanup.rs"]
+mod cleanup;
+
+/// During TeraRelay startup, no previous-process fMP4 worker/readers can
+/// exist. Remove only recognized temporary remux windows.
+pub(crate) fn clean_previous_session_fmp4_cache(cache_root: &Path) {
+    cleanup::purge_previous_fmp4_cache(cache_root);
+}
 #[path = "fmp4_seek.rs"]
 mod seek;
-use seek::{probe_seek_anchor, SeekAnchor};
+#[cfg(test)]
+use seek::probe_seek_anchor;
+use seek::{prepare_remux_window, SeekAnchor};
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -254,6 +264,7 @@ fn configure_http_input_retries(cmd: &mut tokio::process::Command, input_path: &
     }
 }
 
+#[cfg(test)]
 pub async fn run_fmp4_remux(
     ffmpeg_path: &Path,
     input_path: &Path,
@@ -262,12 +273,18 @@ pub async fn run_fmp4_remux(
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
     progress_callback: impl Fn(f32),
 ) -> Result<(), String> {
+    let (anchor, encode_video) = if input_path.is_file() {
+        prepare_remux_window(Path::new("ffprobe"), &input_path.to_string_lossy(), 0.0).await
+    } else {
+        (None, false)
+    };
     run_fmp4_remux_at(
         ffmpeg_path,
         input_path,
         output_path,
         audio_stream_index,
-        None,
+        anchor,
+        encode_video,
         cancel_rx,
         progress_callback,
     )
@@ -280,6 +297,7 @@ async fn run_fmp4_remux_at(
     output_path: &Path,
     audio_stream_index: Option<i32>,
     anchor: Option<SeekAnchor>,
+    encode_video: bool,
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
     progress_callback: impl Fn(f32),
 ) -> Result<(), String> {
@@ -294,17 +312,22 @@ async fn run_fmp4_remux_at(
     let input_name = input_path.to_string_lossy();
     configure_http_input_retries(&mut cmd, input_path);
     if let Some(anchor) = anchor {
-        cmd.arg("-seek_timestamp")
-            .arg("1")
-            .arg("-ss")
-            .arg(format!("{:.6}", anchor.source_timestamp));
+        let timestamp = if encode_video {
+            // Accurate input seek decodes from the prior keyframe and discards
+            // frames before the requested elapsed position.
+            anchor.window_start
+        } else {
+            cmd.args(["-seek_timestamp", "1"]);
+            anchor.source_timestamp
+        };
+        cmd.arg("-ss").arg(format!("{timestamp:.6}"));
     }
     cmd.arg("-i")
         .arg(input_path)
         // Explicit mapping keeps playback deterministic when the source has
         // multiple audio tracks. Subtitles are handled separately as WebVTT.
         .arg("-map")
-        .arg("0:v:0");
+        .arg("0:V:0");
 
     if let Some(stream_index) = audio_stream_index {
         cmd.arg("-map").arg(format!("0:{stream_index}?"));
@@ -312,18 +335,27 @@ async fn run_fmp4_remux_at(
         cmd.arg("-map").arg("0:a:0?");
     }
 
-    cmd.arg("-sn")
-        .arg("-dn")
-        .arg("-c:v")
-        .arg("copy")
-        .arg("-c:a")
+    cmd.args(["-sn", "-dn"]);
+    if encode_video {
+        cmd.args([
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p", "-vf",
+            "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+        ]);
+    } else {
+        cmd.args(["-c:v", "copy"]);
+    }
+    cmd.arg("-c:a")
         .arg("aac")
         .arg("-b:a")
         .arg("192k")
         .arg("-ac")
         .arg("2")
         .arg("-movflags")
-        .arg("frag_keyframe+empty_moov+default_base_moof+global_sidx")
+        // Leave the growing response append-only. An MP4 global index can
+        // insert bytes before fragments that HTTP readers have already read.
+        .arg("frag_keyframe+empty_moov+default_base_moof")
         .arg("-frag_duration")
         .arg("2000000")
         .arg("-flush_packets")
@@ -695,12 +727,25 @@ impl Fmp4RemuxState {
         Ok(cached)
     }
 
-    async fn cancel_key(&self, file_key: &str) -> bool {
+    async fn cancel_key(&self, file_key: &str, session_id: Option<&str>) -> bool {
         let mut active = self.active_sources.lock().await;
-        let Some(entry) = active
-            .values_mut()
-            .find(|entry| entry.key.as_deref() == Some(file_key))
-        else {
+        let matching: Vec<_> = active
+            .iter()
+            .filter(|(key, entry)| {
+                entry.key.as_deref() == Some(file_key)
+                    && session_id.is_none_or(|id| key.ends_with(&format!(":{id}")))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        // A legacy request with no player identity cannot safely choose
+        // between two active sessions of the same movie.
+        if session_id.is_none() && matching.len() > 1 {
+            return false;
+        }
+        let Some(key) = matching.first() else {
+            return false;
+        };
+        let Some(entry) = active.get_mut(key) else {
             return false;
         };
         if let Some(cancel) = entry.cancel.take() {
@@ -735,6 +780,7 @@ pub async fn cmd_prepare_fmp4_stream(
     folder_id: Option<i64>,
     audio_stream_index: Option<i32>,
     start_time_secs: Option<f64>,
+    session_id: String,
     stream_config: tauri::State<'_, StreamConfig>,
     manager: tauri::State<'_, Arc<TranscodeManager>>,
     remux_state: tauri::State<'_, Fmp4RemuxState>,
@@ -748,8 +794,14 @@ pub async fn cmd_prepare_fmp4_stream(
     }
     let folder_id = folder_id.unwrap_or(0);
     let source_key = format!("{folder_id}_{message_id}");
+    // Remux intents are per-player. Two windows playing the same movie must
+    // not cancel each other's seek/probe state.
+    let source_session_key = format!("{source_key}:{session_id}");
+    if !manager.has_stream_session(&source_key, &session_id).await {
+        return Err("Streaming session closed; refusing stale fMP4 remux".into());
+    }
     // Reserve before awaiting the probe, so an older seek cannot replace a newer one.
-    let generation = remux_state.reserve_source(&source_key).await;
+    let generation = remux_state.reserve_source(&source_session_key).await;
     let input_url = format!(
         "http://localhost:{}/stream/{}/{}?token={}",
         stream_config.port,
@@ -761,17 +813,22 @@ pub async fn cmd_prepare_fmp4_stream(
         message_id,
         urlencoding::encode(&stream_config.token),
     );
-    let anchor = if requested > 0.0 {
-        Some(probe_seek_anchor(Path::new("ffprobe"), &input_url, requested).await?)
-    } else {
-        None
-    };
+    let (anchor, encode_video) =
+        prepare_remux_window(Path::new("ffprobe"), &input_url, requested).await;
+    if !manager.has_stream_session(&source_key, &session_id).await {
+        return Err("Streaming player closed during remux preparation".into());
+    }
     let window_start = anchor.map(|anchor| anchor.window_start).unwrap_or(0.0);
     let audio_key = audio_stream_index
         .map(|index| index.to_string())
         .unwrap_or_else(|| "default".to_string());
+    let mode = if encode_video {
+        "seek2_avc"
+    } else {
+        "seek1_aac"
+    };
     let stem = format!(
-        "{}_{}_a{}_s{}_seek1_aac",
+        "{}_{}_a{}_s{}_{mode}",
         folder_id,
         message_id,
         audio_key,
@@ -780,7 +837,7 @@ pub async fn cmd_prepare_fmp4_stream(
     let root = manager.cache_root.join(FMP4_DIR);
     remux_state.prune_idle_cache(&root).await;
     if let Some(file_key) = remux_state
-        .claim_cached_window(&source_key, generation, &root, &stem)
+        .claim_cached_window(&source_session_key, generation, &root, &stem)
         .await?
     {
         return Ok(Fmp4StreamInfo {
@@ -802,9 +859,12 @@ pub async fn cmd_prepare_fmp4_stream(
     let output_path = output_dir.join("output.mp4");
     let partial_path = output_dir.join("output.mp4.part");
     let ready_path = output_dir.join("output.mp4.ready");
+    if !manager.has_stream_session(&source_key, &session_id).await {
+        return Err("Streaming player closed before remux started".into());
+    }
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
     remux_state
-        .install_job(&source_key, generation, &file_key, Some(cancel_tx))
+        .install_job(&source_session_key, generation, &file_key, Some(cancel_tx))
         .await?;
     remux_state.jobs.lock().await.insert(file_key.clone(), None);
     let remux_state = remux_state.inner().clone();
@@ -817,6 +877,7 @@ pub async fn cmd_prepare_fmp4_stream(
                 &partial_path,
                 audio_stream_index,
                 anchor,
+                encode_video,
                 &mut cancel_rx,
                 |_| {},
             )
@@ -888,10 +949,13 @@ pub async fn cmd_prepare_fmp4_stream(
 #[tauri::command]
 pub async fn cmd_cancel_fmp4_stream(
     file_key: String,
+    session_id: Option<String>,
     manager: tauri::State<'_, Arc<TranscodeManager>>,
     remux_state: tauri::State<'_, Fmp4RemuxState>,
 ) -> Result<bool, String> {
-    let cancelled = remux_state.cancel_key(&file_key).await;
+    let cancelled = remux_state
+        .cancel_key(&file_key, session_id.as_deref())
+        .await;
     // This is the ordinary playback-stop/seek-change event. Only old,
     // unreferenced, safely reusable cache candidates are eligible for pruning.
     remux_state
@@ -1242,7 +1306,7 @@ mod fmp4_cache_lifecycle_tests {
             "active cached playback must not be evicted"
         );
         assert!(path.exists());
-        assert!(state.cancel_key(key).await);
+        assert!(state.cancel_key(key, None).await);
         let protected = {
             let active = state.active_sources.lock().await;
             let jobs = state.jobs.lock().await;
@@ -1631,6 +1695,72 @@ mod audio_compatibility_tests {
     }
 
     #[tokio::test]
+    async fn legacy_avi_video_becomes_browser_compatible_h264() {
+        let ffmpeg = Path::new("ffmpeg");
+        if tokio::process::Command::new(ffmpeg)
+            .arg("-version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("terarelay-avi-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("legacy.avi");
+        let output = root.join("playback.mp4");
+        let generated = tokio::process::Command::new(ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=24",
+                "-t",
+                "2",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let (_cancel, mut cancel_rx) = tokio::sync::oneshot::channel();
+        run_fmp4_remux(ffmpeg, &source, &output, None, &mut cancel_rx, |_| {})
+            .await
+            .unwrap();
+        let probe = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(probe.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&probe.stdout).trim(),
+            "h264,yuv420p"
+        );
+    }
+
+    #[tokio::test]
     async fn eac3_surround_audio_becomes_aac_without_changing_the_video_codec() {
         let ffmpeg = Path::new("ffmpeg");
         if tokio::process::Command::new(ffmpeg)
@@ -1775,12 +1905,12 @@ mod seek_playback_tests {
             .install_job("movie", latest, "latest", Some(tx))
             .await
             .unwrap();
-        assert!(!state.cancel_key("old").await);
+        assert!(!state.cancel_key("old", None).await);
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        assert!(state.cancel_key("latest").await);
+        assert!(state.cancel_key("latest", None).await);
         rx.await.unwrap();
     }
 
@@ -1999,6 +2129,7 @@ mod seek_playback_tests {
                 &output,
                 Some(2),
                 Some(anchor),
+                false,
                 &mut cancel_rx,
                 |_| {},
             )

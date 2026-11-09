@@ -10,13 +10,16 @@ use tokio::sync::RwLock;
 ///
 /// - `folder_id == None` → returns the user's own peer (Saved Messages)
 /// - Cache hit → returns immediately without any network call
-/// - Cache miss → scans all dialogs, populates the cache, and returns
+/// - Cache miss → scans until the requested peer, caching dialogs along the way
 pub async fn resolve_peer(
     client: &Client,
     folder_id: Option<i64>,
     peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>,
 ) -> Result<Peer, String> {
-    if let Some(fid) = folder_id {
+    if let Some(requested_id) = folder_id {
+        // A shared TeraRelay channel has a separate, JS-safe negative view ID.
+        // Resolve only registered aliases; unknown IDs fail closed.
+        let fid = crate::commands::shared_channels::alias_for_peer(requested_id)?;
         // Fast path: check cache
         {
             let cache = peer_cache.read().await;
@@ -25,7 +28,7 @@ pub async fn resolve_peer(
             }
         }
 
-        // Slow path: scan dialogs and populate cache
+        // Slow path: cache dialogs until the requested peer is found
         log::debug!("Peer cache miss for folder_id={}, scanning dialogs...", fid);
         let mut found: Option<Peer> = None;
         let mut dialogs = client.iter_dialogs();
@@ -40,7 +43,7 @@ pub async fn resolve_peer(
                 discovered.insert(id, dialog.peer.clone());
                 if id == fid {
                     found = Some(dialog.peer.clone());
-                    // Don't break — keep scanning to warm the cache
+                    break;
                 }
             }
         }

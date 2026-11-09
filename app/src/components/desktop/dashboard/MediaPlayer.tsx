@@ -16,16 +16,17 @@ interface MediaPlayerProps {
     onClose: () => void;
     onNext?: () => void;
     onPrev?: () => void;
+    onDownload?: () => void;
     currentIndex?: number;
     totalItems?: number;
     activeFolderId: number | null;
 }
 
 function shouldPreferFmp4Remux(name: string): boolean {
-    return /\.(mkv|mov|avi)$/i.test(name);
+    return !/\.(mp4|m4v)$/i.test(name);
 }
 
-export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, totalItems, activeFolderId }: MediaPlayerProps) {
+export function MediaPlayer({ file, onClose, onNext, onPrev, onDownload, currentIndex, totalItems, activeFolderId }: MediaPlayerProps) {
     const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [isFullscreen, setIsFullscreen] = useState(false);
@@ -130,8 +131,8 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [onClose, onNext, onPrev, toggleFullscreen, isVideo]);
 
-    // All video containers use the adaptive player. MP4 uses the direct MSE
-    // path; MKV/MOV/AVI/WebM first try the fast no-reencode fMP4 remux path.
+    // Let the decoder use HTTP ranges first. The adaptive player can convert
+    // unsupported video or audio when the original decoder cannot play it.
     if (isVideo && streamUrl) {
         return (
             <AdaptiveMediaPlayer
@@ -141,6 +142,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
                 onClose={onClose}
                 onNext={onNext}
                 onPrev={onPrev}
+                onDownload={onDownload}
                 currentIndex={currentIndex}
                 totalItems={totalItems}
                 preferRemux={shouldPreferFmp4Remux(file.name)}

@@ -18,6 +18,8 @@ export interface TelegramFile {
     stack_version_count?: number;
     /** Optional label for the current primary version. */
     stack_label?: string;
+    /** Path inside the channel's Drive collection, e.g. `Season 01/Extras`. */
+    drive_relative_path?: string;
     // Add other fields if backend sends them
 }
 
@@ -87,7 +89,20 @@ export interface QueueItem {
     totalBytes?: number;
     speedBytesPerSec?: number;
     uploadPhase?: 'preparing' | 'uploading';
-    tempZipPath?: string; // Set when the upload originated from a zipped folder
+    tempZipPath?: string; // Legacy recovery field for uploads created by the previous ZIP-folder flow
+    /** Stable group identity for a folder upload; each episode remains its own queue item. */
+    uploadGroupId?: string;
+    uploadGroupName?: string;
+    /** Original folder-relative path, using forward slashes on every platform. */
+    uploadGroupRelativePath?: string;
+    uploadGroupFileCount?: number;
+    uploadGroupTotalBytes?: number;
+    /** Canonical source root selected for this batch; revalidated by Rust before transfer. */
+    uploadGroupSourceRoot?: string;
+    /** Persisted Drive directory for this file. Retried uploads reuse this location. */
+    driveFolderDirectoryId?: string;
+    /** Stable logical file ID persisted before the post-upload folder move. */
+    driveFolderLogicalFileId?: string;
     /** Optional post-upload action: attach this upload to an existing stack. */
     versionStackId?: string;
     /** Optional post-upload action: create a stack with this existing logical file. */
@@ -150,6 +165,8 @@ export interface DownloadItem {
     totalBytes?: number;
     speedBytesPerSec?: number;
     savePath?: string;
+    /** Automatically chosen bulk destinations must preserve existing files. */
+    noOverwrite?: boolean;
     /** Transfer backend selected explicitly by the user. */
     transferEngine?: TransferEngine;
 }

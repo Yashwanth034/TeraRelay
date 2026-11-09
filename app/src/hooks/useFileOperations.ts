@@ -6,6 +6,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
 import { TelegramFile } from '../types';
+import type { ChannelFolderNode } from '../channelFolderTree';
+import { reserveBulkDownloadPath } from '../transferQueue';
 
 export function useFileOperations(
     activeFolderId: number | null,
@@ -32,11 +34,89 @@ export function useFileOperations(
                 invoke('cmd_delete_preview_for_message', { messageId: id, folderId: activeFolderId }).catch(() => {}),
             ]);
             queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+            queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', activeFolderId] });
             toast.success("File deleted");
         } catch (e) {
             toast.error(`Delete failed: ${e}`);
         }
     }, [activeFolderId, confirm, queryClient]);
+
+    const handleDeleteFolder = useCallback(async (folder: ChannelFolderNode) => {
+        if (activeFolderId === null || !folder.directory_id) {
+            toast.error('This folder is no longer available. Refresh the channel and try again.');
+            return;
+        }
+
+        const collectFiles = (node: ChannelFolderNode): TelegramFile[] => [
+            ...node.files,
+            ...node.folders.flatMap(collectFiles),
+        ];
+        const files = collectFiles(folder);
+        const uniqueFiles = [...new Map(files.map(file => [file.id, file])).values()];
+        if (uniqueFiles.some(file => !!file.stack_id)) {
+            toast.info('This folder contains version stacks. Manage those versions first, then delete the folder.');
+            return;
+        }
+
+        const confirmed = await confirm({
+            title: files.length > 0 ? 'Delete Folder and Contents' : 'Delete Empty Folder',
+            message: files.length > 0
+                ? `Delete "${folder.name}" and all ${uniqueFiles.length} files inside it, including nested folders? This permanently deletes those files from the selected Telegram channel and cannot be undone.`
+                : `Delete the empty Drive folder "${folder.name}" and its empty nested folders?`,
+            confirmText: files.length > 0 ? `Delete ${uniqueFiles.length} Files` : 'Delete Folder',
+            variant: 'danger',
+        });
+        if (!confirmed) return;
+
+        let deleted = 0;
+        const failures: string[] = [];
+        for (const file of uniqueFiles) {
+            try {
+                const ok = await invoke<boolean>('cmd_delete_file', {
+                    messageId: file.id,
+                    folderId: activeFolderId,
+                });
+                if (!ok) throw new Error('The delete command did not confirm completion');
+                await Promise.all([
+                    invoke('cmd_delete_image_thumbnail', { messageId: file.id, folderId: activeFolderId }).catch(() => {}),
+                    invoke('cmd_delete_preview_for_message', { messageId: file.id, folderId: activeFolderId }).catch(() => {}),
+                ]);
+                deleted++;
+            } catch (error) {
+                failures.push(`${file.name}: ${String(error)}`);
+            }
+        }
+
+        let folderError: string | null = null;
+        if (failures.length === 0) {
+            try {
+                await invoke('cmd_drive_delete_empty_channel_folder_tree', {
+                    folderId: activeFolderId,
+                    directoryId: folder.directory_id,
+                });
+            } catch (error) {
+                folderError = String(error);
+            }
+        }
+
+        await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] }),
+            queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', activeFolderId] }),
+        ]);
+        setSelectedIds(selectedIdsRef.current.filter(id => !uniqueFiles.some(file => file.id === id)));
+
+        if (failures.length > 0) {
+            toast.error(`Deleted ${deleted} of ${uniqueFiles.length} files. ${failures.length} could not be deleted; the remaining folder contents were kept.`);
+        } else if (folderError) {
+            toast.error(`Deleted ${deleted} files, but could not remove the empty folder: ${folderError}`);
+        } else {
+            toast.success(
+                files.length > 0
+                    ? `Deleted folder "${folder.name}" and ${deleted} files.`
+                    : `Deleted empty folder "${folder.name}".`,
+            );
+        }
+    }, [activeFolderId, confirm, queryClient, setSelectedIds]);
 
     const handleBulkDelete = useCallback(async () => {
         const ids = selectedIdsRef.current;
@@ -64,6 +144,7 @@ export function useFileOperations(
         }
         setSelectedIds([]);
         queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+        queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', activeFolderId] });
         if (success > 0) toast.success(`Deleted ${success} files.`);
         if (fail > 0) toast.error(`Failed to delete ${fail} files.`);
     }, [activeFolderId, confirm, queryClient, setSelectedIds]);
@@ -72,7 +153,10 @@ export function useFileOperations(
         const ids = selectedIdsRef.current;
         if (ids.length === 0) return;
         const currentFiles = displayedFilesRef.current;
-        const targetFiles = currentFiles.filter((f) => ids.includes(f.id));
+        // Ctrl-click selection order determines bulk download queue order.
+        // The displayed list may be sorted differently from the click sequence.
+        const byId = new Map(currentFiles.map(file => [file.id, file]));
+        const targetFiles = ids.map(id => byId.get(id)).filter((file): file is TelegramFile => !!file);
         if (targetFiles.length === 0) return;
         if (queueBulkDownload) {
             queueBulkDownload(targetFiles, activeFolderId);
@@ -82,16 +166,17 @@ export function useFileOperations(
         // Fallback: direct download if queue not provided
         const downloadToDir = async (dirPath: string) => {
             let successCount = 0;
-            const sep = dirPath.includes('\\') ? '\\' : '/';
+            const usedPaths = new Set<string>();
             for (const file of targetFiles) {
-                const sanitizedName = sanitizeFilename(file.name);
-                const filePath = dirPath.endsWith(sep) ? `${dirPath}${sanitizedName}` : `${dirPath}${sep}${sanitizedName}`;
+                const filePath = reserveBulkDownloadPath(dirPath, sanitizeFilename(file.name), usedPaths);
                 try {
-                    await invoke('cmd_download_file', { req: { message_id: file.id, save_path: filePath, folder_id: activeFolderId } });
+                    await invoke('cmd_download_file', { req: { message_id: file.id, save_path: filePath, folder_id: activeFolderId, no_overwrite: true } });
                     successCount++;
-                } catch (e) { }
+                } catch (error) {
+                    toast.error(`Download failed for ${file.name}: ${error}`);
+                }
             }
-            toast.success(`Downloaded ${successCount} files.`);
+            if (successCount > 0) toast.success(`Downloaded ${successCount} files.`);
             setSelectedIds([]);
         };
         try {
@@ -129,6 +214,16 @@ export function useFileOperations(
                 sourceFolderId: activeFolderId,
                 targetFolderId: targetFolderId
             });
+            if ((activeFolderId ?? 0) < 0 || (targetFolderId ?? 0) < 0) {
+                try {
+                    const sync = await invoke<{ dirty: boolean; source: string }>('cmd_drive_sync_metadata');
+                    if (sync.dirty || sync.source === 'qa-local') {
+                        toast.warning('File moved, but shared-channel Drive metadata still needs synchronization.');
+                    }
+                } catch (error) {
+                    toast.warning('File moved, but shared-channel Drive synchronization needs retry: ' + error);
+                }
+            }
             // Clean up stale thumbnail and preview cache entries for the old message IDs.
             // After a move (forward+delete), the message gets a new ID in the
             // target folder, so old cached thumbnails are orphaned.
@@ -140,8 +235,8 @@ export function useFileOperations(
             queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
             setSelectedIds([]);
             if (onSuccess) onSuccess();
-        } catch {
-            toast.error('Failed to move files');
+        } catch (error) {
+            toast.error(`Could not finish moving files: ${error}`);
         }
     }, [activeFolderId, queryClient, setSelectedIds]);
 
@@ -159,16 +254,17 @@ export function useFileOperations(
         const downloadToDir = async (dirPath: string) => {
             let successCount = 0;
             toast.info(`Downloading folder contents (${files.length} files)...`);
-            const sep = dirPath.includes('\\') ? '\\' : '/';
+            const usedPaths = new Set<string>();
             for (const file of files) {
-                const sanitizedName = sanitizeFilename(file.name);
-                const filePath = dirPath.endsWith(sep) ? `${dirPath}${sanitizedName}` : `${dirPath}${sep}${sanitizedName}`;
+                const filePath = reserveBulkDownloadPath(dirPath, sanitizeFilename(file.name), usedPaths);
                 try {
-                    await invoke('cmd_download_file', { req: { message_id: file.id, save_path: filePath, folder_id: activeFolderId } });
+                    await invoke('cmd_download_file', { req: { message_id: file.id, save_path: filePath, folder_id: activeFolderId, no_overwrite: true } });
                     successCount++;
-                } catch (e) { }
+                } catch (error) {
+                    toast.error(`Download failed for ${file.name}: ${error}`);
+                }
             }
-            toast.success(`Folder Download Complete: ${successCount} files.`);
+            if (successCount > 0) toast.success(`Folder Download Complete: ${successCount} files.`);
         };
         try {
             const dirPath = await pickWithFallback(
@@ -203,6 +299,7 @@ export function useFileOperations(
 
     return {
         handleDelete,
+        handleDeleteFolder,
         handleBulkDelete,
         handleBulkDownload,
         handleBulkMove,

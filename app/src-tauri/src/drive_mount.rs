@@ -1839,7 +1839,91 @@ mod desktop {
     #[cfg(target_os = "linux")]
     const TTL: Duration = Duration::from_secs(1);
     const CACHE_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
-    const CACHE_MAX_BYTES: u64 = crate::cache_cleanup::DRIVE_CACHE_BYTES;
+    // Keep eight complete encrypted 16 MiB windows plus modest framing.
+    // The previous ~32 MiB budget could evict the next VLC window while the
+    // decoder was still filling its buffer. This is a rolling read cache,
+    // NOT a movie download; TDLib's separate cache limit stays unchanged.
+    const CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024 + 32 * 4096;
+
+    /// Coalesce competing foreground and read-ahead misses for the SAME
+    /// immutable cache window. Different windows can still fetch in parallel.
+    /// A weak registry avoids retaining one mutex for every block of a 40 GiB
+    /// movie after the players close.
+    #[derive(Default)]
+    struct DriveRemoteBlockGates {
+        gates: Mutex<HashMap<(String, u64), std::sync::Weak<Mutex<()>>>>,
+    }
+
+    impl DriveRemoteBlockGates {
+        fn for_window(&self, file_id: &str, window: u64) -> Result<Arc<Mutex<()>>, String> {
+            let mut gates = self.gates.lock().map_err(|_| "Drive read gates poisoned")?;
+            if gates.len() > 2048 {
+                gates.retain(|_, gate| gate.strong_count() != 0);
+            }
+            let key = (file_id.to_owned(), window);
+            if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+                return Ok(gate);
+            }
+            let gate = Arc::new(Mutex::new(()));
+            gates.insert(key, Arc::downgrade(&gate));
+            Ok(gate)
+        }
+    }
+
+    #[cfg(test)]
+    mod drive_read_singleflight_tests {
+        use super::DriveRemoteBlockGates;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+        };
+
+        #[test]
+        fn duplicate_readers_share_one_fetch_without_blocking_other_windows() {
+            let gates = Arc::new(DriveRemoteBlockGates::default());
+            let current = gates.for_window("movie", 42).unwrap();
+            let same = gates.for_window("movie", 42).unwrap();
+            let other = gates.for_window("movie", 43).unwrap();
+            assert!(Arc::ptr_eq(&current, &same));
+            assert!(!Arc::ptr_eq(&current, &other));
+            let held = current.lock().unwrap();
+            assert!(
+                other.try_lock().is_ok(),
+                "unrelated movie window must remain parallel"
+            );
+            assert!(
+                same.try_lock().is_err(),
+                "duplicate cache misses must coalesce"
+            );
+            drop(held);
+            let completed = Arc::new(Mutex::new(false));
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let start = Arc::new(Barrier::new(9));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let gates = Arc::clone(&gates);
+                    let completed = Arc::clone(&completed);
+                    let fetches = Arc::clone(&fetches);
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        let gate = gates.for_window("movie", 42).unwrap();
+                        start.wait();
+                        let _held = gate.lock().unwrap();
+                        let mut stored = completed.lock().unwrap();
+                        if !*stored {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            *stored = true;
+                        }
+                    })
+                })
+                .collect();
+            start.wait();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        }
+    }
 
     /// A malformed cache or remote response must fail the read instead of
     /// returning successful but incomplete bytes (which applications may
@@ -2372,6 +2456,64 @@ mod desktop {
         }
     }
 
+    /// Every cloud data fetch uses the SAME bounded, 206-validated byte-range
+    /// reader. Retry only temporary transport/429/5xx/truncated-body faults.
+    /// Never retry authentication errors, wrong Content-Range, bad checksums
+    /// or any response that could change the file's logical byte identity.
+    fn fetch_verified_loopback_range(
+        http: &reqwest::blocking::Client,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, String> {
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            let (result, retryable) = match http
+                .get(url)
+                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                .send()
+            {
+                Ok(response) => {
+                    let retry_status = response.status().is_server_error()
+                        || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                    let result = read_range_response(response, start, end);
+                    let incomplete = result.as_ref().err().is_some_and(|error| {
+                        error.starts_with("Drive stream ended early:")
+                            || error.starts_with("Drive stream expected ")
+                    });
+                    (result, retry_status || (partial && incomplete))
+                }
+                Err(error) => {
+                    let transient = error.is_timeout() || error.is_connect() || error.is_body();
+                    (
+                        Err(format!(
+                            "Drive loopback stream request failed: {}",
+                            error.without_url()
+                        )),
+                        transient,
+                    )
+                }
+            };
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if retryable && attempt + 1 < ATTEMPTS => {
+                    log::warn!(
+                        "Drive remote range transient error (attempt {}/{}): {}",
+                        attempt + 1,
+                        ATTEMPTS,
+                        error
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        250 * (attempt as u64 + 1),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("Drive remote range retry limit exceeded".into())
+    }
+
     /// Require the precise requested range and bound acquisition even if the
     /// loopback server sends a full object or an unlimited chunked response.
     fn read_range_response(
@@ -2431,6 +2573,104 @@ mod desktop {
             ));
         }
         Ok(bytes)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod drive_large_range_retry_tests {
+        use super::fetch_verified_loopback_range;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        fn serve_fixtures(
+            statuses: Vec<u16>,
+            start: u64,
+            end: u64,
+            total: u64,
+        ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/stream/home/1?token=SECRET_TEST_VALUE",
+                listener.local_addr().unwrap().port()
+            );
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counts = Arc::clone(&requests);
+            let handle = std::thread::spawn(move || {
+                for status in statuses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    let mut received = Vec::new();
+                    loop {
+                        let mut buf = [0u8; 1024];
+                        let n = stream.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&buf[..n]);
+                        if received.windows(4).any(|part| part == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&received).to_ascii_lowercase();
+                    assert!(
+                        request.contains(&format!("range: bytes={start}-{end}")),
+                        "Range header missing or truncated for 40 GiB offset"
+                    );
+                    counts.fetch_add(1, Ordering::SeqCst);
+                    let response = match status {
+                        206 => {
+                            let body = b"ABCD";
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(), String::from_utf8_lossy(body)
+                            )
+                        }
+                        2060 => format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/{total}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nABCD"
+                        ),
+                        503 => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                        404 => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                        _ => unreachable!(),
+                    };
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            (url, requests, handle)
+        }
+
+        #[test]
+        fn range_above_40_gib_retries_503_and_returns_exact_verified_bytes() {
+            let start = 40 * 1024_u64.pow(3) + 123;
+            let end = start + 3;
+            let total = end + 100;
+            let (url, requests, server) = serve_fixtures(vec![503, 206], start, end, total);
+            let client = reqwest::blocking::Client::new();
+            let response = fetch_verified_loopback_range(&client, &url, start, end).unwrap();
+            assert_eq!(response, b"ABCD");
+            server.join().unwrap();
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn wrong_range_and_not_found_fail_without_retry_or_token_leak() {
+            let start = 35 * 1024_u64.pow(3) + 21;
+            let end = start + 3;
+            let total = end + 20;
+            for status in [2060, 404] {
+                let (url, requests, server) = serve_fixtures(vec![status], start, end, total);
+                let client = reqwest::blocking::Client::new();
+                let error = fetch_verified_loopback_range(&client, &url, start, end).unwrap_err();
+                assert!(!error.contains("SECRET_TEST_VALUE"), "Private token leaked");
+                assert!(!error.contains("http://"), "Request URL leaked");
+                server.join().unwrap();
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+            }
+        }
     }
 
     fn create_private_file(path: &Path, truncate: bool) -> Result<File, String> {
@@ -3907,17 +4147,21 @@ mod desktop {
     }
 
     #[cfg(test)]
-    static INDEXED_DIRECTORY_LISTING_QUERY_CALLS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    std::thread_local! {
+        // Each unit test owns its instrumentation count. A process-global
+        // counter makes unrelated parallel FUSE tests interfere with resets.
+        static INDEXED_DIRECTORY_LISTING_QUERY_CALLS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
 
     #[cfg(test)]
     fn reset_indexed_directory_listing_query_count() {
-        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.with(|calls| calls.set(0));
     }
 
     #[cfg(test)]
     fn indexed_directory_listing_query_count() -> usize {
-        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.with(std::cell::Cell::get)
     }
 
     #[cfg(target_os = "linux")]
@@ -3926,7 +4170,7 @@ mod desktop {
         parent: Option<&str>,
     ) -> Result<Option<IndexedDirectoryListing>, String> {
         #[cfg(test)]
-        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        INDEXED_DIRECTORY_LISTING_QUERY_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut statement = conn
             .prepare(
                 "WITH current_directory AS (
@@ -4072,17 +4316,19 @@ mod desktop {
     }
 
     #[cfg(test)]
-    static INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    std::thread_local! {
+        static INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
 
     #[cfg(test)]
     fn reset_indexed_directory_plus_listing_query_count() {
-        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS.with(|calls| calls.set(0));
     }
 
     #[cfg(test)]
     fn indexed_directory_plus_listing_query_count() -> usize {
-        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS.with(std::cell::Cell::get)
     }
 
     #[cfg(target_os = "linux")]
@@ -4091,8 +4337,7 @@ mod desktop {
         current_id: Option<&str>,
     ) -> Result<Option<IndexedDirectoryPlusListing>, String> {
         #[cfg(test)]
-        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        INDEXED_DIRECTORY_PLUS_LISTING_QUERY_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut statement = conn
             .prepare(
                 "WITH current_directory AS (
@@ -4693,6 +4938,7 @@ mod desktop {
         cache_root: PathBuf,
         staging_root: PathBuf,
         cache_pruner: crate::cache_cleanup::DriveCachePruner,
+        remote_block_gates: DriveRemoteBlockGates,
         http: reqwest::blocking::Client,
         telegram: crate::commands::TelegramState,
         mount_state: DriveMountState,
@@ -4725,6 +4971,7 @@ mod desktop {
                 state.cache_root.clone(),
                 CACHE_MAX_BYTES,
             )?,
+            remote_block_gates: DriveRemoteBlockGates::default(),
             app: app_handle.clone(),
             stream_port: state.stream_port,
             stream_token: state.stream_token.clone(),
@@ -4908,6 +5155,14 @@ mod desktop {
                 .join(format!("{block:016x}.bin"))
         }
 
+        /// Retry only transient transport/server failures. An invalid byte
+        /// range, authentication error, wrong Content-Range or failed SHA-256
+        /// MUST fail closed; never turn corrupt data into a successful read.
+        /// All URLs contain a private token, so errors must omit request URLs.
+        fn fetch_loopback_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, String> {
+            fetch_verified_loopback_range(&self.http, url, start, end)
+        }
+
         fn fetch_stream_range(
             &self,
             file: &DriveFileRecord,
@@ -4924,18 +5179,7 @@ mod desktop {
                 file.first_message_id,
                 urlencoding::encode(&self.stream_token)
             );
-            let response = self
-                .http
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-                .send()
-                .map_err(|e| {
-                    format!(
-                        "TeraRelay Drive could not fetch file data: {}",
-                        e.without_url()
-                    )
-                })?;
-            read_range_response(response, start, end)
+            self.fetch_loopback_range(&url, start, end)
         }
 
         fn fetch_encrypted_plain_chunk(
@@ -5084,18 +5328,7 @@ mod desktop {
                         message_id,
                         urlencoding::encode(&self.stream_token)
                     );
-                    let response = self
-                        .http
-                        .get(url)
-                        .header(
-                            reqwest::header::RANGE,
-                            format!("bytes={}-{}", block.part_offset, range_end),
-                        )
-                        .send()
-                        .map_err(|e| {
-                            format!("Could not fetch Drive V2 block: {}", e.without_url())
-                        })?;
-                    let bytes = read_range_response(response, block.part_offset, range_end)?;
+                    let bytes = self.fetch_loopback_range(&url, block.part_offset, range_end)?;
                     let actual_hash = format!("{:x}", Sha256::digest(&bytes));
                     if actual_hash != block.sha256 {
                         return Err("Drive V2 block checksum mismatch".to_string());
@@ -5159,6 +5392,25 @@ mod desktop {
                 visible_size.saturating_sub(1),
                 start.saturating_add(CACHE_BLOCK_SIZE - 1),
             );
+
+            // One authenticated block must have exactly one remote fetch at
+            // a time. Otherwise concurrent VLC read() calls and read-ahead
+            // can both miss the same ciphertext and saturate the Telegram
+            // connection. Gate at the physical 16 MiB chunk for encrypted
+            // and V2 objects, and at 4 MiB for legacy plain objects.
+            let fetch_window = if file.storage_version == 2
+                || file.encryption_version == crate::drive_crypto::DRIVE_ENCRYPTION_VERSION
+            {
+                start / crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE
+            } else {
+                start / CACHE_BLOCK_SIZE
+            };
+            let gate = self
+                .remote_block_gates
+                .for_window(&file.file_id, fetch_window)?;
+            let _singleflight = gate
+                .lock()
+                .map_err(|_| "Drive remote block lock poisoned".to_string())?;
 
             if file.storage_version == 2 {
                 let crypto_chunk = start / crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE;
@@ -5657,13 +5909,9 @@ mod desktop {
             let end = part_offset
                 .checked_add(record.chunk_size - 1)
                 .ok_or_else(|| "Drive pending part byte range overflow".to_string())?;
-            let response = self
-                .http
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={part_offset}-{end}"))
-                .send()
-                .map_err(|e| format!("Could not fetch pending Drive chunk: {}", e.without_url()))?;
-            let encoded = read_range_response(response, part_offset, end)?;
+            // Pending/copy-on-write files deserve the same transient read
+            // recovery as ordinary mounted videos, without weakening SHA-256.
+            let encoded = self.fetch_loopback_range(&url, part_offset, end)?;
             if format!("{:x}", Sha256::digest(&encoded)) != record.sha256 {
                 return Err("Pending Drive chunk checksum mismatch".to_string());
             }
@@ -7063,24 +7311,30 @@ mod desktop {
     /// getattr. Keep the number of remote workers and queued requests bounded.
     /// If saturated or disconnected, execute inline rather than losing a FUSE
     /// reply or manufacturing a short/failed read for the caller.
+    /// A remote read must never block fuser's single metadata dispatcher,
+    /// even when all HTTP workers are busy. On overload the caller responds
+    /// with EAGAIN (explicit retry), never a false short read or inline HTTP.
     #[cfg(target_os = "linux")]
-    type FuseRemoteReadJob = Box<dyn FnOnce() + Send + 'static>;
-
-    #[cfg(target_os = "linux")]
-    struct FuseRemoteReadPool {
-        sender: std::sync::mpsc::SyncSender<FuseRemoteReadJob>,
+    struct FuseRemoteReadPool<T: Send + 'static> {
+        sender: std::sync::mpsc::SyncSender<T>,
     }
 
     #[cfg(target_os = "linux")]
-    impl FuseRemoteReadPool {
-        fn new(workers: usize, queue: usize) -> Result<Self, String> {
+    impl<T: Send + 'static> FuseRemoteReadPool<T> {
+        fn new(
+            workers: usize,
+            queue: usize,
+            run: impl Fn(T) + Send + Sync + 'static,
+        ) -> Result<Self, String> {
             if workers == 0 || queue == 0 {
                 return Err("Drive remote read pool requires positive bounds".into());
             }
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<FuseRemoteReadJob>(queue);
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(queue);
             let receiver = Arc::new(Mutex::new(receiver));
+            let run = Arc::new(run);
             for index in 0..workers {
                 let receiver = Arc::clone(&receiver);
+                let run = Arc::clone(&run);
                 std::thread::Builder::new()
                     .name(format!("terarelay-drive-read-{index}"))
                     .spawn(move || loop {
@@ -7089,7 +7343,7 @@ mod desktop {
                             Err(_) => return,
                         };
                         match task {
-                            Ok(task) => task(),
+                            Ok(task) => run(task),
                             Err(_) => return,
                         }
                     })
@@ -7098,18 +7352,380 @@ mod desktop {
             Ok(Self { sender })
         }
 
-        fn dispatch(&self, job: impl FnOnce() + Send + 'static) {
-            match self.sender.try_send(Box::new(job)) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                    log::warn!("Drive remote read queue saturated; preserving read inline");
-                    job();
+        fn try_dispatch(&self, job: T) -> Result<(), T> {
+            self.sender.try_send(job).map_err(|error| match error {
+                std::sync::mpsc::TrySendError::Full(job)
+                | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DriveFuseReadRequest {
+        backend: Arc<TeraRelayFs>,
+        node: Node,
+        offset: u64,
+        size: u32,
+        reply: ReplyData,
+        read_ahead: Arc<DriveReadAhead>,
+        inode: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DriveFuseReadRequest {
+        fn run(self) {
+            let _slow = SlowFuseRequest::new("remote-read-worker");
+            match self
+                .backend
+                .read_resolved_node(&self.node, self.offset, self.size as u64)
+            {
+                Ok(data) => {
+                    self.reply.data(&data);
+                    if let Node::Remote(file) = &self.node {
+                        self.read_ahead
+                            .schedule(self.inode, file, self.offset, data.len());
+                    }
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
-                    log::warn!("Drive remote read workers unavailable; preserving read inline");
-                    job();
+                Err(error) => {
+                    log::warn!("TeraRelay Drive remote read failed: {error}");
+                    self.reply.error(errno_for_core(&error));
                 }
             }
+        }
+
+        fn overloaded(self) {
+            // If even the bounded worker queue is full, fail this one read
+            // explicitly rather than freezing the entire Drive mount.
+            log::warn!(
+                "Drive remote read queue saturated; responding EAGAIN without blocking metadata"
+            );
+            self.reply.error(libc::EAGAIN);
+        }
+    }
+
+    /// Plan a tiny rolling window after a successful read, never from a
+    /// seek's first request. All arithmetic stays u64 (40+ GiB safe) and
+    /// no request may spill beyond the file's visible logical size.
+    #[cfg(target_os = "linux")]
+    fn drive_prefetch_targets(
+        total_bytes: u64,
+        offset: u64,
+        delivered_bytes: usize,
+        sequential: bool,
+        physical_window: u64,
+    ) -> Vec<u64> {
+        if !sequential
+            || delivered_bytes == 0
+            || total_bytes <= 32 * 1024 * 1024
+            || physical_window < CACHE_BLOCK_SIZE
+            || !physical_window.is_multiple_of(CACHE_BLOCK_SIZE)
+        {
+            return Vec::new();
+        }
+        let end = offset
+            .saturating_add(delivered_bytes as u64)
+            .min(total_bytes);
+        if end == 0 {
+            return Vec::new();
+        }
+        // V2 and encrypted V1 store 16 MiB physical chunks: scheduling
+        // three separate 4 MiB slices would download the SAME ciphertext
+        // three times. Schedule unique physical chunks instead.
+        let next_window = (end - 1) / physical_window + 1;
+        let ahead = if physical_window == CACHE_BLOCK_SIZE {
+            3
+        } else {
+            2
+        };
+        (next_window..next_window.saturating_add(ahead))
+            .map(|index| index.saturating_mul(physical_window))
+            .take_while(|start| *start < total_bytes)
+            .map(|start| start / CACHE_BLOCK_SIZE)
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DrivePrefetchJob {
+        file: DriveFileRecord,
+        block: u64,
+        generation: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DrivePrefetchCursor {
+        last_end: u64,
+        generation: u64,
+    }
+
+    /// Opportunistic low-priority background reads. Never holds FUSE, SQLite
+    /// or a player descriptor open; jobs are coalesced and dropped when busy.
+    /// The existing authenticated/sha256-verified fetch path remains the only
+    /// code allowed to publish cached blocks. No decrypted V2 bytes on disk.
+    #[cfg(target_os = "linux")]
+    struct DriveReadAhead {
+        sender: std::sync::mpsc::SyncSender<DrivePrefetchJob>,
+        pending: Arc<Mutex<HashSet<(String, u64)>>>,
+        cursors: Arc<Mutex<HashMap<String, DrivePrefetchCursor>>>,
+        inode_files: Mutex<HashMap<u64, String>>,
+        closed_inodes: Mutex<HashSet<u64>>,
+        serial: std::sync::atomic::AtomicU64,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DriveReadAhead {
+        fn new(backend: Arc<TeraRelayFs>) -> Result<Self, String> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<DrivePrefetchJob>(16);
+            let receiver = Arc::new(Mutex::new(receiver));
+            let pending = Arc::new(Mutex::new(HashSet::<(String, u64)>::new()));
+            let cursors = Arc::new(Mutex::new(HashMap::<String, DrivePrefetchCursor>::new()));
+            for index in 0..2 {
+                let receiver = Arc::clone(&receiver);
+                let pending = Arc::clone(&pending);
+                let cursors = Arc::clone(&cursors);
+                let backend = Arc::clone(&backend);
+                std::thread::Builder::new()
+                    .name(format!("terarelay-drive-prefetch-{index}"))
+                    .spawn(move || loop {
+                        let job = match receiver.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else {
+                            return;
+                        };
+                        let identity = (job.file.file_id.clone(), job.block);
+                        let current = cursors.lock().ok().is_some_and(|cursor| {
+                            cursor
+                                .get(&job.file.file_id)
+                                .is_some_and(|cursor| cursor.generation == job.generation)
+                        });
+                        if current {
+                            // Background errors never mutate the main FUSE
+                            // reply. An actual user read retries and reports
+                            // its own authoritative error.
+                            let _ = backend.fetch_remote_block(&job.file, job.block, None);
+                        }
+                        if let Ok(mut set) = pending.lock() {
+                            set.remove(&identity);
+                        }
+                    })
+                    .map_err(|error| format!("Could not start Drive prefetch worker: {error}"))?;
+            }
+            Ok(Self {
+                sender,
+                pending,
+                cursors,
+                inode_files: Mutex::new(HashMap::new()),
+                closed_inodes: Mutex::new(HashSet::new()),
+                serial: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+
+        fn note_open(&self, ino: u64) {
+            if let Ok(mut closed) = self.closed_inodes.lock() {
+                closed.remove(&ino);
+            }
+        }
+
+        fn note_close(&self, ino: u64) {
+            // Invalidate queued speculative fetches as soon as the LAST
+            // descriptor closes. Already-running reqwest reads cannot be
+            // interrupted synchronously, but they never hold the FUSE
+            // dispatcher and only write to the disposable bounded cache.
+            if let Ok(mut closed) = self.closed_inodes.lock() {
+                if closed.len() >= 4096 {
+                    closed.clear();
+                }
+                closed.insert(ino);
+                if let Ok(mut files) = self.inode_files.lock() {
+                    if let Some(id) = files.remove(&ino) {
+                        if let Ok(mut cursors) = self.cursors.lock() {
+                            cursors.remove(&id);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn schedule(&self, ino: u64, file: &DriveFileRecord, offset: u64, delivered: usize) {
+            let total = file.plaintext_size.unwrap_or(file.total_size);
+            if delivered == 0 || offset >= total {
+                return;
+            }
+            let end = offset.saturating_add(delivered as u64).min(total);
+            let Ok(closed) = self.closed_inodes.lock() else {
+                return;
+            };
+            if closed.contains(&ino) {
+                return;
+            }
+            if let Ok(mut files) = self.inode_files.lock() {
+                files.insert(ino, file.file_id.clone());
+            }
+            let (sequential, generation) = match self.cursors.lock() {
+                Ok(mut cursors) => {
+                    // Keep metadata bounded when a file manager opens many
+                    // unrelated files. Clearing cancels stale queued work.
+                    if cursors.len() >= 128 && !cursors.contains_key(&file.file_id) {
+                        cursors.clear();
+                    }
+                    let previous = cursors.get(&file.file_id);
+                    let sequential = previous.map_or(offset < CACHE_BLOCK_SIZE, |previous| {
+                        offset <= previous.last_end.saturating_add(CACHE_BLOCK_SIZE)
+                            && offset.saturating_add(CACHE_BLOCK_SIZE) >= previous.last_end
+                    });
+                    let generation = if sequential {
+                        previous.map(|value| value.generation).unwrap_or_else(|| {
+                            self.serial
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        })
+                    } else {
+                        self.serial
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    };
+                    cursors.insert(
+                        file.file_id.clone(),
+                        DrivePrefetchCursor {
+                            last_end: end,
+                            generation,
+                        },
+                    );
+                    (sequential, generation)
+                }
+                Err(_) => return,
+            };
+            drop(closed);
+            let physical_window = if file.storage_version == 2 || file.encryption_version != 0 {
+                crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE
+            } else {
+                CACHE_BLOCK_SIZE
+            };
+            for block in
+                drive_prefetch_targets(total, offset, delivered, sequential, physical_window)
+            {
+                let key = (file.file_id.clone(), block);
+                let Ok(mut pending) = self.pending.lock() else {
+                    return;
+                };
+                if !pending.insert(key.clone()) {
+                    continue;
+                }
+                drop(pending);
+                match self.sender.try_send(DrivePrefetchJob {
+                    file: file.clone(),
+                    block,
+                    generation,
+                }) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        if let Ok(mut pending) = self.pending.lock() {
+                            pending.remove(&key);
+                        }
+                        // A busy prefetch lane should never block playback or
+                        // fill an unbounded queue.
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod drive_read_ahead_tests {
+        use super::{
+            drive_prefetch_targets, DrivePrefetchCursor, DriveReadAhead, CACHE_BLOCK_SIZE,
+        };
+        use std::collections::{HashMap, HashSet};
+        use std::sync::{atomic::AtomicU64, Arc, Mutex};
+
+        #[test]
+        fn closing_last_reader_invalidates_queued_prefetch_without_affecting_reopen() {
+            let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+            let ahead = DriveReadAhead {
+                sender,
+                pending: Arc::new(Mutex::new(HashSet::new())),
+                cursors: Arc::new(Mutex::new(HashMap::new())),
+                inode_files: Mutex::new(HashMap::new()),
+                closed_inodes: Mutex::new(HashSet::new()),
+                serial: AtomicU64::new(1),
+            };
+            ahead.note_open(42);
+            ahead.inode_files.lock().unwrap().insert(42, "movie".into());
+            ahead.cursors.lock().unwrap().insert(
+                "movie".into(),
+                DrivePrefetchCursor {
+                    last_end: 64 * 1024,
+                    generation: 17,
+                },
+            );
+            ahead.note_close(42);
+            assert!(
+                !ahead.cursors.lock().unwrap().contains_key("movie"),
+                "Closing the movie must invalidate queued read-ahead"
+            );
+            assert!(
+                ahead.closed_inodes.lock().unwrap().contains(&42),
+                "Late remote replies may not restart background download"
+            );
+            ahead.note_open(42);
+            assert!(
+                !ahead.closed_inodes.lock().unwrap().contains(&42),
+                "Opening the same movie again must allow new read-ahead"
+            );
+        }
+
+        #[test]
+        fn prefetch_40_gib_movie_window_uses_u64_offsets_and_stops_at_eof() {
+            let total = 40 * 1024_u64.pow(3) + 1234;
+            assert_eq!(
+                drive_prefetch_targets(total, 0, 64 * 1024, true, CACHE_BLOCK_SIZE),
+                vec![1, 2, 3]
+            );
+            assert_eq!(
+                drive_prefetch_targets(total, 0, 64 * 1024, false, CACHE_BLOCK_SIZE),
+                Vec::<u64>::new()
+            );
+            let last = (total - 1) / CACHE_BLOCK_SIZE;
+            let offset = total - 1024;
+            assert!(drive_prefetch_targets(total, offset, 1024, true, CACHE_BLOCK_SIZE).is_empty());
+            assert!(last > u32::MAX as u64 / CACHE_BLOCK_SIZE);
+        }
+
+        #[test]
+        fn encrypted_v2_prefetches_unique_16_mib_chunks() {
+            let total = 40 * 1024_u64.pow(3);
+            let crypto = crate::drive_crypto::DRIVE_PLAINTEXT_CHUNK_SIZE;
+            assert_eq!(crypto, 4 * CACHE_BLOCK_SIZE);
+            assert_eq!(
+                drive_prefetch_targets(total, 0, 128 * 1024, true, crypto),
+                vec![4, 8],
+                "must not trigger three duplicate downloads of first ciphertext chunk"
+            );
+            assert_eq!(
+                drive_prefetch_targets(total, 17 * 1024 * 1024, 64 * 1024, true, crypto),
+                vec![8, 12],
+            );
+        }
+
+        #[test]
+        fn prefetch_short_files_and_empty_reads_do_nothing() {
+            assert!(drive_prefetch_targets(1024, 0, 100, true, CACHE_BLOCK_SIZE).is_empty());
+            assert!(
+                drive_prefetch_targets(40 * 1024_u64.pow(3), 0, 0, true, CACHE_BLOCK_SIZE)
+                    .is_empty()
+            );
+            let total = 40 * 1024_u64.pow(3);
+            let offset = total - CACHE_BLOCK_SIZE * 2;
+            assert_eq!(
+                drive_prefetch_targets(
+                    total,
+                    offset,
+                    CACHE_BLOCK_SIZE as usize,
+                    true,
+                    CACHE_BLOCK_SIZE
+                ),
+                vec![(total / CACHE_BLOCK_SIZE) - 1]
+            );
         }
     }
 
@@ -7119,31 +7735,39 @@ mod desktop {
         use std::sync::{mpsc, Arc, Condvar, Mutex};
         use std::time::{Duration, Instant};
 
+        type Job = Box<dyn FnOnce() + Send + 'static>;
+        fn pool(workers: usize, queue: usize) -> FuseRemoteReadPool<Job> {
+            FuseRemoteReadPool::new(workers, queue, |job: Job| job()).unwrap()
+        }
+
         #[test]
         fn bounded_fuse_remote_read_pool_keeps_metadata_dispatch_responsive() {
-            let pool = FuseRemoteReadPool::new(2, 8).unwrap();
+            let pool = pool(2, 8);
             let (started_tx, started_rx) = mpsc::channel();
             let (finished_tx, finished_rx) = mpsc::channel();
             let gate = Arc::new((Mutex::new(false), Condvar::new()));
             for _ in 0..2 {
                 let gate = Arc::clone(&gate);
                 let started_tx = started_tx.clone();
-                pool.dispatch(move || {
-                    started_tx.send(()).unwrap();
-                    let (lock, notify) = &*gate;
-                    let mut ready = lock.lock().unwrap();
-                    while !*ready {
-                        ready = notify.wait(ready).unwrap();
-                    }
-                });
+                assert!(pool
+                    .try_dispatch(Box::new(move || {
+                        started_tx.send(()).unwrap();
+                        let (lock, notify) = &*gate;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = notify.wait(ready).unwrap();
+                        }
+                    }))
+                    .is_ok());
             }
             for _ in 0..2 {
                 started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             }
             let before = Instant::now();
-            pool.dispatch(move || finished_tx.send(()).unwrap());
-            // Scheduling another HTTP read must not wait for either blocked
-            // worker: the FUSE callback can immediately handle lookup/getattr.
+            assert!(pool
+                .try_dispatch(Box::new(move || finished_tx.send(()).unwrap()))
+                .is_ok());
+            // Scheduling another HTTP read must not wait for blocked workers.
             assert!(before.elapsed() < Duration::from_secs(1));
             assert!(finished_rx.try_recv().is_err());
             {
@@ -7155,31 +7779,37 @@ mod desktop {
         }
 
         #[test]
-        fn saturated_fuse_remote_read_pool_completes_every_reply_once() {
-            let pool = FuseRemoteReadPool::new(1, 1).unwrap();
+        fn saturated_fuse_remote_read_pool_rejects_without_blocking_dispatch() {
+            let pool = pool(1, 1);
             let (started_tx, started_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             let (finished_tx, finished_rx) = mpsc::channel();
             let first_done = finished_tx.clone();
-            pool.dispatch(move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                first_done.send(1).unwrap();
-            });
+            assert!(pool
+                .try_dispatch(Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    first_done.send(1).unwrap();
+                }))
+                .is_ok());
             started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             let second_done = finished_tx.clone();
-            pool.dispatch(move || second_done.send(2).unwrap());
-            // The bounded queue is full; this job runs inline rather than
-            // discarding the FUSE reply or pretending its contents are empty.
-            pool.dispatch(move || finished_tx.send(3).unwrap());
-            assert_eq!(finished_rx.recv_timeout(Duration::from_secs(3)), Ok(3));
+            assert!(pool
+                .try_dispatch(Box::new(move || second_done.send(2).unwrap()))
+                .is_ok());
+            let started = Instant::now();
+            let overloaded = pool.try_dispatch(Box::new(move || finished_tx.send(3).unwrap()));
+            assert!(
+                overloaded.is_err(),
+                "full queue must reject, never perform HTTP inline"
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            // The kernel caller owns the rejected FUSE reply and sends EAGAIN;
+            // no third job may execute or silently report zero bytes.
+            drop(overloaded);
             release_tx.send(()).unwrap();
-            let mut remaining = [
-                finished_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-                finished_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-            ];
-            remaining.sort_unstable();
-            assert_eq!(remaining, [1, 2]);
+            assert_eq!(finished_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+            assert_eq!(finished_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
             assert!(finished_rx.try_recv().is_err());
         }
     }
@@ -7187,7 +7817,8 @@ mod desktop {
     #[cfg(target_os = "linux")]
     struct LinuxFuseAdapter {
         backend: Arc<TeraRelayFs>,
-        remote_reads: FuseRemoteReadPool,
+        remote_reads: FuseRemoteReadPool<DriveFuseReadRequest>,
+        read_ahead: Arc<DriveReadAhead>,
         generation: u64,
         lifetimes: InodeLifetimes<RetiredRead>,
     }
@@ -8110,6 +8741,7 @@ mod desktop {
                     }
                     Some(FileType::RegularFile) => {
                         self.lifetimes.open(ino);
+                        self.read_ahead.note_open(ino);
                         reply.opened(0, 0);
                         return;
                     }
@@ -8138,6 +8770,7 @@ mod desktop {
                     }
                     if flags & libc::O_ACCMODE == libc::O_RDONLY {
                         self.lifetimes.open(ino);
+                        self.read_ahead.note_open(ino);
                         reply.opened(0, 0);
                         return;
                     }
@@ -8264,16 +8897,18 @@ mod desktop {
                 // reply on a bounded worker, leaving the serial dispatcher
                 // free for unrelated lookup, getattr and readdir requests.
                 let backend = Arc::clone(&self.backend);
-                self.remote_reads.dispatch(move || {
-                    let _slow = SlowFuseRequest::new("remote-read-worker");
-                    match backend.read_resolved_node(&node, offset as u64, size as u64) {
-                        Ok(data) => reply.data(&data),
-                        Err(error) => {
-                            log::warn!("TeraRelay Drive remote read failed: {error}");
-                            reply.error(errno_for_core(&error));
-                        }
-                    }
-                });
+                let request = DriveFuseReadRequest {
+                    backend,
+                    node,
+                    offset: offset as u64,
+                    size,
+                    reply,
+                    read_ahead: Arc::clone(&self.read_ahead),
+                    inode: ino,
+                };
+                if let Err(overloaded) = self.remote_reads.try_dispatch(request) {
+                    overloaded.overloaded();
+                }
                 return;
             }
             // Pending and retained reads retain their established staging
@@ -8666,6 +9301,9 @@ mod desktop {
         ) {
             let _slow = SlowFuseRequest::new("release");
             self.lifetimes.close(ino);
+            if self.lifetimes.open_count(ino) == 0 {
+                self.read_ahead.note_close(ino);
+            }
             // Only the initial read-only CREATE handle owns a writer.
             if !release_closes_pending_writer(flags, fh) {
                 reply.ok();
@@ -9878,11 +10516,16 @@ mod desktop {
             telegram_state.inner(),
         )?;
         // Set up bounded HTTP-read workers before publishing the mount.
-        let remote_reads = FuseRemoteReadPool::new(2, 32)?;
+        // More concurrent cloud reads help VLC and file browsers without
+        // holding the serial FUSE metadata loop. Saturation responds EAGAIN
+        // instead of blocking ALL Drive operations for up to 90 seconds.
+        let remote_reads = FuseRemoteReadPool::new(4, 64, DriveFuseReadRequest::run)?;
+        let read_ahead = Arc::new(DriveReadAhead::new(Arc::clone(&backend))?);
         let generation = state.inner.begin_session(request_epoch)?;
         let filesystem = LinuxFuseAdapter {
             backend,
             remote_reads,
+            read_ahead,
             generation,
             lifetimes: InodeLifetimes::default(),
         };
@@ -10014,6 +10657,7 @@ mod desktop {
                 state.cache_root.clone(),
                 CACHE_MAX_BYTES,
             )?,
+            remote_block_gates: DriveRemoteBlockGates::default(),
             app: app_handle,
             stream_port: state.stream_port,
             stream_token: state.stream_token.clone(),

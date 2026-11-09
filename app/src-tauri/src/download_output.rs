@@ -1,4 +1,7 @@
 use sha2::{Digest, Sha256};
+
+pub(crate) const DESTINATION_EXISTS: &str =
+    "Bulk download destination already exists. Move the existing file, then retry.";
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -612,12 +615,12 @@ impl DownloadOutput {
         &self.path_text
     }
 
-    pub async fn publish(&mut self) -> Result<(), String> {
+    pub async fn publish(&mut self, no_overwrite: bool) -> Result<(), String> {
         let staging = self
             .staging
             .as_ref()
             .ok_or_else(|| "Download output was already published".to_string())?;
-        if destination_stamp(&self.destination).await? != self.original {
+        if !no_overwrite && destination_stamp(&self.destination).await? != self.original {
             return Err("Destination changed during download. Choose another save location before retrying.".to_string());
         }
         // Sync requires write access on Windows; opening must not truncate bytes.
@@ -630,9 +633,26 @@ impl DownloadOutput {
             .await
             .map_err(|e| format!("Cannot sync completed download output: {e}"))?;
         drop(file);
-        tokio::fs::rename(staging, &self.destination)
-            .await
-            .map_err(|e| format!("Cannot publish completed download: {e}"))?;
+        if no_overwrite {
+            // A sibling hard link atomically publishes the complete file
+            // only if the destination is still free.
+            tokio::fs::hard_link(staging, &self.destination)
+                .await
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        DESTINATION_EXISTS.to_string()
+                    } else {
+                        format!("Cannot publish bulk download without overwriting: {error}")
+                    }
+                })?;
+            if let Err(error) = tokio::fs::remove_file(staging).await {
+                log::warn!("Bulk download was saved but staging cleanup failed: {error}");
+            }
+        } else {
+            tokio::fs::rename(staging, &self.destination)
+                .await
+                .map_err(|e| format!("Cannot publish completed download: {e}"))?;
+        }
         self.staging = None;
         if let Some(resume) = self.resume.take() {
             // Close the journal before unlinking it (also needed on Windows),
@@ -737,7 +757,7 @@ mod tests {
         assert!(!output.is_region_confirmed(8, 4));
         assert_eq!(output.confirmed_bytes(), 8);
         output.confirm_region(8, 4).await.unwrap();
-        output.publish().await.unwrap();
+        output.publish(false).await.unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"goodparttail");
         assert!(!Path::new(&stage).exists());
         assert!(
@@ -1159,7 +1179,7 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(second.path(), b"verified new file").unwrap();
-        second.publish().await.unwrap();
+        second.publish(false).await.unwrap();
         drop(first);
         assert!(!std::path::Path::new(&first_path).exists());
         assert_eq!(std::fs::read(&destination).unwrap(), b"verified new file");
@@ -1168,6 +1188,24 @@ mod tests {
             .unwrap();
         drop(failed);
         assert_eq!(std::fs::read(&destination).unwrap(), b"verified new file");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_publication_preserves_an_existing_destination() {
+        let dir = scratch();
+        let destination = dir.join("report.pdf");
+        std::fs::write(&destination, b"existing document").unwrap();
+        let mut output = DownloadOutput::create(destination.to_str().unwrap(), "bulk")
+            .await
+            .unwrap();
+        std::fs::write(output.path(), b"bulk download").unwrap();
+        assert!(output.publish(true).await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing document");
+        std::fs::remove_file(&destination).unwrap();
+        output.publish(true).await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"bulk download");
+        assert!(!Path::new(output.path()).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1182,7 +1220,7 @@ mod tests {
         std::fs::write(stage.path(), b"new download").unwrap();
         std::fs::write(&destination, b"someone changed this file").unwrap();
         assert!(stage
-            .publish()
+            .publish(false)
             .await
             .unwrap_err()
             .contains("Destination changed"));
@@ -1197,7 +1235,7 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(stage.path(), b"verified").unwrap();
-        assert!(stage.publish().await.is_err());
+        assert!(stage.publish(false).await.is_err());
         drop(stage);
         assert!(directory.is_dir());
         std::fs::remove_dir_all(dir).unwrap();

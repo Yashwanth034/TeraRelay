@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 
 import { TelegramFile, ShareInfo } from '../../types';
@@ -134,6 +135,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const { data: allFiles = [], isLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
+        staleTime: 30_000,
         queryFn: () => invoke<Array<{
             id: number; name: string; size: number; icon_type: string; folder_id: number | null;
             created_at: string; mime_type?: string; file_ext?: string; is_split?: boolean;
@@ -147,18 +149,76 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         enabled: !!store,
     });
 
+    const { data: driveChannelPaths, isLoading: isDrivePathsLoading, isError: isDrivePathsError } = useQuery<{
+        directories: string[];
+        directory_ids: Record<string, string>;
+        directory_created_at: Record<string, number>;
+        file_paths: Record<string, string>;
+    }>({
+        queryKey: ['drive-channel-file-paths', activeFolderId],
+        queryFn: () => invoke<{
+            directories: string[];
+            directory_ids: Record<string, string>;
+            directory_created_at: Record<string, number>;
+            file_paths: Record<string, string>;
+        }>(
+            'cmd_drive_get_channel_file_paths',
+            { folderId: activeFolderId },
+        ),
+        enabled: !!store && activeFolderId !== null,
+        staleTime: 15_000,
+    });
+    const channelFiles = useMemo(() => {
+        if (activeFolderId === null) return allFiles;
+        const paths = driveChannelPaths?.file_paths ?? {};
+        return allFiles.map(file => ({
+            ...file,
+            drive_relative_path: file.logical_file_id ? paths[file.logical_file_id] : undefined,
+        }));
+    }, [activeFolderId, allFiles, driveChannelPaths]);
+
+    // Apply the background Telegram reconciliation directly to React Query so
+    // stale-while-refresh listings update without another blocking IPC call.
+    useEffect(() => {
+        let unlisten: (() => void) | undefined;
+        let disposed = false;
+        void listen<{
+            folder_id: number | null;
+            files: Array<{
+                id: number; name: string; size: number; icon_type: string; folder_id: number | null;
+                created_at: string; mime_type?: string; file_ext?: string; is_split?: boolean;
+                logical_file_id?: string; stack_id?: string; stack_name?: string;
+                stack_version_count?: number; stack_label?: string;
+            }>;
+        }>('files-updated', ({ payload }) => {
+            queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', payload.folder_id] });
+            queryClient.setQueryData(['files', payload.folder_id], payload.files.map(file => ({
+                ...file,
+                sizeStr: formatBytes(file.size),
+                type: (file.icon_type as TelegramFile['type']) || 'file',
+            })));
+        }).then(stop => {
+            if (disposed) stop();
+            else unlisten = stop;
+        }).catch(error => console.warn('Could not subscribe to channel file refresh:', error));
+        return () => {
+            disposed = true;
+            unlisten?.();
+        };
+    }, [queryClient]);
+
     // Keep file-array identity stable during transfer progress and unrelated UI updates.
     // The file explorer sorts/virtualizes this array; recreating it on every
     // dashboard render causes avoidable O(n log n) work and thumbnail updates.
     const displayedFiles = useMemo(() => {
         const term = searchTerm.trim().toLowerCase();
         if (activeFolderId === null && searchTerm.length > 2) return searchResults;
-        if (!term && (activeFolderId === null || channelFileCategory === 'all')) return allFiles;
-        return allFiles.filter((file: TelegramFile) =>
+        if (!term && (activeFolderId === null || channelFileCategory === 'all')) return channelFiles;
+        return channelFiles.filter((file: TelegramFile) =>
             (file.stack_name || file.name).toLowerCase().includes(term)
             && (activeFolderId === null || channelFileCategory === 'all' || getFileCategory(file.name) === channelFileCategory)
         );
-    }, [activeFolderId, allFiles, channelFileCategory, searchResults, searchTerm]);
+    }, [activeFolderId, allFiles, channelFiles, channelFileCategory, searchResults, searchTerm]);
 
     const activeCategoryLabel: Record<FileCategory, string | undefined> = {
         all: undefined,
@@ -183,8 +243,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         cancelItem: cancelUploadItem,
         pauseItem: pauseUploadItem,
         resumeItem: resumeUploadItem,
+        pauseGroup: pauseUploadGroup,
+        resumeGroup: resumeUploadGroup,
+        cancelGroup: cancelUploadGroup,
         retryItem: retryUploadItem,
         dismissItem: dismissUploadItem,
+        dismissGroup: dismissUploadGroup,
     } = useFileUpload(activeFolderId, store, allFiles);
     const remoteImport = useRemoteImport(activeFolderId, store, enqueuePreparedImports, cancelUploadItem);
     const {
@@ -212,7 +276,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useFileDownload(store);
 
     const {
-        handleDelete, handleBulkDelete, handleBulkDownload,
+        handleDelete, handleDeleteFolder, handleBulkDelete, handleBulkDownload,
         handleBulkMove, handleDownloadFolder, handleGlobalSearch
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles, queueBulkDownload);
@@ -754,6 +818,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onClose={() => setPlayingFile(null)}
                         onNext={handleNextPreview}
                         onPrev={handlePrevPreview}
+                        onDownload={() => queueDownload(playingFile.id, playingFile.name, activeFolderId)}
                         currentIndex={previewContextIndex}
                         totalItems={previewContextFiles.length}
                         activeFolderId={activeFolderId}
@@ -852,7 +917,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <ChannelFeed
                         hasTransferPanel={uploadQueue.length > 0 || downloadQueue.length > 0 || remoteImportJobs.length > 0 || driveSyncWarning !== null}
                         files={displayedFiles}
-                        loading={isLoading || isSearching}
+                        driveDirectoryPaths={driveChannelPaths?.directories ?? []}
+                        driveDirectoryIdsByPath={driveChannelPaths?.directory_ids ?? {}}
+                        driveDirectoryCreatedAtByPath={driveChannelPaths?.directory_created_at ?? {}}
+                        driveDirectoryLoadError={activeFolderId !== null && isDrivePathsError}
+                        loading={isLoading || isSearching || (activeFolderId !== null && isDrivePathsLoading)}
                         error={error}
                         selectedIds={selectedIds}
                         activeFolderId={activeFolderId}
@@ -860,6 +929,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onFileClick={handleFileClick}
                         onToggleSelection={handleToggleSelection}
                         onDelete={handleVisibleDelete}
+                        onDeleteFolder={handleDeleteFolder}
                         onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                         onDownloadAll={(members) => queueBulkDownload(members, activeFolderId)}
                         onPreview={handlePreview}
@@ -898,7 +968,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onDetails={handleShowDetails}
                         onManualUpload={handleManualUpload}
                         onFolderUpload={handleFolderUpload}
-                        showFolderUpload={true}
+                        showFolderUpload={activeFolderId !== null}
                         onToggleSelection={handleToggleSelection}
                         onDrop={handleDropOnFolder}
                         onDragStart={(ids) => setInternalDragIds(ids)}
@@ -1037,6 +1107,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         onResumeItem={resumeUploadItem}
                         onRetryItem={retryUploadItem}
                         onDismissItem={dismissUploadItem}
+                        onPauseGroup={pauseUploadGroup}
+                        onResumeGroup={resumeUploadGroup}
+                        onCancelGroup={cancelUploadGroup}
+                        onDismissGroup={dismissUploadGroup}
                     />
                     <DownloadQueue
                         items={downloadQueue}

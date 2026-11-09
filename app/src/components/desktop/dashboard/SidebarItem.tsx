@@ -204,7 +204,7 @@ export function SidebarItem({
                         </button>
                     )}
 
-                    {!isMember && onToggleVisibility && (
+                    {!isMember && folderId !== null && folderId >= 0 && onToggleVisibility && (
                         <button
                             onClick={() => { setContextMenu(null); onToggleVisibility(); }}
                             className="flex items-center gap-2 px-2 py-1.5 text-sm text-telegram-text hover:bg-telegram-hover rounded transition-colors text-left w-full"

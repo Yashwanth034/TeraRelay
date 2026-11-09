@@ -1,6 +1,8 @@
 import { useState, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { useQuery } from '@tanstack/react-query';
 import { useScrollAffordance } from '../../../hooks/useScrollAffordance';
-import { HardDrive, Folder, Plus, RefreshCw, LogOut, ChevronLeft, ChevronRight, Settings2, Trash2, Check, X, Eye, EyeOff, UserPlus } from 'lucide-react';
+import { HardDrive, Folder, Plus, RefreshCw, LogOut, ChevronLeft, ChevronRight, Settings2, Trash2, Check, X, Eye, EyeOff, UserPlus, Crown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SidebarItem } from './SidebarItem';
 import { TeraRelayBrand } from '../../shared/TeraRelayBrand';
@@ -31,6 +33,11 @@ import {
     useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
+
+interface TelegramAccountTier {
+    is_premium: boolean | null;
+    max_part_size_bytes: number;
+}
 
 const PRESET_COLORS = [
     '#3B82F6', // Blue
@@ -113,7 +120,7 @@ interface SidebarProps {
     onDelete: (id: number, name: string) => void;
     onRename: (id: number, name: string) => void;
     onToggleVisibility: (id: number, name: string, isPublic: boolean) => void;
-    onCreate: (name: string) => Promise<void>;
+    onCreate: (name: string, storageFolderId?: number) => Promise<void>;
     onJoinChannel: () => void;
     isSyncing: boolean;
     isConnected: boolean;
@@ -135,8 +142,37 @@ export function Sidebar({
     const scrollRef = useRef<HTMLElement>(null);
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
+    const [storageMode, setStorageMode] = useState<'dedicated' | 'shared'>('dedicated');
+    const [selectedStorageId, setSelectedStorageId] = useState<number | null>(null);
+    const storageChoices = folders.filter(folder => folder.id > 0 && folder.role === 'owner');
     const { t } = useTranslation();
     const { settings, updateSetting } = useSettings();
+    // Read-only status from the same Grammers account used for Boost uploads.
+    // Unknown/failed verification must never be displayed as "Free".
+    const accountTier = useQuery({
+        queryKey: ['telegram-account-tier'],
+        queryFn: () => invoke<TelegramAccountTier>('cmd_telegram_account_tier'),
+        enabled: isConnected,
+        retry: false,
+        staleTime: 60_000,
+        refetchInterval: 180_000,
+        refetchOnWindowFocus: true,
+        refetchOnMount: 'always',
+    });
+    const premiumStatus = isConnected && accountTier.isSuccess
+        ? accountTier.data.is_premium
+        : null;
+    const accountTierLabel = premiumStatus === true
+        ? 'Telegram Premium'
+        : premiumStatus === false
+            ? 'Telegram Free'
+            : accountTier.isFetching ? 'Checking Telegram plan' : 'Plan unavailable';
+    const accountTierDetail = premiumStatus === true
+        ? '4 GB per upload part'
+        : premiumStatus === false
+            ? '2 GB per upload part'
+            : '2 GB safe limit until verified';
+    const accountTierTooltip = 'Verified against your main Telegram account. TDLib is checked separately when uploading.';
 
     // Grouping States
     const [activeGroupId, setActiveGroupId] = useState<number | null | 'all'>('all');
@@ -210,9 +246,13 @@ export function Sidebar({
 
     const submitCreate = async () => {
         if (!newFolderName.trim()) return;
+        if (storageMode === 'shared' && selectedStorageId === null) return;
         try {
-            await onCreate(newFolderName);
+            await onCreate(newFolderName,
+                storageMode === 'shared' ? selectedStorageId! : undefined);
             setNewFolderName("");
+            setStorageMode('dedicated');
+            setSelectedStorageId(null);
             setShowNewFolderInput(false);
         } catch {
             // handled by parent
@@ -451,7 +491,7 @@ export function Sidebar({
                                 }}
                                 onDelete={() => onDelete(folder.id, folder.name)}
                                 onRename={() => onRename(folder.id, folder.name)}
-                                onToggleVisibility={() => onToggleVisibility(folder.id, folder.name, !!(folder.is_public || folder.username))}
+                                onToggleVisibility={folder.id < 0 ? undefined : () => onToggleVisibility(folder.id, folder.name, !!(folder.is_public || folder.username))}
                                 folderId={folder.id}
                                 isPublic={!!(folder.is_public || folder.username)}
                                 collapsed={settings.sidebarCollapsed}
@@ -471,6 +511,42 @@ export function Sidebar({
                         <PremiumSurface tone="soft" className="p-3">
                             <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-telegram-subtext">
                                 New channel
+                            </div>
+                            <div className="mb-2 space-y-2">
+                                <label htmlFor="new-channel-storage-mode" className="block text-xs text-telegram-subtext">Storage mode</label>
+                                <select
+                                    id="new-channel-storage-mode"
+                                    value={storageMode}
+                                    onChange={event => {
+                                        const mode = event.target.value as 'dedicated' | 'shared';
+                                        setStorageMode(mode);
+                                        setSelectedStorageId(mode === 'shared' ? (storageChoices[0]?.id ?? null) : null);
+                                    }}
+                                    className="w-full rounded-lg border border-telegram-border bg-telegram-bg px-2.5 py-2 text-xs text-telegram-text"
+                                >
+                                    <option value="dedicated">Dedicated Telegram channel</option>
+                                    <option value="shared">Share existing Telegram storage</option>
+                                </select>
+                                {storageMode === 'shared' && (
+                                    <>
+                                        <label htmlFor="new-channel-backing" className="block text-xs text-telegram-subtext">Store files in</label>
+                                        <select
+                                            id="new-channel-backing"
+                                            value={selectedStorageId ?? ''}
+                                            onChange={event => setSelectedStorageId(Number(event.target.value))}
+                                            disabled={storageChoices.length === 0}
+                                            className="w-full rounded-lg border border-telegram-border bg-telegram-bg px-2.5 py-2 text-xs text-telegram-text"
+                                        >
+                                            {storageChoices.length === 0 && <option value="">Create a dedicated channel first</option>}
+                                            {storageChoices.map(folder => (
+                                                <option key={folder.id} value={folder.id}>{folder.name}</option>
+                                            ))}
+                                        </select>
+                                        <p className="text-[11px] text-telegram-subtext">
+                                            Separate file lists in TeraRelay, shared Telegram storage. Telegram members of the backing channel can access every stored file.
+                                        </p>
+                                    </>
+                                )}
                             </div>
                             <div className="flex items-center gap-2">
                                 <input
@@ -506,7 +582,7 @@ export function Sidebar({
                                 <button
                                     type="button"
                                     onClick={submitCreate}
-                                    disabled={!newFolderName.trim()}
+                                    disabled={!newFolderName.trim() || (storageMode === 'shared' && selectedStorageId === null)}
                                     className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-telegram-primary text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
                                     aria-label="Create channel"
                                     title="Create channel"
@@ -547,6 +623,15 @@ export function Sidebar({
                             className="w-7 justify-center px-0"
                             title={isConnected ? t('common.connected_telegram') : t('common.disconnected_telegram')}
                         />
+                        {isConnected && (
+                            <PremiumBadge
+                                tone={premiumStatus === true ? 'primary' : premiumStatus === false ? 'neutral' : 'warning'}
+                                className="w-7 justify-center px-0"
+                                title={accountTierLabel + ' · ' + accountTierDetail + '. ' + accountTierTooltip}
+                            >
+                                <Crown className="h-3.5 w-3.5" aria-hidden="true" />
+                            </PremiumBadge>
+                        )}
                         <PremiumIconButton
                             label={isSyncing ? t('common.syncing') : t('common.sync')}
                             tone="primary"
@@ -568,6 +653,31 @@ export function Sidebar({
                         <PremiumBadge tone={isConnected ? 'success' : 'danger'} dot className="self-start">
                             {isConnected ? t('common.connected_telegram') : t('common.disconnected_telegram')}
                         </PremiumBadge>
+
+                        {isConnected && (
+                            <div className="flex items-center gap-2 min-w-0" title={accountTierTooltip}>
+                                <PremiumBadge
+                                    tone={premiumStatus === true ? 'primary' : premiumStatus === false ? 'neutral' : 'warning'}
+                                    className="shrink-0 gap-1"
+                                >
+                                    <Crown className="h-3 w-3" aria-hidden="true" />
+                                    {accountTierLabel}
+                                </PremiumBadge>
+                                <span className="text-[11px] text-telegram-subtext truncate" title={accountTierDetail}>
+                                    {accountTierDetail}
+                                </span>
+                                <button
+                                    type="button"
+                                    aria-label="Refresh Telegram account plan"
+                                    title="Refresh Telegram account plan"
+                                    onClick={() => { void accountTier.refetch(); }}
+                                    disabled={accountTier.isFetching}
+                                    className="ml-auto shrink-0 rounded p-1 text-telegram-subtext hover:text-telegram-text disabled:opacity-40"
+                                >
+                                    <RefreshCw className={`h-3 w-3 ${accountTier.isFetching ? 'animate-spin' : ''}`} aria-hidden="true" />
+                                </button>
+                            </div>
+                        )}
 
                         <div className="flex gap-2">
                             <PremiumButton

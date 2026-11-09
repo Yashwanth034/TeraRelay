@@ -36,6 +36,17 @@ pub struct LogicalFileManifestV1 {
     pub chunks: Vec<ManifestChunkV1>,
 }
 
+impl LogicalFileManifestV1 {
+    pub(crate) fn matches_move_destination(&self, destination: &Self, channel_id: &str) -> bool {
+        let mut expected = self.clone();
+        expected.logical_channel_id = channel_id.to_string();
+        for (chunk, moved) in expected.chunks.iter_mut().zip(&destination.chunks) {
+            chunk.message_id = moved.message_id;
+        }
+        &expected == destination
+    }
+}
+
 pub fn new_file_id() -> String {
     let bytes: [u8; 16] = rand::random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -613,6 +624,22 @@ pub fn delete_cached_file(conn: &sqlite::Connection, file_id: &str) -> Result<()
         .map_err(|e: sqlite::Error| e.to_string())?;
     drop(delete_chunks);
 
+    let logical_channel_id = {
+        let mut lookup = conn
+            .prepare("SELECT logical_channel_id FROM logical_files WHERE file_id = ? LIMIT 1")
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        lookup.bind((1, file_id)).map_err(|e| e.to_string())?;
+        if lookup.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            Some(
+                lookup
+                    .read::<String, _>("logical_channel_id")
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        }
+    };
+
     let mut delete_file = conn
         .prepare("DELETE FROM logical_files WHERE file_id = ?")
         .map_err(|e: sqlite::Error| e.to_string())?;
@@ -622,6 +649,22 @@ pub fn delete_cached_file(conn: &sqlite::Connection, file_id: &str) -> Result<()
     delete_file
         .next()
         .map_err(|e: sqlite::Error| e.to_string())?;
+    drop(delete_file);
+
+    // Logical-file deletion intentionally leaves the uploaded Drive folder
+    // hierarchy behind unless empty imported directories are pruned. Remove
+    // only now-empty descendants of this channel's imported root; folders
+    // containing another file, a pending write, or a symlink remain intact.
+    if let Some(channel_id) = logical_channel_id {
+        if let Err(error) =
+            crate::commands::drive_metadata::prune_empty_imported_channel_directories(
+                conn,
+                &channel_id,
+            )
+        {
+            log::warn!("Deleted logical file but could not prune empty Drive folders: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -663,6 +706,21 @@ pub fn cached_chunk_message_ids(
 mod tests {
     use super::*;
 
+    #[test]
+    fn move_retry_matches_content_in_the_destination_channel() {
+        let source = sample_manifest();
+        let mut destination = source.clone();
+        destination.logical_channel_id = "c".repeat(32);
+        for chunk in &mut destination.chunks {
+            chunk.message_id += 100;
+        }
+        assert!(source.matches_move_destination(&destination, &"c".repeat(32)));
+        assert!(!source.matches_move_destination(&destination, &"d".repeat(32)));
+
+        destination.chunks[0].sha256 = Some("e".repeat(64));
+        assert!(!source.matches_move_destination(&destination, &"c".repeat(32)));
+    }
+
     fn sample_manifest() -> LogicalFileManifestV1 {
         LogicalFileManifestV1 {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -688,6 +746,21 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn premium_four_gigabyte_document_keeps_exact_manifest_size() {
+        let mut manifest = sample_manifest();
+        manifest.original_name = "premium-video.mkv".to_string();
+        manifest.chunks = vec![ManifestChunkV1 {
+            index: 1,
+            message_id: 128,
+            size: 4_000_000_000,
+            sha256: None,
+        }];
+        manifest.total_size = 4_000_000_000;
+        let bytes = encode_manifest(&manifest).unwrap();
+        assert_eq!(decode_manifest(&bytes, None, None).unwrap(), manifest);
     }
 
     #[test]

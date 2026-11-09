@@ -154,6 +154,9 @@ pub fn require_owner_role(
             "This TeraRelay channel is read-only for members. Only the owner can modify it."
                 .to_string(),
         ),
+        Some(role) if role == "shared_deleted" => {
+            Err("This shared TeraRelay channel has been removed and is read-only.".to_string())
+        }
         _ => Ok(()),
     }
 }
@@ -212,6 +215,100 @@ pub fn ensure_logical_channel(
         .map_err(|e: sqlite::Error| e.to_string())?;
     stmt.next().map_err(|e: sqlite::Error| e.to_string())?;
     Ok(record)
+}
+
+/// Recover the original channel identity from a validated remote file manifest.
+///
+/// Never replace an existing identity that has local files/Drive references,
+/// and never alias one logical ID to two different Telegram channels.
+pub fn adopt_verified_channel_id(
+    conn: &sqlite::Connection,
+    backing_channel_id: i64,
+    verified_id: &str,
+    name: &str,
+    role: &str,
+) -> Result<(), String> {
+    if verified_id.len() != 32
+        || !verified_id
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err("Invalid recovered TeraRelay logical-channel ID".into());
+    }
+    let mut collision = conn
+        .prepare("SELECT backing_channel_id FROM logical_channels WHERE logical_id = ?")
+        .map_err(|e| e.to_string())?;
+    collision
+        .bind((1, verified_id))
+        .map_err(|e| e.to_string())?;
+    if collision.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let existing_backing = collision.read::<i64, _>(0).map_err(|e| e.to_string())?;
+        if existing_backing != backing_channel_id {
+            return Err(
+                "Recovered logical-channel ID is already assigned to a different Telegram channel"
+                    .into(),
+            );
+        }
+    }
+    drop(collision);
+
+    match read_logical_channel(conn, backing_channel_id)? {
+        Some(existing) if existing.logical_id == verified_id => Ok(()),
+        Some(existing) => {
+            // A fresh install may have briefly created an empty placeholder.
+            // Never rewrite an established channel or its Drive relationships.
+            let mut files = conn
+                .prepare("SELECT 1 FROM logical_files WHERE logical_channel_id = ? LIMIT 1")
+                .map_err(|e| e.to_string())?;
+            files
+                .bind((1, existing.logical_id.as_str()))
+                .map_err(|e| e.to_string())?;
+            if files.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+                return Err(
+                    "Existing channel has local file records; refusing identity replacement".into(),
+                );
+            }
+            drop(files);
+            let mut dirs = conn
+                .prepare(
+                    "SELECT 1 FROM drive_directories WHERE backing_logical_channel_id = ? LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            dirs.bind((1, existing.logical_id.as_str()))
+                .map_err(|e| e.to_string())?;
+            if dirs.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+                return Err(
+                    "Existing channel has Drive references; refusing identity replacement".into(),
+                );
+            }
+            drop(dirs);
+            let mut stmt = conn
+                .prepare("UPDATE logical_channels SET logical_id = ? WHERE backing_channel_id = ?")
+                .map_err(|e| e.to_string())?;
+            stmt.bind((1, verified_id)).map_err(|e| e.to_string())?;
+            stmt.bind((2, backing_channel_id))
+                .map_err(|e| e.to_string())?;
+            stmt.next().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        None => {
+            let now = unix_now();
+            let mut stmt = conn.prepare(
+                "INSERT INTO logical_channels
+                 (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+                 VALUES (?, ?, ?, ?, 1, ?, ?)"
+            ).map_err(|e| e.to_string())?;
+            stmt.bind((1, verified_id)).map_err(|e| e.to_string())?;
+            stmt.bind((2, backing_channel_id))
+                .map_err(|e| e.to_string())?;
+            stmt.bind((3, name)).map_err(|e| e.to_string())?;
+            stmt.bind((4, role)).map_err(|e| e.to_string())?;
+            stmt.bind((5, now)).map_err(|e| e.to_string())?;
+            stmt.bind((6, now)).map_err(|e| e.to_string())?;
+            stmt.next().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
 }
 
 fn upsert_joined_logical_channel(
@@ -515,6 +612,9 @@ pub async fn cmd_export_tera_channel_invite(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<TeraChannelInviteInfo, String> {
+    if folder_id < 0 {
+        return Err("Shared-storage channels do not have independent Telegram memberships. Share the dedicated backing channel instead.".into());
+    }
     let client = state
         .client
         .lock()
@@ -776,6 +876,84 @@ mod tests {
         let conn = test_channel_db("member");
         ensure_channel_can_upload(&conn, None).unwrap();
         require_owner_role(&conn, 999).unwrap();
+    }
+
+    #[test]
+    fn fresh_device_recovers_verified_channel_identity_without_replacing_data() {
+        let conn = test_channel_db("owner");
+        conn.execute(
+            "CREATE TABLE logical_files (logical_channel_id TEXT NOT NULL);
+             CREATE TABLE drive_directories (backing_logical_channel_id TEXT);",
+        )
+        .unwrap();
+        let original = "fedcba9876543210fedcba9876543210";
+        adopt_verified_channel_id(&conn, 987, original, "Movies", "owner").unwrap();
+        let channel = read_logical_channel(&conn, 987).unwrap().unwrap();
+        assert_eq!(channel.logical_id, original);
+        assert_eq!(channel.name, "Movies");
+        // Repeated scans cannot silently rename an existing recovered channel.
+        adopt_verified_channel_id(&conn, 987, original, "Renamed in Telegram", "owner").unwrap();
+        assert_eq!(
+            read_logical_channel(&conn, 987).unwrap().unwrap().name,
+            "Movies"
+        );
+
+        // A verified cloud ID can replace an empty local placeholder.
+        adopt_verified_channel_id(
+            &conn,
+            123,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "test",
+            "owner",
+        )
+        .unwrap();
+        assert_eq!(
+            read_logical_channel(&conn, 123)
+                .unwrap()
+                .unwrap()
+                .logical_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        // Never alias one remote identity to two different Telegram channels.
+        assert!(
+            adopt_verified_channel_id(&conn, 999, original, "Other", "owner")
+                .unwrap_err()
+                .contains("different Telegram channel")
+        );
+
+        // Existing local files and Drive references are authoritative until
+        // a separately validated migration is performed.
+        conn.execute("INSERT INTO logical_files VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')")
+            .unwrap();
+        assert!(adopt_verified_channel_id(
+            &conn,
+            123,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "test",
+            "owner"
+        )
+        .unwrap_err()
+        .contains("local file records"));
+        conn.execute("DELETE FROM logical_files").unwrap();
+        conn.execute("INSERT INTO drive_directories VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')")
+            .unwrap();
+        assert!(adopt_verified_channel_id(
+            &conn,
+            123,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "test",
+            "owner"
+        )
+        .unwrap_err()
+        .contains("Drive references"));
+        assert!(adopt_verified_channel_id(&conn, 999, "../bad", "test", "owner").is_err());
+        assert_eq!(
+            read_logical_channel(&conn, 123)
+                .unwrap()
+                .unwrap()
+                .logical_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]

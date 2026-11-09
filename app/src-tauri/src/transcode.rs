@@ -15,16 +15,25 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::commands::TelegramState;
 use crate::mp4_utils;
 use grammers_client::types::Media;
 use tauri::Manager;
+
+#[path = "streaming_cache_lifecycle.rs"]
+mod cache_lifecycle;
+
+/// Remove the previous process's temporary HLS/originals cache at startup.
+/// The startup path intentionally does not touch the fMP4 remux tree.
+pub fn clean_previous_session_stream_cache(root: &Path) {
+    cache_lifecycle::clean_previous_session_caches(root);
+}
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -227,15 +236,66 @@ fn finished_hls_variant(output_dir: &Path) -> bool {
     segments > 0
 }
 
+/// A live EVENT playlist becomes playable after three complete, validated
+/// 4-second segments. This never makes a partial variant eligible for cache
+/// reuse: finished_hls_variant still requires EXT-X-ENDLIST at completion.
+fn progressive_hls_playable(output_dir: &Path) -> bool {
+    let path = output_dir.join("index.m3u8");
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(playlist) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if !playlist.starts_with("#EXTM3U")
+        || !playlist
+            .lines()
+            .any(|line| line.trim() == "#EXT-X-PLAYLIST-TYPE:EVENT")
+        || playlist
+            .lines()
+            .any(|line| line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-MAP:"))
+    {
+        return false;
+    }
+    let mut segments = 0usize;
+    for segment in playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let Some(digits) = segment
+            .strip_prefix("segment_")
+            .and_then(|name| name.strip_suffix(".ts"))
+        else {
+            return false;
+        };
+        if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(meta) = std::fs::metadata(output_dir.join(segment)) else {
+            return false;
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 3
+}
+
 #[derive(Clone)]
 pub struct TranscodeManager {
     pub cache_root: PathBuf,
     pub ffmpeg_path: Arc<Mutex<Option<PathBuf>>>,
-    jobs: Arc<Mutex<HashMap<String, Arc<Mutex<TranscodeJob>>>>>,
+    pub(crate) jobs: Arc<Mutex<HashMap<String, Arc<Mutex<TranscodeJob>>>>>,
     // Different HLS qualities share the same original MP4 on disk. Allow
     // only one cache download per file while other qualities await it.
     original_download_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     max_cache_bytes: Arc<Mutex<u64>>,
+    pub(crate) sessions: Arc<Mutex<cache_lifecycle::StreamSessions>>,
 }
 
 impl TranscodeManager {
@@ -253,59 +313,91 @@ impl TranscodeManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             original_download_locks: Arc::new(Mutex::new(HashMap::new())),
             max_cache_bytes: Arc::new(Mutex::new(MAX_CACHE_BYTES)),
+            sessions: Arc::new(Mutex::new(cache_lifecycle::StreamSessions::default())),
         }
     }
 
     /// Clean up incomplete HLS directories from previous runs.
     fn clean_partial_outputs(cache_root: &Path) {
+        // Never traverse a symlink or an unrecognized media directory.
+        // A previous crash must not authorize deletion outside our own cache.
+        let real_dir = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        };
+        if !real_dir(cache_root) {
+            return;
+        }
         let hls_root = cache_root.join(HLS_DIR);
-        if let Ok(entries) = std::fs::read_dir(&hls_root) {
-            for entry in entries.flatten() {
-                let file_dir = entry.path();
-                if !file_dir.is_dir() {
-                    continue;
-                }
-                // An old FFmpeg run may have produced an index.m3u8 before
-                // exiting. Validate *each* quality independently, preserving
-                // finished siblings while removing only interrupted variants.
-                if let Ok(variants) = std::fs::read_dir(&file_dir) {
-                    for variant in variants.flatten() {
-                        let quality_dir = variant.path();
-                        if quality_dir.is_dir() && !finished_hls_variant(&quality_dir) {
-                            log::info!(
-                                "Transcode: Cleaning up incomplete HLS variant: {:?}",
-                                quality_dir
-                            );
-                            let _ = std::fs::remove_dir_all(&quality_dir);
+        if real_dir(&hls_root) {
+            if let Ok(entries) = std::fs::read_dir(&hls_root) {
+                for entry in entries.flatten() {
+                    let file_dir = entry.path();
+                    let key = entry.file_name();
+                    let Some(key) = key.to_str() else {
+                        continue;
+                    };
+                    if validate_cache_clear_selection(Some(key), None).is_err()
+                        || !real_dir(&file_dir)
+                    {
+                        continue;
+                    }
+                    if let Ok(variants) = std::fs::read_dir(&file_dir) {
+                        for variant in variants.flatten() {
+                            let quality_dir = variant.path();
+                            let quality = variant.file_name();
+                            let Some(quality) = quality.to_str() else {
+                                continue;
+                            };
+                            if !QUALITY_PRESETS.iter().any(|preset| preset.label == quality)
+                                || !real_dir(&quality_dir)
+                            {
+                                continue;
+                            }
+                            if !finished_hls_variant(&quality_dir) {
+                                log::info!(
+                                    "Transcode: Removing interrupted HLS variant: {:?}",
+                                    quality_dir
+                                );
+                                let _ = std::fs::remove_dir_all(&quality_dir);
+                            }
                         }
                     }
-                }
-                if std::fs::read_dir(&file_dir)
-                    .map(|mut entries| entries.next().is_none())
-                    .unwrap_or(false)
-                {
-                    let _ = std::fs::remove_dir(&file_dir);
+                    if std::fs::read_dir(&file_dir)
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_dir(&file_dir);
+                    }
                 }
             }
         }
-        // Also clean incomplete original downloads (zero-size or .part files)
-        let orig_root = cache_root.join(ORIGINALS_DIR);
-        if let Ok(entries) = std::fs::read_dir(&orig_root) {
+        let originals = cache_root.join(ORIGINALS_DIR);
+        if !real_dir(&originals) {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(&originals) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    let should_remove = if path.extension().and_then(|e| e.to_str()) == Some("part")
-                    {
-                        true // Orphaned partial download
-                    } else if let Ok(meta) = std::fs::metadata(&path) {
-                        meta.len() == 0 // Zero-size completed file
-                    } else {
-                        false
-                    };
-                    if should_remove {
-                        log::info!("Transcode: Removing incomplete file: {:?}", path);
-                        let _ = std::fs::remove_file(&path);
-                    }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let key = name
+                    .strip_suffix(".mp4.part")
+                    .or_else(|| name.strip_suffix(".mp4"));
+                if !key.is_some_and(|key| validate_cache_clear_selection(Some(key), None).is_ok()) {
+                    continue;
+                }
+                let Ok(info) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !info.is_file() || info.file_type().is_symlink() {
+                    continue;
+                }
+                if name.ends_with(".mp4.part") || info.len() == 0 {
+                    log::info!("Transcode: Removing interrupted cached source: {:?}", path);
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -432,6 +524,15 @@ impl TranscodeManager {
                 active_variants.push(self.hls_output_dir(&job.key.file_key(), &job.key.quality));
             }
         }
+        // Completed segments are STILL IN USE while an HLS player has them
+        // open. Don't evict under the decoder just because FFmpeg finished.
+        let sessions = self.sessions.lock().await;
+        for (file_key, viewers) in &sessions.viewers {
+            if !viewers.is_empty() {
+                active_originals.insert(self.original_path(file_key));
+                active_variants.push(self.cache_root.join(HLS_DIR).join(file_key));
+            }
+        }
 
         // Collect all files with their modification times
         let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
@@ -457,6 +558,11 @@ impl TranscodeManager {
         for (path, size, _) in &files {
             if freed >= target {
                 break;
+            }
+            // fMP4 has a separate reader-lease-aware eviction policy. HLS
+            // eviction must never delete an active native decoder's output.
+            if path.starts_with(self.cache_root.join("fmp4")) {
+                continue;
             }
             if active_originals.contains(path)
                 || active_variants
@@ -634,101 +740,126 @@ async fn test_ffmpeg(path: &Path) -> Result<bool, String> {
 
 /// Download the original MP4 file from Telegram to local cache.
 /// Returns the total file size on success.
-pub async fn cache_original(
-    client: &grammers_client::Client,
-    media: &Media,
+async fn cache_original(
+    source_url: &str,
     dest_path: &Path,
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
-    progress_callback: impl Fn(f32),
+    progress: impl Fn(f32),
 ) -> Result<u64, String> {
-    let total_size = match media {
-        Media::Document(d) => d.size() as u64,
-        _ => return Err("Not a document".to_string()),
-    };
-
-    // Ensure parent directory exists
     if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create cache dir: {}", e))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("Failed to create cache directory: {error}"))?;
     }
-
     let tmp_path = dest_path.with_extension("mp4.part");
-    let mut file = tokio::fs::File::create(&tmp_path)
+    let file = tokio::fs::File::create(&tmp_path)
         .await
-        .map_err(|e| format!("Failed to create cache file: {}", e))?;
-
-    use tokio::io::AsyncWriteExt;
-
-    let mut download_iter = client.iter_download(media);
-    download_iter = download_iter.chunk_size(65536);
-    let mut downloaded: u64 = 0;
-
-    loop {
-        tokio::select! {
-            _ = &mut *cancel_rx => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err("Cancelled".to_string());
-            }
-            result = download_iter.next() => {
-                match result {
-                    Ok(Some(chunk)) => {
-                        file.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
-                        downloaded += chunk.len() as u64;
-                        progress_callback(downloaded as f32 / total_size as f32);
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        return Err(format!("Download error: {}", e));
-                    }
-                }
-            }
-        }
+        .map_err(|error| format!("Failed to create cache file: {error}"))?;
+    // Cache the logical HTTP source, which can span many Telegram documents.
+    let result = tokio::select! {
+        _ = &mut *cancel_rx => Err("Cancelled".to_string()),
+        result = transfer_transcode_source(source_url, file, progress) => result,
+    };
+    let finalized = async {
+        let bytes = result?;
+        tokio::fs::rename(&tmp_path, dest_path)
+            .await
+            .map_err(|error| format!("Cannot finalize cached source: {error}"))?;
+        Ok(bytes)
     }
-
-    file.flush()
-        .await
-        .map_err(|e| format!("Flush error: {}", e))?;
-    drop(file);
-
-    // Validate file size matches expected size
-    let actual_size = tokio::fs::metadata(&tmp_path)
-        .await
-        .map_err(|e| format!("Metadata error: {}", e))?
-        .len();
-
-    if actual_size == 0 {
+    .await;
+    if finalized.is_err() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err("Downloaded zero bytes".to_string());
     }
-
-    if actual_size != total_size {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(format!(
-            "Incomplete download: expected {} bytes, received {} bytes",
-            total_size, actual_size
-        ));
-    }
-
-    // Rename .part → .mp4
-    tokio::fs::rename(&tmp_path, dest_path)
-        .await
-        .map_err(|e| format!("Rename error: {}", e))?;
-
-    log::info!(
-        "Transcode: Cached original to {:?} ({} bytes)",
-        dest_path,
-        actual_size
-    );
-    Ok(actual_size)
+    finalized
 }
 
 // ── HLS Transcode (Phase 3) ─────────────────────────────────────────────
+
+/// Stream the authenticated source from TeraRelay's own loopback server into
+/// FFmpeg stdin with bounded backpressure. That server already understands
+/// multi-part logical Telegram files, so no full-size MKV is cached locally.
+/// Never expose the stream token on the FFmpeg command line or error logs.
+async fn feed_progressive_source(
+    source_url: String,
+    stdin: tokio::process::ChildStdin,
+) -> Result<(), String> {
+    transfer_transcode_source(&source_url, stdin, |_| {}).await?;
+    Ok(())
+}
+
+async fn transfer_transcode_source(
+    source_url: &str,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+    progress: impl Fn(f32),
+) -> Result<u64, String> {
+    let parsed = reqwest::Url::parse(source_url).map_err(|_| "Invalid local stream URL")?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !parsed.path().starts_with("/stream/")
+        || parsed
+            .query_pairs()
+            .find(|(name, _)| name == "token")
+            .is_none()
+    {
+        return Err("Refusing non-local or unauthenticated transcoding input".into());
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Could not initialize local stream client")?;
+    let mut response = tokio::time::timeout(Duration::from_secs(90), client.get(source_url).send())
+        .await
+        .map_err(|_| "Timed out accessing local Telegram stream")?
+        .map_err(|_| "Could not connect to local Telegram stream")?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Local Telegram stream returned HTTP {} (not suitable for conversion)",
+            response.status().as_u16()
+        ));
+    }
+    let expected_bytes = response.content_length();
+    let mut fed_bytes: u64 = 0;
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(90), response.chunk())
+            .await
+            .map_err(|_| "Telegram source stalled during progressive conversion")?
+            .map_err(|_| "Telegram source failed while converting")?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        fed_bytes = fed_bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or("Source size overflow")?;
+        // Waiting for FFmpeg to accept data throttles network reads as needed.
+        tokio::time::timeout(Duration::from_secs(90), output.write_all(&chunk))
+            .await
+            .map_err(|_| "Transcoder stopped accepting source data")?
+            .map_err(|error| format!("Cannot write source data for conversion: {error}"))?;
+        if let Some(expected) = expected_bytes.filter(|size| *size > 0) {
+            progress((fed_bytes as f32 / expected as f32).min(1.0));
+        }
+    }
+    if fed_bytes == 0 || expected_bytes.is_some_and(|size| size != fed_bytes) {
+        return Err("Local Telegram stream ended before its advertised byte count".into());
+    }
+    output
+        .shutdown()
+        .await
+        .map_err(|error| format!("Could not finish source input: {error}"))?;
+    Ok(fed_bytes)
+}
 
 /// Run FFmpeg to generate a single HLS variant.
 pub async fn run_transcode(
     ffmpeg_path: &Path,
     input_path: &Path,
+    progressive_source_url: Option<String>,
     output_dir: &Path,
     quality: &QualityPreset,
     duration_secs: Option<f64>,
@@ -742,10 +873,19 @@ pub async fn run_transcode(
     let playlist_path = output_dir.join("index.m3u8");
     let segment_pattern = output_dir.join("segment_%03d.ts");
 
+    let progressive = progressive_source_url.is_some();
     let mut cmd = tokio::process::Command::new(ffmpeg_path);
     cmd.arg("-y") // Overwrite
+        .arg("-hide_banner")
+        // Non-seekable Matroska/WebM feeds are handed to FFmpeg over stdin.
+        // Never place the private localhost streaming token on FFmpeg argv.
+        .args(["-probesize", "5000000", "-analyzeduration", "3000000"])
         .arg("-i")
-        .arg(input_path)
+        .arg(if progressive {
+            std::ffi::OsStr::new("pipe:0")
+        } else {
+            input_path.as_os_str()
+        })
         // Explicit stream mapping: first video, optional audio, no subtitles/data
         .arg("-map")
         .arg("0:v:0")
@@ -754,11 +894,25 @@ pub async fn run_transcode(
         .arg("-sn") // No subtitles
         .arg("-dn") // No data streams
         .arg("-vf")
-        .arg(quality.scale_filter)
+        // Do not accidentally upscale a source that is below the requested
+        // quality. Source height is otherwise known only after probing stdin.
+        .arg(if progressive {
+            match quality.height {
+                360 => "scale=-2:min(ih\\,360)",
+                480 => "scale=-2:min(ih\\,480)",
+                720 => "scale=-2:min(ih\\,720)",
+                _ => "scale=-2:min(ih\\,1080)",
+            }
+        } else {
+            quality.scale_filter
+        })
         .arg("-c:v")
         .arg("libx264")
+        .args(["-pix_fmt", "yuv420p"])
         .arg("-preset")
-        .arg("veryfast")
+        // Lower encoding latency on a live Telegram stream. Offline/VOD
+        // retains its prior preset for consistent cached output quality.
+        .arg(if progressive { "superfast" } else { "veryfast" })
         .arg("-crf")
         .arg("23")
         // HLS segment boundaries require IDR frames. Without forcing them
@@ -781,18 +935,32 @@ pub async fn run_transcode(
         .arg("-hls_time")
         .arg(HLS_SEGMENT_TIME.to_string())
         .arg("-hls_playlist_type")
-        .arg("vod")
+        // An EVENT playlist may be viewed while FFmpeg is still writing;
+        // it is finalized with ENDLIST when conversion finishes.
+        .arg(if progressive { "event" } else { "vod" })
+        .arg("-hls_list_size")
+        .arg("0")
         .arg("-hls_segment_filename")
         .arg(&segment_pattern)
         .arg(&playlist_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
+        .stdin(if progressive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn FFmpeg: {}", e))?;
+    let mut feeder_task = if let Some(source_url) = progressive_source_url {
+        let stdin = child.stdin.take().ok_or("No FFmpeg source input pipe")?;
+        Some(tokio::spawn(feed_progressive_source(source_url, stdin)))
+    } else {
+        None
+    };
     let stderr = child.stderr.take().ok_or("No stderr pipe")?;
 
     // Parse FFmpeg progress from stderr, filter error lines inline for memory efficiency
@@ -804,6 +972,7 @@ pub async fn run_transcode(
     let parse_result: Result<(), String> = loop {
         tokio::select! {
             _ = &mut *cancel_rx => {
+                if let Some(task) = feeder_task.take() { task.abort(); }
                 // Kill the FFmpeg process
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -851,7 +1020,13 @@ pub async fn run_transcode(
         .await
         .map_err(|e| format!("FFmpeg wait error: {}", e))?;
 
-    // Check for cancellation or earlier error
+    // Check for cancellation or earlier error. Abort the input feeder as
+    // soon as FFmpeg exits abnormally; it may still be waiting for Telegram.
+    if !status.success() || parse_result.is_err() {
+        if let Some(task) = feeder_task.take() {
+            task.abort();
+        }
+    }
     parse_result?;
 
     if !status.success() {
@@ -866,6 +1041,22 @@ pub async fn run_transcode(
             status.code(),
             tail_msg
         ));
+    }
+
+    // Ensure the complete authenticated source reached the FFmpeg input,
+    // including every physical part of a multi-part logical Telegram file.
+    if let Some(task) = feeder_task.take() {
+        let input_result = task
+            .await
+            .map_err(|_| "FFmpeg source reader was interrupted".to_string())
+            .and_then(|result| result);
+        if let Err(error) = input_result {
+            // Even a successful FFmpeg exit may be caused by a prematurely
+            // closed Telegram source. Never make that truncated HLS cache
+            // eligible for later reuse.
+            let _ = std::fs::remove_dir_all(output_dir);
+            return Err(error);
+        }
     }
 
     // Only mark the output ready when FFmpeg has exited and every referenced
@@ -914,8 +1105,8 @@ pub async fn execute_transcode_pipeline(
     manager: &TranscodeManager,
     key: &TranscodeKey,
     quality_preset: &QualityPreset,
-    client: grammers_client::Client,
-    media: Media,
+    source_url: String,
+    progressive: bool,
     duration_secs: Option<f64>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -944,65 +1135,70 @@ pub async fn execute_transcode_pipeline(
     let original_path = manager.original_path(&file_key);
     let output_dir = manager.hls_output_dir(&file_key, &key.quality);
 
-    // ── Step 1: Cache original if needed ────────────────────────────
-    // Serialize the shared original across *different quality* HLS jobs.
-    // A concurrent quality must not truncate the first worker's .mp4.part
-    // file. Waiting remains cancellable and never locks the global job map.
-    let original_gate = manager.original_download_lock(&file_key).await;
-    let original_guard = tokio::select! {
-        guard = original_gate.lock_owned() => guard,
-        _ = &mut cancel_rx => {
+    // Files with streaming-safe demuxers are converted directly from an
+    // authenticated loopback source. Do not cache the entire Telegram movie.
+    if !progressive {
+        // ── Step 1: Cache original if needed ────────────────────────────
+        // Serialize the shared original across *different quality* HLS jobs.
+        // A concurrent quality must not truncate the first worker's .mp4.part
+        // file. Waiting remains cancellable and never locks the global job map.
+        let original_gate = manager.original_download_lock(&file_key).await;
+        let original_guard = tokio::select! {
+            guard = original_gate.lock_owned() => guard,
+            _ = &mut cancel_rx => {
+                job_arc.lock().await.phase = JobPhase::Cancelled;
+                return;
+            }
+        };
+        if cancel_rx.try_recv().is_ok() {
             job_arc.lock().await.phase = JobPhase::Cancelled;
             return;
         }
-    };
-    if cancel_rx.try_recv().is_ok() {
-        job_arc.lock().await.phase = JobPhase::Cancelled;
-        return;
-    }
-    if !original_path.exists() {
-        {
-            let mut job = job_arc.lock().await;
-            job.phase = JobPhase::CachingOriginal { progress: 0.0 };
-        }
+        if !original_path.exists() {
+            {
+                let mut job = job_arc.lock().await;
+                job.phase = JobPhase::CachingOriginal { progress: 0.0 };
+            }
 
-        let job_arc_clone = job_arc.clone();
-        match cache_original(
-            &client,
-            &media,
-            &original_path,
-            &mut cancel_rx,
-            |progress| {
+            let job_arc_clone = job_arc.clone();
+            match cache_original(&source_url, &original_path, &mut cancel_rx, |progress| {
                 let job_arc = job_arc_clone.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut job = job_arc.lock().await;
                     record_job_progress(&mut job, JobPhase::CachingOriginal { progress });
                 });
-            },
-        )
-        .await
-        {
-            Ok(size) => {
-                log::info!(
-                    "Transcode: Cached original ({} bytes), starting transcode...",
-                    size
-                );
-            }
-            Err(e) => {
-                let mut job = job_arc.lock().await;
-                if !matches!(job.phase, JobPhase::Cancelled) {
-                    job.phase = JobPhase::Error(format!("Cache failed: {}", e));
+            })
+            .await
+            {
+                Ok(size) => {
+                    log::info!(
+                        "Transcode: Cached original ({} bytes), starting transcode...",
+                        size
+                    );
                 }
-                return;
+                Err(e) => {
+                    let mut job = job_arc.lock().await;
+                    if !matches!(job.phase, JobPhase::Cancelled) {
+                        job.phase = JobPhase::Error(format!("Cache failed: {}", e));
+                    }
+                    return;
+                }
             }
         }
+
+        // The atomically completed original is now safe for other qualities.
+        drop(original_guard);
+    } else if cancel_rx.try_recv().is_ok() {
+        job_arc.lock().await.phase = JobPhase::Cancelled;
+        return;
     }
 
-    // The atomically completed original is now safe for other qualities.
-    drop(original_guard);
-
     // ── Step 2: Detect source resolution ────────────────────────────
-    let source_height = get_source_height(&original_path);
+    let source_height = if progressive {
+        None // FFmpeg probes the pipe; its filter prevents upscaling.
+    } else {
+        get_source_height(&original_path)
+    };
 
     {
         let mut job = job_arc.lock().await;
@@ -1034,6 +1230,7 @@ pub async fn execute_transcode_pipeline(
     let result = run_transcode(
         &ffmpeg_path,
         &original_path,
+        progressive.then_some(source_url),
         &output_dir,
         quality_preset,
         duration_secs,
@@ -1061,6 +1258,36 @@ pub async fn execute_transcode_pipeline(
             job.phase = JobPhase::Error(e);
         }
     }
+}
+
+fn supports_progressive_pipe(name: &str) -> bool {
+    // These container demuxers can read sequential input without seeking to
+    // a trailing MP4 moov atom. MP4 and other formats keep the existing
+    // full-cache fallback until a seek-safe input is available.
+    let lower = name.trim().to_ascii_lowercase();
+    [".mkv", ".webm", ".ts", ".m2ts", ".mpeg", ".mpg"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+fn local_progressive_url(
+    key: &TranscodeKey,
+    config: &crate::commands::streaming::StreamConfig,
+) -> String {
+    let folder = if key.folder_id == 0 {
+        "home".to_string()
+    } else {
+        key.folder_id.to_string()
+    };
+    // The private token never appears in FFmpeg arguments or diagnostics;
+    // reqwest alone uses the authenticated per-session loopback URL.
+    format!(
+        "http://127.0.0.1:{}/stream/{}/{}?token={}",
+        config.port,
+        folder,
+        key.message_id,
+        urlencoding::encode(&config.token),
+    )
 }
 
 // ── Tauri Commands ──────────────────────────────────────────────────────
@@ -1109,13 +1336,51 @@ pub async fn cmd_get_transcode_capabilities(
     })
 }
 
+/// Register an ephemeral player before it requests HLS conversion.
+#[tauri::command]
+pub async fn cmd_begin_stream_session(
+    file_key: String,
+    session_id: String,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
+) -> Result<(), String> {
+    manager.begin_stream_session(&file_key, &session_id).await
+}
+
+/// Release exactly one player's reservation. Last-viewer exit cancels all
+/// variants; final worker cleanup removes finished and partial HLS cache.
+#[tauri::command]
+pub async fn cmd_end_stream_session(
+    file_key: String,
+    session_id: String,
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
+    remux_state: tauri::State<'_, crate::fmp4_remux::Fmp4RemuxState>,
+) -> Result<(), String> {
+    manager.end_stream_session(&file_key, &session_id).await?;
+    if !manager
+        .sessions
+        .lock()
+        .await
+        .viewers
+        .get(&file_key)
+        .is_some_and(|viewers| !viewers.is_empty())
+    {
+        remux_state
+            .release_stream_source(manager.inner().clone(), file_key)
+            .await;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn cmd_prepare_transcoded_stream(
     message_id: i32,
     folder_id: Option<i64>,
     quality: String,
+    file_name: Option<String>,
+    session_id: String,
     state: tauri::State<'_, TelegramState>,
     manager: tauri::State<'_, Arc<TranscodeManager>>,
+    stream_config: tauri::State<'_, crate::commands::streaming::StreamConfig>,
 ) -> Result<TranscodePrepareResult, String> {
     let folder_id = folder_id.unwrap_or(0);
     let key = TranscodeKey {
@@ -1123,6 +1388,12 @@ pub async fn cmd_prepare_transcoded_stream(
         message_id,
         quality: quality.clone(),
     };
+    if !manager
+        .has_stream_session(&key.file_key(), &session_id)
+        .await
+    {
+        return Err("Streaming session already closed; refusing a stale conversion".into());
+    }
 
     // Validate quality
     let preset = QUALITY_PRESETS
@@ -1176,12 +1447,16 @@ pub async fn cmd_prepare_transcoded_stream(
                 progress: *progress,
                 playlist_url: None,
             }),
-            JobPhase::Transcoding { progress } => Ok(TranscodePrepareResult {
-                job_id: key.job_id(),
-                status: "transcoding".to_string(),
-                progress: *progress,
-                playlist_url: None,
-            }),
+            JobPhase::Transcoding { progress } => {
+                let playable = progressive_hls_playable(&output_dir);
+                Ok(TranscodePrepareResult {
+                    job_id: key.job_id(),
+                    status: if playable { "streaming" } else { "transcoding" }.to_string(),
+                    progress: *progress,
+                    playlist_url: playable
+                        .then(|| format!("/hls/{}/{}/index.m3u8", key.file_key(), quality)),
+                })
+            }
             JobPhase::Ready => Ok(TranscodePrepareResult {
                 job_id: key.job_id(),
                 status: "ready".to_string(),
@@ -1238,11 +1513,11 @@ pub async fn cmd_prepare_transcoded_stream(
         let duration_secs = get_duration_from_media(&client, message_id, folder_id, &state)
             .await
             .ok();
-        Ok::<_, String>((client, media, duration_secs))
+        Ok::<_, String>((media, duration_secs))
     }
     .await;
 
-    let (client, media, duration_secs) = match prepared {
+    let (media, duration_secs) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let mut job = job_arc.lock().await;
@@ -1250,18 +1525,36 @@ pub async fn cmd_prepare_transcoded_stream(
                 job.phase = JobPhase::Error(error.clone());
             }
             job.in_flight = false;
+            drop(job);
+            if let Err(error) = manager.finish_stream_disposal(&key.file_key()).await {
+                log::warn!("Streaming cache cleanup after failed preparation: {error}");
+            }
             return Err(error);
         }
     };
 
+    // Prefer the logical filename supplied by the file list: a Telegram
+    // multipart storage document can be named .partN, while its logical
+    // movie is MKV. Fall back to the document's own filename.
+    let source_name = file_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| match &media {
+            Media::Document(document) => document.name(),
+            _ => "",
+        });
+    let progressive = supports_progressive_pipe(source_name);
+    let source_url = local_progressive_url(&key, &stream_config);
+
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    if !manager
+        .arm_prepared_stream(&key.file_key(), &job_arc, cancel_tx)
+        .await
     {
-        let mut job = job_arc.lock().await;
-        if matches!(job.phase, JobPhase::Cancelled) {
-            job.in_flight = false;
-            return Err("Transcode cancelled during preparation".to_string());
+        if let Err(error) = manager.finish_stream_disposal(&key.file_key()).await {
+            log::warn!("Streaming cache cleanup after cancellation: {error}");
         }
-        job.cancel_tx = Some(cancel_tx);
+        return Err("Transcode cancelled during preparation".to_string());
     }
 
     let manager_clone = manager.inner().clone();
@@ -1274,8 +1567,8 @@ pub async fn cmd_prepare_transcoded_stream(
             &manager_clone,
             &key_clone,
             &preset_clone,
-            client,
-            media,
+            source_url,
+            progressive,
             duration_secs,
             cancel_rx,
         )
@@ -1289,7 +1582,14 @@ pub async fn cmd_prepare_transcoded_stream(
             job.in_flight = false;
         }
 
-        // LRU eviction after job completes
+        // An abandoned player must not leave completed HLS segments behind,
+        // even if FFmpeg finished just before its close event.
+        if let Err(error) = manager_clone
+            .finish_stream_disposal(&key_clone.file_key())
+            .await
+        {
+            log::warn!("Deferred streaming cache cleanup failed: {error}");
+        }
         manager_clone.evict_lru().await;
     });
 
@@ -1385,6 +1685,20 @@ pub async fn cmd_get_transcode_status(
     let (status_str, progress, error, playlist_url) = match &phase {
         JobPhase::NotStarted => ("pending".to_string(), 0.0, None, None),
         JobPhase::CachingOriginal { progress } => ("caching".to_string(), *progress, None, None),
+        JobPhase::Transcoding { progress }
+            if progressive_hls_playable(&manager.hls_output_dir(&key.file_key(), &key.quality)) =>
+        {
+            (
+                "streaming".to_string(),
+                *progress,
+                None,
+                Some(format!(
+                    "/hls/{}/{}/index.m3u8",
+                    key.file_key(),
+                    key.quality
+                )),
+            )
+        }
         JobPhase::Transcoding { progress } => ("transcoding".to_string(), *progress, None, None),
         JobPhase::Ready
             if finished_hls_variant(&manager.hls_output_dir(&key.file_key(), &key.quality)) =>
@@ -1422,14 +1736,26 @@ pub async fn cmd_get_transcode_status(
 #[tauri::command]
 pub async fn cmd_cancel_transcode(
     job_id: String,
+    session_id: Option<String>,
     manager: tauri::State<'_, Arc<TranscodeManager>>,
 ) -> Result<(), String> {
     let jobs = manager.jobs.lock().await;
     let job_arc = jobs
         .get(&job_id)
         .ok_or_else(|| format!("Job {} not found", job_id))?;
-
+    let sessions = manager.sessions.lock().await;
     let mut job = job_arc.lock().await;
+    let file_key = job.key.file_key();
+    let active = sessions.viewers.get(&file_key);
+    // Do not let an obsolete player cancel the replacement's reused job,
+    // or let one of two viewers interrupt the other's quality stream.
+    if session_id
+        .as_ref()
+        .is_some_and(|id| !active.is_some_and(|v| v.contains(&id.to_ascii_lowercase())))
+        || active.is_some_and(|viewers| viewers.len() > 1)
+    {
+        return Ok(());
+    }
     if let Some(tx) = job.cancel_tx.take() {
         let _ = tx.send(());
     }
@@ -1457,6 +1783,39 @@ pub async fn cmd_get_transcode_cache_info(
         max_bytes: max,
         cached_variants: vec![],
     })
+}
+
+/// A visible, safe streaming-storage action. This is deliberately separate
+/// from "Clear Local Cache", which manages thumbnails/TDLib data and must
+/// not delete uploads, Drive files or Telegram authorization.
+#[tauri::command]
+pub async fn cmd_clear_streaming_cache(
+    manager: tauri::State<'_, Arc<TranscodeManager>>,
+    remux_state: tauri::State<'_, crate::fmp4_remux::Fmp4RemuxState>,
+) -> Result<String, String> {
+    // Abort rather than delete content that a player, FFmpeg worker or
+    // active HTTP range reader could still be using.
+    let before = manager.total_cache_size();
+    remux_state.clear_idle_fmp4_cache(manager.inner()).await?;
+    {
+        let jobs = manager.jobs.lock().await;
+        let sessions = manager.sessions.lock().await;
+        if sessions.viewers.values().any(|viewers| !viewers.is_empty()) {
+            return Err("Close all video players before clearing streaming cache".into());
+        }
+        for job in jobs.values() {
+            if job.lock().await.in_flight {
+                return Err("Wait for streaming conversions to stop before clearing cache".into());
+            }
+        }
+        cache_lifecycle::clear_known_transcode_cache(&manager.cache_root)?;
+    }
+    let after = manager.total_cache_size();
+    Ok(format!(
+        "Streaming cache cleanup completed: freed {:.1} MiB; {:.1} MiB remains (unrecognized files are preserved).",
+        before.saturating_sub(after) as f64 / (1024.0 * 1024.0),
+        after as f64 / (1024.0 * 1024.0)
+    ))
 }
 
 #[tauri::command]
@@ -1609,7 +1968,7 @@ pub async fn cmd_get_detailed_transcode_cache(
 
 /// Cache deletion accepts only canonical remote file IDs and supported
 /// preset labels. User-provided paths must never reach remove_dir_all.
-fn validate_cache_clear_selection(
+pub(crate) fn validate_cache_clear_selection(
     file_key: Option<&str>,
     quality: Option<&str>,
 ) -> Result<(), String> {
@@ -1925,7 +2284,16 @@ async fn serve_hls_file(
         };
         return HttpResponse::Ok()
             .content_type("application/vnd.apple.mpegurl")
-            .insert_header(("Cache-Control", "private, max-age=10"))
+            // The live EVENT playlist changes every few seconds while
+            // FFmpeg appends segments. Never cache a growing playlist.
+            .insert_header((
+                "Cache-Control",
+                if playlist.contains("#EXT-X-ENDLIST") {
+                    "private, max-age=10"
+                } else {
+                    "private, no-store"
+                },
+            ))
             .body(authorized);
     }
 
@@ -2291,6 +2659,46 @@ mod playback_manager_tests {
         assert!(matches!(job.phase, JobPhase::CachingOriginal { progress } if progress == 0.0));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_partial_cleanup_never_follows_symlinked_or_unknown_cache_entries() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-safe-startup-{:032x}",
+            rand::random::<u128>()
+        ));
+        let external = std::env::temp_dir().join(format!(
+            "terarelay-safe-startup-external-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(root.join("hls")).unwrap();
+        std::fs::create_dir_all(root.join("originals")).unwrap();
+        std::fs::create_dir_all(external.join("720p")).unwrap();
+        std::fs::write(external.join("720p/precious"), b"do not touch").unwrap();
+        symlink(&external, root.join("hls/12_34")).unwrap();
+        std::fs::create_dir_all(root.join("hls/55_66")).unwrap();
+        symlink(&external.join("720p"), root.join("hls/55_66/720p")).unwrap();
+        std::fs::write(root.join("originals/12_34.mp4.part"), b"temporary").unwrap();
+        std::fs::write(root.join("originals/unknown-file.mp4.part"), b"user data").unwrap();
+        symlink(
+            &external.join("720p/precious"),
+            root.join("originals/55_66.mp4.part"),
+        )
+        .unwrap();
+        TranscodeManager::clean_partial_outputs(&root);
+        assert_eq!(
+            std::fs::read(external.join("720p/precious")).unwrap(),
+            b"do not touch"
+        );
+        assert!(root.join("hls/12_34").exists());
+        assert!(root.join("hls/55_66/720p").exists());
+        assert!(!root.join("originals/12_34.mp4.part").exists());
+        assert!(root.join("originals/unknown-file.mp4.part").exists());
+        assert!(root.join("originals/55_66.mp4.part").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
+    }
+
     #[test]
     fn startup_cleanup_preserves_finished_quality_and_prunes_crashed_sibling() {
         let root = std::env::temp_dir().join(format!(
@@ -2402,6 +2810,75 @@ mod playback_manager_tests {
             "eviction deleted an actively generated HLS segment"
         );
         assert!(!other.exists(), "inactive cache must remain evictable");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progressive_quality_only_uses_pipe_safe_containers() {
+        for name in [
+            "Movie.MKV",
+            "clip.webm",
+            "scene.ts",
+            "capture.M2TS",
+            "movie.mpeg",
+            "video.mpg",
+        ] {
+            assert!(
+                supports_progressive_pipe(name),
+                "valid streaming source: {name}"
+            );
+        }
+        for name in [
+            "movie.mp4",
+            "movie.mov",
+            "movie.avi",
+            "movie.mkv.exe",
+            "movie",
+            "../hls/index.m3u8",
+        ] {
+            assert!(
+                !supports_progressive_pipe(name),
+                "unsafe full-cache bypass: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_hls_requires_three_safe_complete_segments_without_cached_ready() {
+        let root = std::env::temp_dir().join(format!(
+            "terarelay-hls-event-qa-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let playlist = root.join("index.m3u8");
+        let header = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:EVENT\n";
+        std::fs::write(&playlist, header).unwrap();
+        assert!(!progressive_hls_playable(&root));
+        for n in 0..3 {
+            std::fs::write(root.join(format!("segment_{n:03}.ts")), b"transport stream").unwrap();
+            let body = (0..=n)
+                .map(|i| format!("#EXTINF:4.0,\nsegment_{i:03}.ts\n"))
+                .collect::<String>();
+            std::fs::write(&playlist, format!("{header}{body}")).unwrap();
+            assert_eq!(progressive_hls_playable(&root), n == 2);
+            assert!(
+                !finished_hls_variant(&root),
+                "live output must not become reusable cache"
+            );
+        }
+        std::fs::write(&playlist,
+            format!("{header}#EXTINF:4,\nsegment_000.ts\n#EXTINF:4,\nsegment_001.ts\n#EXTINF:4,\nsegment_002.ts\n../invalid.ts\n")).unwrap();
+        assert!(
+            !progressive_hls_playable(&root),
+            "traversal must be rejected"
+        );
+        std::fs::write(&playlist,
+            format!("{header}#EXTINF:4,\nsegment_000.ts\n#EXTINF:4,\nsegment_001.ts\n#EXTINF:4,\nsegment_002.ts\n#EXT-X-ENDLIST\n")).unwrap();
+        assert!(progressive_hls_playable(&root));
+        assert!(
+            finished_hls_variant(&root),
+            "finished event stream should be cache-reusable"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

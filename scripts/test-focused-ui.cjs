@@ -53,6 +53,7 @@ function test(name, fn) {
 }
 const queueProps = {
   onCancelAll() {}, onCancelItem() {}, onPauseItem() {}, onResumeItem() {}, onRetryItem() {},
+  onPauseGroup() {}, onResumeGroup() {}, onCancelGroup() {}, onDismissItem() {}, onDismissGroup() {},
 };
 
 test('isolated real Telegram QA keeps API hash ephemeral when secure storage is unavailable', () => {
@@ -129,6 +130,154 @@ test('transfer queues expose named actions, determinate progress and completion/
       }
     }
   }
+});
+
+test('folder upload UI keeps a collection compact with weighted progress and group controls', () => {
+  const { UploadQueue } = load(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'));
+  const shared = {
+    folderId: 9100001,
+    uploadGroupId: 'season-group',
+    uploadGroupName: 'Season 01',
+    uploadGroupFileCount: 2,
+    uploadGroupTotalBytes: 300,
+    uploadGroupSourceRoot: '/fixture',
+    driveFolderDirectoryId: 'a'.repeat(32),
+  };
+  const html = renderToStaticMarkup(React.createElement(UploadQueue, {
+    ...queueProps,
+    items: [
+      {
+        ...shared, id: 'episode-01', path: '/fixture/Episode 01.mkv',
+        uploadGroupRelativePath: 'Episode 01.mkv', status: 'uploading',
+        totalBytes: 200, uploadedBytes: 100, progress: 50,
+      },
+      {
+        ...shared, id: 'episode-02', path: '/fixture/Episode 02.mkv',
+        uploadGroupRelativePath: 'Episode 02.mkv', status: 'paused',
+        totalBytes: 100, uploadedBytes: 0, progress: 0,
+      },
+    ],
+  }));
+  assert.ok(html.includes('Season 01'), 'Collapsed collection name is missing');
+  assert.ok(!html.includes('Episode 01.mkv') && !html.includes('Episode 02.mkv'),
+    'Collapsed collection leaks individual episode rows into the upload dock');
+  assert.ok(html.includes('100 B / 300 B'), 'Collection byte summary does not use confirmed per-file bytes');
+  assert.ok(html.includes('aria-valuenow="33"'), 'Collection progress is not weighted by bytes');
+  for (const label of [
+    'Pause folder upload Season 01',
+    'Resume folder upload Season 01',
+    'Cancel folder upload Season 01',
+  ]) {
+    assert.ok(html.includes(label), 'Collection is missing its group action: ' + label);
+  }
+  assert.ok(html.includes('aria-controls="folder-upload-files-season-group"'),
+    'Collection disclosure is not linked to its details list');
+  assert.ok(html.includes('Folder upload'), 'Collection card is missing its explicit upload context');
+  assert.ok(html.includes('View files'), 'Collection card does not invite expansion');
+  assert.ok(html.includes('border-telegram-primary/20'), 'Collection card is missing its distinct collection styling');
+});
+
+test('folder upload episode rows use a distinct progress card with per-file controls', () => {
+  const { FolderUploadEpisodeRow } = load(path.join(root, 'app/src/components/desktop/dashboard/FolderUploadEpisodeRow.tsx'));
+  const item = {
+    id: 'episode-01', path: '/fixture/Episode 01.mkv',
+    uploadGroupRelativePath: 'Season 01/Episode 01.mkv',
+    status: 'uploading', totalBytes: 200, uploadedBytes: 100, progress: 50,
+    speedBytesPerSec: 40,
+  };
+  const noop = () => {};
+  const html = renderToStaticMarkup(React.createElement(FolderUploadEpisodeRow, {
+    index: 0, item, onPause: noop, onResume: noop, onCancel: noop, onRetry: noop,
+  }));
+  assert.ok(html.includes('tr-folder-upload-episode'), 'Expanded folder item is not a custom episode card');
+  assert.ok(html.includes('Season 01/Episode 01.mkv'), 'Episode relative path is hidden');
+  assert.ok(html.includes('50%'), 'Per-file transfer progress is missing');
+  assert.ok(html.includes('aria-label="Pause Season 01/Episode 01.mkv"'), 'Episode pause action is missing');
+  assert.ok(html.includes('aria-label="Cancel Season 01/Episode 01.mkv"'), 'Episode cancel action is missing');
+});
+
+test('folder collections are interleaved with ordinary files by their first episode date', () => {
+  const { buildChannelFolderTree, buildChannelTimeline } = load(path.join(root, 'app/src/channelFolderTree.ts'));
+  const file = (id, name, date, folderPath) => ({
+    id, name, size: 100, sizeStr: '100 B', type: 'file',
+    created_at: date, logical_file_id: name, drive_relative_path: folderPath,
+  });
+  const files = [
+    file(100, 'Earlier.mkv', '2026-11-08T10:00:00Z'),
+    file(200, 'Episode 01.mp4', '2026-11-08T11:00:00Z', 'Season 01'),
+    file(201, 'Episode 02.mp4', '2026-11-08T11:00:02Z', 'Season 01'),
+    file(300, 'Later.mkv', '2026-11-08T12:00:00Z'),
+  ];
+  const tree = buildChannelFolderTree(files, ['Season 01'], { 'Season 01': 'drive-season-01' });
+  const timeline = buildChannelTimeline(tree.folders, tree.looseFiles);
+  assert.deepEqual(timeline.map(item => item.kind === 'folder' ? item.folder.name : item.file.name), [
+    'Earlier.mkv', 'Season 01', 'Later.mkv',
+  ], 'Folder must appear chronologically between older and newer channel files');
+  assert.equal(timeline[1].kind, 'folder');
+  assert.equal(timeline[1].timestamp, new Date('2026-11-08T11:00:00Z').getTime(),
+    'Folder should anchor to its earliest uploaded episode');
+});
+
+test('empty folders use their persisted Drive creation time in the channel timeline', () => {
+  const { buildChannelFolderTree, buildChannelTimeline } = load(path.join(root, 'app/src/channelFolderTree.ts'));
+  const tree = buildChannelFolderTree([
+    { id: 1, name: 'Old.mkv', size: 10, type: 'file', created_at: '2026-11-08T10:00:00Z' },
+    { id: 2, name: 'New.mkv', size: 10, type: 'file', created_at: '2026-11-08T12:00:00Z' },
+  ], ['Empty upload'], { 'Empty upload': 'empty-id' }, {
+    'Empty upload': new Date('2026-11-08T11:00:00Z').getTime(),
+  });
+  const timeline = buildChannelTimeline(tree.folders, tree.looseFiles);
+  assert.deepEqual(timeline.map(item => item.kind === 'folder' ? item.folder.name : item.file.name), [
+    'Old.mkv', 'Empty upload', 'New.mkv',
+  ]);
+});
+
+test('channel folder rows expose explicit delete actions only for writable mapped folders', () => {
+  const { ChannelFolderGroups } = load(path.join(root, 'app/src/components/desktop/dashboard/ChannelFolderGroups.tsx'));
+  const noop = () => {};
+  const folder = {
+    name: 'Season 01', path: 'Season 01', directory_id: 'drive-season-01',
+    folders: [], files: [], file_count: 0, total_bytes: 0,
+  };
+  const props = {
+    folders: [folder], allFiles: [], activeFolderId: 9100001, selectedIds: [],
+    onFileClick: noop, onToggleSelection: noop, onDownload: noop,
+    onDownloadAll: noop, onPreview: noop, onMore: noop,
+    onDeleteFolder: noop,
+  };
+  const writable = renderToStaticMarkup(React.createElement(ChannelFolderGroups, props));
+  assert.ok(writable.includes('Delete folder Season 01 and 0 files'),
+    'Mapped folder is missing its delete control');
+  const readOnly = renderToStaticMarkup(React.createElement(ChannelFolderGroups, {
+    ...props, readOnly: true,
+  }));
+  assert.ok(!readOnly.includes('Delete folder Season 01'),
+    'Read-only channel exposes a destructive folder action');
+});
+
+test('channel folder tree preserves nested folders, empty folders and file totals', () => {
+  const { buildChannelFolderTree } = load(path.join(root, 'app/src/channelFolderTree.ts'));
+  const file = (id, name, path, size) => ({
+    id, name, size, sizeStr: size + ' B', type: 'file', logical_file_id: id,
+    drive_relative_path: path,
+  });
+  const tree = buildChannelFolderTree([
+    file('ep1', 'Episode 01.mp4', 'Season 01', 100),
+    file('ep2', 'Episode 02.mp4', 'Season 01', 200),
+    file('trailer', 'Trailer.mkv', 'Season 01/Extras', 300),
+    file('outside', 'Loose.mp4', undefined, 50),
+    file('unsafe', 'Escaped.mp4', '../outside', 20),
+  ], ['Season 01', 'Season 01/Extras', 'Empty folder']);
+  const season = tree.folders.find(folder => folder.name === 'Season 01');
+  const empty = tree.folders.find(folder => folder.name === 'Empty folder');
+  assert.ok(season, 'Season directory is missing');
+  assert.equal(season.file_count, 3, 'Nested files are not included in the season total');
+  assert.equal(season.total_bytes, 600, 'Nested bytes are not included in the season total');
+  assert.equal(season.files.length, 2, 'Season root episodes are not retained');
+  assert.equal(season.folders[0].name, 'Extras', 'Nested subfolder was flattened');
+  assert.equal(season.folders[0].files[0].name, 'Trailer.mkv', 'Nested file was not placed inside Extras');
+  assert.equal(empty.file_count, 0, 'Empty folders must remain visible with an accurate count');
+  assert.equal(tree.looseFiles.length, 2, 'Unmapped and unsafe paths must remain at channel root');
 });
 
 test('adaptive video player exposes named modal controls and protects native widget keys', () => {
@@ -299,11 +448,12 @@ function remuxHarness(options = {}) {
     transcodeCapsRef: { current: { available: true } }, remuxGenerationRef: { current: 0 },
     selectedAudioStreamRef: { current: 2 }, streamBaseRef: { current: 'http://localhost' },
     streamAuthRef: { current: 'qa' }, abortMseRef: { current() {} }, logRef: { current() {} },
+    streamSessionRef: { current: { id: 'qa-session', key: '1_7', ready: Promise.resolve() } },
     savedTimeRef: { current: 0 }, remuxWindowRef: { current: { start: 0, complete: false, key: null } },
     pendingSeekRef: { current: null }, nativePlaybackStartedRef: { current: true },
     nativeUserPauseRef: { current: !!options.paused },
     nativeCompletedRetryRef: { current: 0 }, setMovieTime() {},
-    setNativeDecoderRevision: () => {},
+    setNativeDecoderRevision: () => { state.decoderRevisionReset = true; },
     fallbackVideoRef: { current: {
       currentTime: 3.5, paused: !!options.paused,
       pause() { state.oldPaused = true; },
@@ -464,7 +614,9 @@ test('silent native startup recovers while playable and stale sources are left a
     { name: 'silent stalled decoder', expected: 1 },
     { name: 'already has a frame', readyState: 2, expected: 0 },
     { name: 'already playing', phase: 'playing', expected: 0 },
-    { name: 'buffering after playback began', played: true, expected: 0 },
+    { name: 'persistent stall after playback began', played: true, expected: 1 },
+    { name: 'brief buffering after playback began', played: true, advanced: true, expected: 0 },
+    { name: 'explicitly paused', paused: true, expected: 0 },
     { name: 'source changed', stale: true, expected: 0 },
     { name: 'HLS owns playback', mode: 'hls', expected: 0 },
     { name: 'conversion active', converting: true, expected: 0 },
@@ -478,15 +630,17 @@ test('silent native startup recovers while playable and stale sources are left a
       fmp4RemuxingRef: { current: !!scenario.converting }, remuxGenerationRef: generation,
       transcodeCapabilities: { available: scenario.available !== false },
       transcodeCapsRef: { current: { available: scenario.available !== false } },
-      fallbackVideoRef: { current: { readyState: scenario.readyState || 0 } },
+      fallbackVideoRef: { current: { readyState: scenario.readyState || 0, currentTime: 0, seeking: false } },
       nativePlaybackStartedRef: { current: !!scenario.played },
-      HTMLMediaElement: { HAVE_CURRENT_DATA: 2 },
+      nativeUserPauseRef: { current: !!scenario.paused },
+      HTMLMediaElement: { HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3 },
       handleProgressiveDetected() { attempts++; },
       logRef: { current() {} }, setNativePhase() {}, setNativeError(value) { error = value; },
       setTimeout(callback) { timer = callback; return 1; }, clearTimeout() {},
     };
     vm.runInNewContext(js, context)();
     if (scenario.stale) generation.current++;
+    if (scenario.advanced) context.fallbackVideoRef.current.currentTime += 1;
     timer?.();
     assert.equal(attempts, scenario.expected, scenario.name);
     assert.equal(!!error, !!scenario.error, scenario.name + ' error');
@@ -522,6 +676,7 @@ test('compatibility conversion releases the original network source before start
   };
   context.invoke = async () => {
     assert.ok(paused && removed && loaded, 'Original video still competes for network while conversion starts');
+    assert.ok(!state.decoderRevisionReset, 'Decoder reset would remount the old video while conversion is starting');
     throw new Error('fixture backend conversion failure');
   };
   start();

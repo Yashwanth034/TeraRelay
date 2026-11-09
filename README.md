@@ -97,17 +97,16 @@ Beyond basic folders, the desktop app includes tools for organizing and checking
 
 Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/latest) for distribution limits.
 
-## What's improved in v0.2.3
+## What's improved in v0.2.4
 
-- **Reliable new-channel uploads:** Telegram message IDs may repeat across channels. The Drive index now migrates safely instead of rejecting a chunk belonging to another channel.
-- **Safe upload recovery:** a failed local reindex rolls back without losing existing chunk records, so Retry can recover the original Telegram upload rather than blindly uploading another copy.
-- **Cleaner completed downloads:** successful resumable downloads remove their SQLite journal/lease files; active or interrupted downloads still retain their private recovery data.
-- **Better video playback recovery:** HTTP 5xx stream failures have FFmpeg-compatible retries, a short diagnostic, and a manual retry action. Permanently missing Telegram chunks still require recovery.
-- **Stable renamed channels:** channels already registered in TeraRelay remain discoverable even if the Telegram title is edited outside the app.
+- **Folder uploads:** clearer per-file episode rows, ordered queue processing, and folder grouping in the channel timeline.
+- **Folder management:** nested Drive folder inventory and a whole-folder delete action, including empty folders.
+- **Drive reliability:** stronger channel-scoped identity, shared-channel handling, metadata/read-lifetime recovery, and transfer-queue regression coverage.
+- **Video playback:** improved progressive HLS/fMP4 cleanup and seeking, plus an in-player **Open with** option for installed VLC or mpv.
+- **Linux-only distribution:** this public release provides Linux x86_64 desktop packages. Windows, macOS, Android, and iOS installers are not part of this release.
 
-No stale or deleted-channel folders are automatically removed: verify the remote channel and preserve the data before reconciling duplicate Drive entries.
+Older release notes belong in the [full changelog](CHANGELOG.md) rather than repeating entire past versions in this README.
 
-**Older release notes belong in the [full changelog](CHANGELOG.md)** rather than repeating entire past versions in this README.
 
 ## Practical limits and security
 

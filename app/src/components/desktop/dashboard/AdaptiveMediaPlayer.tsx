@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { X, ChevronLeft, ChevronRight, AlertTriangle, Loader2, RefreshCw, StopCircle, Maximize2, Minimize2, Volume2, VolumeX, Volume1, Play, Activity, Trash2, Zap } from 'lucide-react';
+import { X, AlertTriangle, Loader2, RefreshCw, StopCircle, Maximize2, Minimize2, Volume2, VolumeX, Volume1, Play, Pause, RotateCcw, RotateCw, AudioLines, Captions, Monitor, Download, Activity, Trash2, Zap, ExternalLink, ChevronDown } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
 import Hls from 'hls.js';
 import { TelegramFile, StreamingQuality, TranscodePrepareResult, TranscodeJobPhase, TranscodeCapabilities, MediaTrackInfo, MediaTrackProbe, QUALITY_LABELS, HLS_QUALITIES } from '../../../types';
 import { useAdaptiveStreaming } from '../../../hooks/useAdaptiveStreaming';
-import { QualitySelector } from '../../shared/QualitySelector';
-import { PlaybackTimeline, authorizeHlsChildRequestUrl, buildAuthenticatedHlsUrl, buildAuthenticatedRemuxUrl, buildAuthenticatedSubtitleUrl, chooseCompatibilityQuality, describePlaybackError, eligibleNativeMemoryMp4, fetchBoundedNativeMp4, nativeRemuxRevisionUrl, nativeProgressiveRevisionUrl, planPlaybackSeek, restoreCompatibilityPlayback, shouldDeferCompletedRemuxSeek, shouldRemuxAfterNativeDecoderFailure, shouldResumeAfterRemuxFinish, shiftSubtitleCues } from './playbackTimeline';
+
+import { authorizeHlsChildRequestUrl, buildAuthenticatedHlsUrl, buildAuthenticatedRemuxUrl, buildAuthenticatedSubtitleUrl, chooseCompatibilityQuality, describePlaybackError, eligibleNativeMemoryMp4, fetchBoundedNativeMp4, nativeRemuxRevisionUrl, nativeProgressiveRevisionUrl, planPlaybackSeek, restoreCompatibilityPlayback, shouldDeferCompletedRemuxSeek, shouldRemuxAfterNativeDecoderFailure, shouldResumeAfterRemuxFinish, shiftSubtitleCues } from './playbackTimeline';
 
 interface AdaptiveMediaPlayerProps {
     file: TelegramFile;
@@ -15,15 +15,30 @@ interface AdaptiveMediaPlayerProps {
     onClose: () => void;
     onNext?: () => void;
     onPrev?: () => void;
+    onDownload?: () => void;
     currentIndex?: number;
     totalItems?: number;
     streamUrl: string;
     preferRemux?: boolean;
 }
 
+interface ExternalVideoPlayer {
+    id: string;
+    name: string;
+}
+
 // ── HLS Quality State ────────────────────────────────────────────────
 
 const STREAM_BASE_KEY = '/stream/';
+
+function formatPlayerClock(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) return '00:00';
+    const rounded = Math.floor(seconds);
+    const hours = Math.floor(rounded / 3600);
+    const minutes = Math.floor((rounded % 3600) / 60).toString().padStart(2, '0');
+    const secs = (rounded % 60).toString().padStart(2, '0');
+    return hours > 0 ? `${hours}:${minutes}:${secs}` : `${minutes}:${secs}`;
+}
 
 function mediaTrackLabel(track: MediaTrackInfo, ordinal: number, kind: 'Audio' | 'Subtitle'): string {
     const name = track.title?.trim() || track.language?.toUpperCase() || `${kind} ${ordinal}`;
@@ -40,6 +55,7 @@ export function AdaptiveMediaPlayer({
     onClose,
     onNext,
     onPrev,
+    onDownload,
     currentIndex,
     totalItems,
     streamUrl,
@@ -107,6 +123,7 @@ export function AdaptiveMediaPlayer({
     const abortMseRef = useRef<(() => void) | null>(null);
     const logRef = useRef<((msg: string, ...args: unknown[]) => void) | null>(null);
     const transcodeCapsRef = useRef<TranscodeCapabilities | null>(null);
+    const streamSessionRef = useRef<{ id: string; key: string; ready: Promise<void> } | null>(null);
 
     // ── Handle progressive MP4 detection — trigger fMP4 remux ──────
     const handleProgressiveDetected = useCallback((requestedTime?: number) => {
@@ -118,7 +135,6 @@ export function AdaptiveMediaPlayer({
         // decoder recovery allowance; do not inherit a previous window's
         // failed parser state.
         nativeCompletedRetryRef.current = 0;
-        setNativeDecoderRevision(0);
         setFmp4Remuxing(true);
         setFmp4RemuxError(null);
         const gen = remuxGenerationRef.current;
@@ -139,7 +155,13 @@ export function AdaptiveMediaPlayer({
                     video.load();
                 }
                 const previousKey = remuxWindowRef.current.key;
-                if (previousKey) await invoke('cmd_cancel_fmp4_stream', { fileKey: previousKey });
+                if (previousKey) await invoke('cmd_cancel_fmp4_stream', { fileKey: previousKey, sessionId: streamSessionRef.current?.id });
+                const session = streamSessionRef.current;
+                if (!session || session.key !== `${activeFolderId ?? 0}_${file.id}`) {
+                    throw new Error('Player session closed before remux preparation.');
+                }
+                await session.ready;
+                if (gen !== remuxGenerationRef.current || streamSessionRef.current !== session) return;
                 const result = await invoke<{
                     url: string; output_file_key: string; status: string; window_start_secs?: number;
                 }>('cmd_prepare_fmp4_stream', {
@@ -147,9 +169,10 @@ export function AdaptiveMediaPlayer({
                     folderId: activeFolderId,
                     audioStreamIndex: selectedAudioStreamRef.current,
                     startTimeSecs: position,
+                    sessionId: session.id,
                 });
                 if (gen !== remuxGenerationRef.current) {
-                    invoke('cmd_cancel_fmp4_stream', { fileKey: result.output_file_key }).catch(() => {});
+                    invoke('cmd_cancel_fmp4_stream', { fileKey: result.output_file_key, sessionId: session.id }).catch(() => {});
                     return;
                 }
                 remuxWindowRef.current = {
@@ -162,6 +185,7 @@ export function AdaptiveMediaPlayer({
                 );
                 if (!fullUrl) throw new Error('Invalid local fMP4 remux URL');
                 if (result.status === 'ready') {
+                    setNativeDecoderRevision(0);
                     setFmp4StreamUrl(fullUrl);
                     setFmp4Remuxing(false);
                     fmp4RemuxingRef.current = false;
@@ -180,6 +204,7 @@ export function AdaptiveMediaPlayer({
                     if (status.status !== 'ready') continue;
                     const wasPlayingPartial = playingPartial;
                     if (!playingPartial) {
+                        setNativeDecoderRevision(0);
                         setFmp4StreamUrl(fullUrl);
                         setFmp4Remuxing(false);
                         setRestartNonce(n => n + 1);
@@ -237,13 +262,14 @@ export function AdaptiveMediaPlayer({
         [handleProgressiveDetected],
     );
 
+    // Native HTTP ranges let the decoder fetch and seek without a JavaScript
+    // downloader that can throttle original media below its playback bitrate.
     const {
         videoRef: mseVideoRef,
         phase: msePhase,
         error: mseError,
         tracks,
         loadProgress,
-        currentQuality,
         setQuality,
         adaptiveMode,
         setAdaptiveMode,
@@ -251,7 +277,7 @@ export function AdaptiveMediaPlayer({
         useFallback,
         fallbackUrl,
         abort: abortMse,
-    } = useAdaptiveStreaming(restartStreamUrl, file.name, progressiveCallback, !!fmp4StreamUrl);
+    } = useAdaptiveStreaming(restartStreamUrl, file.name, progressiveCallback, true);
 
     // A native decoder retry changes ONLY the <video> URL and React key,
     // never useAdaptiveStreaming's pipeline URL. fMP4 aliases must be
@@ -298,7 +324,6 @@ export function AdaptiveMediaPlayer({
     // check. Retry once capabilities arrive instead of losing that fallback.
     useEffect(() => {
         if (nativePhase === 'error' && transcodeCapabilities?.available
-            && (preferRemux || file.name.toLowerCase().endsWith('.mp4'))
             && !fmp4StreamUrl && !fmp4RemuxError && !fmp4RemuxingRef.current
             // Opted-in private-memory playback must not silently convert
             // an ordinary MP4 if its decoder reports another error.
@@ -308,7 +333,7 @@ export function AdaptiveMediaPlayer({
             && shouldRemuxAfterNativeDecoderFailure(preferRemux, nativeOriginalRetryRef.current)) {
             handleProgressiveDetected();
         }
-    }, [nativePhase, transcodeCapabilities, preferRemux, file.name,
+    }, [nativePhase, transcodeCapabilities, preferRemux,
         fmp4StreamUrl, fmp4RemuxError, memoryMediaUrl, memoryLoading, handleProgressiveDetected]);
     const [mediaTracks, setMediaTracks] = useState<MediaTrackProbe>({ audio_tracks: [], subtitle_tracks: [] });
     const sourceDuration = mediaTracks.duration_secs != null && Number.isFinite(mediaTracks.duration_secs) && mediaTracks.duration_secs > 0
@@ -319,6 +344,9 @@ export function AdaptiveMediaPlayer({
     const [selectedSubtitleStream, setSelectedSubtitleStream] = useState<number | null>(null);
     const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
     const [subtitleLoading, setSubtitleLoading] = useState(false);
+    const showSubtitleTrack = useCallback((element: HTMLTrackElement | null) => {
+        if (element) element.track.mode = 'showing';
+    }, []);
     // File changes and rapid track switches must invalidate late subtitle IPC.
     const subtitleSelectionGenerationRef = useRef(0);
     const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -331,12 +359,42 @@ export function AdaptiveMediaPlayer({
     // The Rust transcoder reuses job IDs by folder/file/quality. A stale
     // response must not cancel an identical job requested by a newer intent.
     const hlsDesiredJobRef = useRef<string | null>(null);
+    // A live HLS EVENT playlist is playable before full conversion. Keep
+    // polling until ENDLIST is durable; never cache it as completed early.
+    const liveHlsRef = useRef(false);
     const streamAuthRef = useRef<string>('');
     const currentJobIdRef = useRef<string | null>(null);
     const streamBaseRef = useRef<string>('');
+    const [externalVideoPlayers, setExternalVideoPlayers] = useState<ExternalVideoPlayer[]>([]);
+    const [externalPlayerMenuOpen, setExternalPlayerMenuOpen] = useState(false);
+    const [openingExternalPlayer, setOpeningExternalPlayer] = useState<string | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [isFullscreen, setIsFullscreen] = useState(false);
     const isFullscreenRef = useRef(false);
+    const [controlsVisible, setControlsVisible] = useState(true);
+    const controlsIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const [playerDuration, setPlayerDuration] = useState(0);
+    // Delay expensive native remux seeking until a timeline drag is released.
+    const [scrubTime, setScrubTime] = useState<number | null>(null);
+    const [playbackRate, setPlaybackRate] = useState(1);
+    const revealControls = useCallback(() => {
+        setControlsVisible(true);
+        if (controlsIdleTimerRef.current !== null) clearTimeout(controlsIdleTimerRef.current);
+        if (isFullscreen) {
+            controlsIdleTimerRef.current = setTimeout(() => setControlsVisible(false), 2700);
+        }
+    }, [isFullscreen]);
+    useEffect(() => {
+        if (!isFullscreen) {
+            setControlsVisible(true);
+            if (controlsIdleTimerRef.current !== null) clearTimeout(controlsIdleTimerRef.current);
+        } else {
+            revealControls();
+        }
+        return () => {
+            if (controlsIdleTimerRef.current !== null) clearTimeout(controlsIdleTimerRef.current);
+        };
+    }, [isFullscreen, revealControls]);
     // HLS video ready flag for retry-safe attach
     const [hlsVideoReady, setHlsVideoReady] = useState(false);
     // Callback ref: fires when HLS video element mounts
@@ -353,7 +411,6 @@ export function AdaptiveMediaPlayer({
     // ── Volume state ─────────────────────────────────────────────────
     const [volume, setVolume] = useState(1);
     const [isMuted, setIsMuted] = useState(false);
-    const [showVolumeSlider, setShowVolumeSlider] = useState(false);
     const volumeBeforeMute = useRef(1);
 
     // ── Source / playing resolution tracking ──────────────────────────
@@ -387,6 +444,27 @@ export function AdaptiveMediaPlayer({
     // Clear transcode cache for current file
     const [clearingCache, setClearingCache] = useState(false);
     const fileKey = `${activeFolderId ?? 0}_${file.id}`;
+    useEffect(() => {
+        // Distinct player mounts must never share an identity, including React
+        // StrictMode's effect cleanup/restart cycle.
+        const random = new Uint8Array(16);
+        crypto.getRandomValues(random);
+        const id = Array.from(random, byte => byte.toString(16).padStart(2, '0')).join('');
+        const ready = invoke<void>('cmd_begin_stream_session', { fileKey, sessionId: id });
+        const session = { id, key: fileKey, ready };
+        streamSessionRef.current = session;
+        return () => {
+            if (streamSessionRef.current === session) streamSessionRef.current = null;
+            // Release only after registration completes. If the player closed
+            // during preparation, the Rust session gate rejects the late job.
+            void ready.then(
+                () => invoke<void>('cmd_end_stream_session', { fileKey, sessionId: id }),
+                () => undefined,
+            ).catch(error => {
+                console.warn('TeraRelay could not discard its temporary streaming cache:', error);
+            });
+        };
+    }, [fileKey]);
 
     const handleClearTranscodeCache = useCallback(async () => {
         setClearingCache(true);
@@ -442,6 +520,52 @@ export function AdaptiveMediaPlayer({
         if (useFallback) return fallbackVideoRef.current;
         return mseVideoRef.current;
     }, [playbackMode, useFallback]);
+
+    // Detect only supported players when this in-app video player opens.
+    // The file browser and the separate Drive external-open flow never call
+    // these commands or render this control.
+    useEffect(() => {
+        let active = true;
+        invoke<ExternalVideoPlayer[]>('cmd_list_external_video_players')
+            .then(players => {
+                if (active) setExternalVideoPlayers(Array.isArray(players) ? players : []);
+            })
+            .catch(error => {
+                if (active) {
+                    setExternalVideoPlayers([]);
+                    console.warn('Could not detect external video players:', error);
+                }
+            });
+        return () => { active = false; };
+    }, []);
+
+    useEffect(() => {
+        setExternalPlayerMenuOpen(false);
+    }, [file.id, activeFolderId]);
+
+    const handleOpenExternalPlayer = useCallback(async (playerId: string) => {
+        if (openingExternalPlayer !== null) return;
+        const player = externalVideoPlayers.find(candidate => candidate.id === playerId);
+        if (!player) return;
+
+        setOpeningExternalPlayer(playerId);
+        try {
+            await invoke<void>('cmd_open_video_in_external_player', {
+                playerId,
+                messageId: file.id,
+                folderId: activeFolderId,
+            });
+            // Pause only after the native launcher confirms it started, so a
+            // failed launch never interrupts the built-in player.
+            getActiveVideo()?.pause();
+            setExternalPlayerMenuOpen(false);
+            toast.success(`Opening in ${player.name}…`);
+        } catch (error) {
+            toast.error(`Could not open ${file.name} in ${player.name}: ${String(error)}`);
+        } finally {
+            setOpeningExternalPlayer(null);
+        }
+    }, [openingExternalPlayer, externalVideoPlayers, file.id, file.name, activeFolderId, getActiveVideo]);
 
     // Sync volume to whichever video element is actually visible.
     const applyVolume = useCallback((v: number, muted: boolean) => {
@@ -505,7 +629,38 @@ export function AdaptiveMediaPlayer({
         handleProgressiveDetected(time);
     }, [getActiveVideo, handleProgressiveDetected]);
 
+    const leaveHls = useCallback(() => {
+        hlsGenerationRef.current += 1;
+        hlsDesiredJobRef.current = null;
+        liveHlsRef.current = false;
+        const jobId = currentJobIdRef.current;
+        currentJobIdRef.current = null;
+        if (jobId) invoke('cmd_cancel_transcode', {
+            jobId, sessionId: streamSessionRef.current?.id,
+        }).catch(() => {});
+        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+        setHlsPlaylistUrl(null);
+        setHlsPhase('idle');
+        setHlsQuality(null);
+        setQuality('original');
+        setPlaybackMode('original');
+    }, [setQuality]);
+
     const seekTo = useCallback((time: number) => {
+        if (playbackMode === 'hls' && liveHlsRef.current) {
+            const video = getActiveVideo();
+            const seekable = video?.seekable;
+            if (time > 0 && (!seekable?.length || time > seekable.end(seekable.length - 1))) {
+                if (transcodeCapsRef.current?.available) {
+                    requestRemuxAt(time);
+                    leaveHls();
+                } else {
+                    toast.info('This quality is still converting. More of the video will be seekable shortly.');
+                }
+                return;
+            }
+        }
         const remuxComplete = playbackMode === 'original' && !!fmp4StreamUrl
             && remuxWindowRef.current.complete;
         if (playbackMode === 'original' && pendingSeekRef.current) {
@@ -551,7 +706,7 @@ export function AdaptiveMediaPlayer({
         }
         if (plan.kind === 'remux') requestRemuxAt(plan.time);
         else video.currentTime = plan.time;
-    }, [getActiveVideo, useFallback, playbackMode, fmp4StreamUrl, requestRemuxAt]);
+    }, [getActiveVideo, useFallback, playbackMode, fmp4StreamUrl, requestRemuxAt, leaveHls]);
 
     const seekBy = useCallback((seconds: number) => {
         seekTo(getMoviePosition() + seconds);
@@ -782,20 +937,8 @@ export function AdaptiveMediaPlayer({
         setSelectedAudioStream(streamIndex);
 
         requestRemuxAt(moviePosition);
-        if (playbackMode === 'hls') {
-            hlsGenerationRef.current += 1;
-            hlsDesiredJobRef.current = null;
-            const previousJobId = currentJobIdRef.current;
-            currentJobIdRef.current = null;
-            if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
-            hlsRef.current?.destroy();
-            hlsRef.current = null;
-            if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-            setQuality('original');
-            setPlaybackMode('original');
-        }
-    }, [getMoviePosition, requestRemuxAt, playbackMode, setQuality]);
+        if (playbackMode === 'hls') leaveHls();
+    }, [getMoviePosition, requestRemuxAt, playbackMode, leaveHls]);
 
     const handleSubtitleTrackChange = useCallback(async (streamIndex: number | null) => {
         const generation = ++subtitleSelectionGenerationRef.current;
@@ -861,13 +1004,14 @@ export function AdaptiveMediaPlayer({
         remuxGenerationRef.current += 1;
         hlsGenerationRef.current += 1;
         hlsDesiredJobRef.current = null;
+        liveHlsRef.current = false;
         if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
         }
-        const previousJobId = currentJobIdRef.current;
+        // Temporary HLS cleanup is owned by the session release. A stale
+        // source effect must never cancel a different player's stream.
         currentJobIdRef.current = null;
-        if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
         remuxWindowRef.current = { start: 0, complete: false, key: null };
         pendingSeekRef.current = null;
         savedTimeRef.current = 0;
@@ -884,7 +1028,7 @@ export function AdaptiveMediaPlayer({
             hlsGenerationRef.current += 1;
             hlsDesiredJobRef.current = null;
             const fileKey = remuxWindowRef.current.key;
-            if (fileKey) invoke('cmd_cancel_fmp4_stream', { fileKey }).catch(() => {});
+            if (fileKey) invoke('cmd_cancel_fmp4_stream', { fileKey, sessionId: streamSessionRef.current?.id }).catch(() => {});
         };
     }, [streamUrl, clearMemoryMedia]);
 
@@ -939,22 +1083,27 @@ export function AdaptiveMediaPlayer({
 
     useEffect(() => {
         if (!useFallback || playbackMode !== 'original' || fmp4StreamUrl || fmp4RemuxError
-            || nativePlaybackStartedRef.current || fmp4RemuxingRef.current
+            || fmp4RemuxingRef.current
             || (nativePhase !== 'loading' && nativePhase !== 'ready')) return;
         const video = fallbackVideoRef.current;
-        if (!video) return;
+        if (!video || (nativeUserPauseRef.current && !video.seeking)) return;
         const generation = remuxGenerationRef.current;
+        const alreadyPlaying = nativePlaybackStartedRef.current;
+        const observedTime = video.currentTime;
         const timer = setTimeout(() => {
-            if (generation !== remuxGenerationRef.current || nativePlaybackStartedRef.current
-                || fmp4RemuxingRef.current || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return;
+            if (generation !== remuxGenerationRef.current || fallbackVideoRef.current !== video
+                || fmp4RemuxingRef.current || (nativeUserPauseRef.current && !video.seeking)
+                || Math.abs(video.currentTime - observedTime) > 0.25
+                || (!video.seeking && video.readyState >= (alreadyPlaying
+                    ? HTMLMediaElement.HAVE_FUTURE_DATA : HTMLMediaElement.HAVE_CURRENT_DATA))) return;
             if (transcodeCapsRef.current?.available) {
-                logRef.current?.('Native video startup stalled; trying compatibility playback');
+                logRef.current?.('Native video stalled; trying compatibility playback');
                 handleProgressiveDetected();
-            } else {
+            } else if (!alreadyPlaying) {
                 setNativeError('Video did not start. Compatibility playback requires FFmpeg.');
                 setNativePhase('error');
             }
-        }, 20_000);
+        }, alreadyPlaying ? 8_000 : 20_000);
         return () => clearTimeout(timer);
     }, [streamUrl, useFallback, playbackMode, nativePhase, fmp4StreamUrl,
         fmp4RemuxError, transcodeCapabilities, handleProgressiveDetected]);
@@ -1004,10 +1153,32 @@ export function AdaptiveMediaPlayer({
                         setHlsProgress(status.progress);
                         break;
                     case 'transcoding':
-                        setHlsPhase('transcoding');
+                        if (!liveHlsRef.current) setHlsPhase('transcoding');
                         setHlsProgress(status.progress);
                         break;
+                    case 'streaming': {
+                        // FFmpeg has already written three verified HLS
+                        // segments; start playback while it continues.
+                        if (!liveHlsRef.current) {
+                            const liveUrl = buildAuthenticatedHlsUrl(
+                                streamBaseRef.current, status.playlist_url || '', streamAuthRef.current,
+                            );
+                            if (!liveUrl) {
+                                setHlsPhase('failed');
+                                setHlsError('Invalid streaming playlist URL.');
+                                clearInterval(intervalId);
+                                pollTimerRef.current = null;
+                                return;
+                            }
+                            liveHlsRef.current = true;
+                            setHlsPlaylistUrl(liveUrl);
+                            setHlsPhase('ready');
+                        }
+                        setHlsProgress(status.progress);
+                        break;
+                    }
                     case 'ready':
+                        liveHlsRef.current = false;
                         clearInterval(intervalId);
                         pollTimerRef.current = null;
                         currentJobIdRef.current = null;
@@ -1074,6 +1245,7 @@ export function AdaptiveMediaPlayer({
         // Matches TranscodeKey::job_id in src-tauri/src/transcode.rs.
         const desiredJobId = `${activeFolderId ?? 0}_${file.id}_${quality}`;
         hlsDesiredJobRef.current = desiredJobId;
+        liveHlsRef.current = false;
         if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -1081,7 +1253,9 @@ export function AdaptiveMediaPlayer({
         const previousJobId = currentJobIdRef.current;
         currentJobIdRef.current = null;
         if (previousJobId && previousJobId !== desiredJobId) {
-            invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
+            invoke('cmd_cancel_transcode', {
+                jobId: previousJobId, sessionId: streamSessionRef.current?.id,
+            }).catch(() => {});
         }
 
         log('startTranscode', { quality, activeFolderId, messageId: file.id });
@@ -1096,7 +1270,7 @@ export function AdaptiveMediaPlayer({
         fmp4RemuxingRef.current = false;
         setFmp4Remuxing(false);
         const fileKey = remuxWindowRef.current.key;
-        if (fileKey) invoke('cmd_cancel_fmp4_stream', { fileKey }).catch(() => {});
+        if (fileKey) invoke('cmd_cancel_fmp4_stream', { fileKey, sessionId: streamSessionRef.current?.id }).catch(() => {});
 
         hlsQualityRef.current = quality;
         setPlaybackMode('hls');
@@ -1116,11 +1290,20 @@ export function AdaptiveMediaPlayer({
         }
 
         try {
-            // Use activeFolderId instead of file.folder_id so we resolve the correct peer
+            const session = streamSessionRef.current;
+            if (!session || session.key !== `${activeFolderId ?? 0}_${file.id}`) {
+                throw new Error('Player session is no longer active.');
+            }
+            await session.ready;
+            if (generation !== hlsGenerationRef.current || streamSessionRef.current !== session) return;
+            // The backend checks this session at entry, then keeps the shared
+            // preparation alive while any viewer still needs the source.
             const result = await invoke<TranscodePrepareResult>('cmd_prepare_transcoded_stream', {
                 messageId: file.id,
                 folderId: activeFolderId,
                 quality,
+                fileName: file.name,
+                sessionId: session.id,
             });
 
             // If a different movie/quality took over, only cancel the job
@@ -1131,7 +1314,9 @@ export function AdaptiveMediaPlayer({
                 // replacement's matching job, nor a finished cached variant.
                 if (result.job_id && result.status !== 'ready'
                     && result.job_id !== hlsDesiredJobRef.current) {
-                    invoke('cmd_cancel_transcode', { jobId: result.job_id }).catch(() => {});
+                    invoke('cmd_cancel_transcode', {
+                        jobId: result.job_id, sessionId: session.id,
+                    }).catch(() => {});
                 }
                 return;
             }
@@ -1174,7 +1359,7 @@ export function AdaptiveMediaPlayer({
             setHlsError(String(e));
             setHlsVariantStates(prev => ({ ...prev, [quality]: 'failed' }));
         }
-    }, [file.id, activeFolderId, pollTranscodeStatus, abortMse, log, getActiveVideo, getMoviePosition]);
+    }, [file.id, file.name, activeFolderId, pollTranscodeStatus, abortMse, log, getActiveVideo, getMoviePosition]);
 
     // ── Handle quality change ────────────────────────────────────────
     const handleQualityChange = useCallback((quality: StreamingQuality) => {
@@ -1188,7 +1373,9 @@ export function AdaptiveMediaPlayer({
             hlsDesiredJobRef.current = null;
             const previousJobId = currentJobIdRef.current;
             currentJobIdRef.current = null;
-            if (previousJobId) invoke('cmd_cancel_transcode', { jobId: previousJobId }).catch(() => {});
+            if (previousJobId) invoke('cmd_cancel_transcode', {
+                jobId: previousJobId, sessionId: streamSessionRef.current?.id,
+            }).catch(() => {});
             const restoreRemux = playbackMode === 'hls' && !!fmp4StreamUrl;
             const moviePosition = restoreRemux ? getMoviePosition() : 0;
             // Clean up HLS if switching back from transcode mode
@@ -1227,16 +1414,11 @@ export function AdaptiveMediaPlayer({
 
     // ── Fullscreen helpers (DOM/video fullscreen first, Tauri fallback) ──
     const enterFullscreen = useCallback(async () => {
-        // Try DOM/video fullscreen first
+        // Fullscreen the complete player shell, NEVER the native <video>.
+        // Fullscreening the video discards our audio/quality/seek controls.
         let fullscreenSuccess = false;
         try {
-            const video = getActiveVideo();
-            const customControls = useFallback && playbackMode === 'original' && !!fmp4StreamUrl && sourceDuration !== null;
-            const target = customControls ? containerRef.current : video;
-            if (target && typeof target.requestFullscreen === 'function') {
-                await target.requestFullscreen({ navigationUI: 'hide' });
-                fullscreenSuccess = true;
-            } else if (containerRef.current) {
+            if (containerRef.current?.requestFullscreen) {
                 await containerRef.current.requestFullscreen({ navigationUI: 'hide' });
                 fullscreenSuccess = true;
             }
@@ -1248,7 +1430,7 @@ export function AdaptiveMediaPlayer({
             } catch {}
         }
         setIsFullscreen(true);
-    }, [getActiveVideo, useFallback, playbackMode, fmp4StreamUrl, sourceDuration]);
+    }, []);
 
     const exitFullscreen = useCallback(async () => {
         if (document.fullscreenElement) {
@@ -1337,18 +1519,28 @@ export function AdaptiveMediaPlayer({
         };
 
         if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Native HLS support (Safari)
-            video.src = hlsPlaylistUrl;
-            video.addEventListener('loadedmetadata', () => {
+            const onLoadedMetadata = () => {
                 onHlsMetadata();
                 restoreCompatibilityPlayback(video, savedTime, savedPlaybackRef.current);
-            }, { once: true });
+            };
+            video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+            video.src = hlsPlaylistUrl;
+            return () => {
+                video.removeEventListener('loadedmetadata', onLoadedMetadata);
+                video.removeAttribute('src');
+                video.load();
+            };
         } else if (Hls.isSupported()) {
             const authValue = streamAuthRef.current;
             const hls = new Hls({
                 enableWorker: true,
                 lowLatencyMode: false,
-                backBufferLength: 90,
+                // Keep memory bounded while downloading multi-GB originals
+                // and use the first segments, not the live edge, for movies.
+                backBufferLength: 45,
+                maxBufferLength: 24,
+                startPosition: 0,
+                liveSyncDurationCount: 2,
                 // Authenticate only this player's local playlist/segment URLs.
                 // Never send a local bearer token to an external HLS URI.
                 xhrSetup: (xhr, url) => {
@@ -1386,15 +1578,18 @@ export function AdaptiveMediaPlayer({
                     log('HLS non-fatal error', data.type, data.details);
                 }
             });
+            return () => {
+                if (hlsRef.current === hls) {
+                    hls.destroy();
+                    hlsRef.current = null;
+                }
+            };
         } else {
             log('HLS not supported in this browser');
             setHlsError('HLS playback not supported in this browser');
             setHlsPhase('failed');
         }
 
-        return () => {
-            // Don't destroy on cleanup, only on explicit switch
-        };
     }, [playbackMode, hlsPlaylistUrl, hlsPhase, hlsVideoReady, log]);
 
     // ── Cancel ongoing transcode ─────────────────────────────────────
@@ -1406,7 +1601,9 @@ export function AdaptiveMediaPlayer({
         currentJobIdRef.current = null;
         // Invalidate the old player immediately. Never await cancellation:
         // a slow/stale response must not wipe a newer user's quality choice.
-        if (jobId) invoke('cmd_cancel_transcode', { jobId }).catch(() => {});
+        if (jobId) invoke('cmd_cancel_transcode', {
+            jobId, sessionId: streamSessionRef.current?.id,
+        }).catch(() => {});
         if (pollTimerRef.current) {
             clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
@@ -1437,9 +1634,9 @@ export function AdaptiveMediaPlayer({
     useEffect(() => {
         return () => {
             hlsGenerationRef.current += 1;
-            const jobId = currentJobIdRef.current;
             currentJobIdRef.current = null;
-            if (jobId) invoke('cmd_cancel_transcode', { jobId }).catch(() => {});
+            // Last-viewer release handles cancellation + removal AFTER FFmpeg
+            // exits. Do not cancel another viewer sharing this quality here.
             if (hlsRef.current) {
                 hlsRef.current.destroy();
                 hlsRef.current = null;
@@ -1520,9 +1717,44 @@ export function AdaptiveMediaPlayer({
         };
     }, []);
 
+    // One custom transport bar controls every playback engine (MSE, HLS,
+    // and native/WebKit). Keep progress and pause state synchronized without
+    // polling or touching the decoder on every React render.
+    useEffect(() => {
+        const video = getActiveVideo();
+        if (!video) return;
+        const update = () => {
+            const offset = playbackMode === 'original' && useFallback && fmp4StreamUrl
+                ? remuxWindowRef.current.start : 0;
+            if (!pendingSeekRef.current && Number.isFinite(video.currentTime)) {
+                const position = offset + video.currentTime;
+                setMovieTime(previous => Math.abs(previous - position) >= 0.2 ? position : previous);
+            }
+            if (Number.isFinite(video.duration) && video.duration > 0) {
+                const duration = offset + video.duration;
+                setPlayerDuration(previous => Math.abs(previous - duration) > 0.4 ? duration : previous);
+            }
+            setNativePaused(video.paused);
+        };
+        video.playbackRate = playbackRate;
+        for (const event of ['timeupdate', 'loadedmetadata', 'durationchange', 'seeking', 'seeked', 'playing', 'pause', 'ended']) {
+            video.addEventListener(event, update);
+        }
+        update();
+        return () => {
+            for (const event of ['timeupdate', 'loadedmetadata', 'durationchange', 'seeking', 'seeked', 'playing', 'pause', 'ended']) {
+                video.removeEventListener(event, update);
+            }
+        };
+    }, [getActiveVideo, playbackMode, useFallback, fmp4StreamUrl, hlsVideoReady,
+        nativeMediaUrl, msePhase, hlsPhase, playbackRate]);
+
+    useEffect(() => {
+        setPlayerDuration(0);
+    }, [streamUrl]);
+
     // ── Determine current display state ──────────────────────────────
     const isHlsMode = playbackMode === 'hls';
-    const hasVideoTrack = tracks.some(t => t.type === 'video');
     const isMseLoading = msePhase === 'loading' || msePhase === 'initializing';
     const isHlsLoading = hlsPhase === 'preparing' || hlsPhase === 'caching' || hlsPhase === 'transcoding';
     const displayPhase: string = isHlsMode ? hlsPhase : fmp4RemuxError ? 'error' : useFallback ? nativePhase : (isMseLoading ? 'loading' : msePhase);
@@ -1536,45 +1768,105 @@ export function AdaptiveMediaPlayer({
     const showOriginalVideo = !isHlsMode && !useFallback;
 
     // Build the effective quality label
-    const effectiveQuality: StreamingQuality = isHlsMode ? (hlsQuality || 'original') : currentQuality;
+    const effectiveQuality: StreamingQuality = isHlsMode ? (hlsQuality || 'original') : 'original';
+
+    const durationToShow = sourceDuration && sourceDuration > 0 ? sourceDuration : playerDuration;
+    const scrubPosition = scrubTime ?? movieTime;
+    const playedPercent = durationToShow > 0 ? Math.min(100, Math.max(0, scrubPosition / durationToShow * 100)) : 0;
+    const chromeHidden = isFullscreen && !controlsVisible;
+    const commitScrub = (position: number) => {
+        if (Number.isFinite(position) && position >= 0) seekTo(position);
+        setScrubTime(null);
+    };
 
     return (
         <div
-            className={`fixed inset-0 z-[200] bg-black/90 animate-in fade-in duration-200 ${isFullscreen ? 'p-0' : 'flex items-center justify-center p-4 backdrop-blur-md'}`}
+            className={'fixed inset-0 z-[200] flex items-center justify-center bg-black/85 backdrop-blur-md ' + (isFullscreen ? 'p-0' : 'p-3 sm:p-6')}
             onClick={onClose}
         >
-            <div ref={containerRef} role="dialog" aria-modal="true" aria-label={`Video player: ${file.name}`} className={`relative ${isFullscreen ? 'fixed inset-0 w-screen h-screen max-w-none' : 'w-full max-w-6xl flex flex-col items-center'}`} onClick={e => e.stopPropagation()}>
-                {/* Video seek buttons. Shift+Arrow keeps previous/next file navigation. */}
-                <button onClick={() => seekBy(-10)} aria-label="Back 10 seconds" className={`absolute left-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'left-4' : ''}`} title="Back 10 seconds (ArrowLeft / J)">
-                    <ChevronLeft className="w-6 h-6" />
-                    <span className="sr-only">Back 10 seconds</span>
-                </button>
-                <button onClick={() => seekBy(10)} aria-label="Forward 10 seconds" className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all z-10 ${isFullscreen ? 'right-4' : ''}`} title="Forward 10 seconds (ArrowRight / L)">
-                    <ChevronRight className="w-6 h-6" />
-                    <span className="sr-only">Forward 10 seconds</span>
-                </button>
-                <div className={`absolute z-30 flex items-center gap-2 ${isFullscreen ? 'top-4 right-4' : '-top-12 right-0'}`}>
-                    <button
-                        onClick={toggleFullscreen}
-                        aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
-                        className="w-10 h-10 flex items-center justify-center text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all"
-                        title={isFullscreen ? 'Exit fullscreen (F)' : 'Fullscreen (F)'}
-                    >
-                        {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+            <div ref={containerRef} role="dialog" aria-modal="true" aria-label={'Video player: ' + file.name}
+                data-testid="terarelay-stream-player"
+                className={'tr-stream-player relative flex flex-col overflow-hidden bg-[#10101b] text-white border border-violet-400/30 shadow-[0_24px_100px_rgba(0,0,0,.85)] ' +
+                    (isFullscreen ? 'fixed inset-0 h-screen w-screen rounded-none border-0' : 'w-[94vw] max-w-[1400px] max-h-[96vh] rounded-2xl')}
+                onClick={e => e.stopPropagation()} onMouseMove={revealControls}
+                onTouchStart={revealControls} onPointerDown={revealControls}
+                onFocusCapture={() => {
+                    setControlsVisible(true);
+                    if (controlsIdleTimerRef.current !== null) clearTimeout(controlsIdleTimerRef.current);
+                }}
+                onBlurCapture={revealControls}
+                style={{ cursor: chromeHidden ? 'none' : undefined }}
+            >
+                {/* One toolbar, for all playback engines: no duplicate or native video controls. */}
+                <header className={'tr-stream-chrome z-40 flex shrink-0 items-center gap-3 bg-[#151522] px-4 sm:px-6 py-3.5 transition-opacity duration-300 ' +
+                    (isFullscreen ? 'absolute inset-x-0 top-0 bg-gradient-to-b from-black/90 to-black/30 ' : 'relative border-b border-white/10 ') +
+                    (chromeHidden ? 'opacity-0 pointer-events-none' : 'opacity-100')}>
+                    <span aria-hidden="true" className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-600 text-sm font-black shadow-[0_0_20px_rgba(124,58,237,.25)]">TR</span>
+                    <div className="min-w-0 flex-1">
+                        <h2 title={file.name} className="truncate text-sm sm:text-base font-semibold">{file.name}</h2>
+                        {typeof currentIndex === 'number' && typeof totalItems === 'number' && totalItems > 1 &&
+                            <span className="block text-[10px] text-white/40">{currentIndex + 1} of {totalItems}</span>}
+                    </div>
+                    <label className="tr-stream-select inline-flex shrink-0 items-center gap-2 rounded-xl border border-violet-400/60 bg-violet-500/15 px-2.5 py-2 text-xs font-medium focus-within:ring-2 focus-within:ring-violet-400" title="Stream quality">
+                        <Monitor className="h-4 w-4 text-violet-300" aria-hidden="true" />
+                        <select aria-label="Stream quality" data-testid="stream-quality"
+                            value={adaptiveMode ? 'auto' : effectiveQuality}
+                            onChange={event => {
+                                const chosen = event.target.value;
+                                if (chosen === 'auto') {
+                                    setAdaptiveMode(true);
+                                } else {
+                                    if (adaptiveMode) setAdaptiveMode(false);
+                                    handleQualityChange(chosen as StreamingQuality);
+                                }
+                                revealControls();
+                            }}
+                            className="max-w-[80px] cursor-pointer bg-transparent text-white outline-none">
+                            {transcodeCapabilities?.available && <option value="auto">Auto</option>}
+                            <option value="360p" disabled={!transcodeCapabilities?.available || (sourceHeight !== null && sourceHeight < 360)}>360p</option>
+                            <option value="480p" disabled={!transcodeCapabilities?.available || (sourceHeight !== null && sourceHeight < 480)}>480p</option>
+                            <option value="720p" disabled={!transcodeCapabilities?.available || (sourceHeight !== null && sourceHeight < 720)}>{QUALITY_LABELS['720p']}{hlsVariantStates['720p'] === 'transcoding' ? ' · preparing' : ''}</option>
+                            <option value="1080p" disabled={!transcodeCapabilities?.available || (sourceHeight !== null && sourceHeight < 1080)}>1080p</option>
+                            <option value="original">Original</option>
+                        </select>
+                    </label>
+                    <label className="tr-stream-select hidden sm:inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-2.5 py-2 text-xs text-white/90 focus-within:ring-2 focus-within:ring-violet-400" title="Subtitles">
+                        <Captions className="h-4 w-4 shrink-0" aria-hidden="true"/>
+                        <select aria-label="Subtitles" value={selectedSubtitleStream ?? ''}
+                            disabled={subtitleLoading || mediaTracks.subtitle_tracks.length === 0}
+                            onChange={event => {
+                                const id = event.target.value;
+                                void handleSubtitleTrackChange(id === '' ? null : Number(id));
+                            }}
+                            className="w-[72px] max-w-[100px] cursor-pointer bg-transparent text-white outline-none disabled:opacity-60">
+                            <option value="">{subtitleLoading ? 'Loading' : 'Subtitles'}</option>
+                            {mediaTracks.subtitle_tracks.map((track, index) =>
+                                <option value={track.index} key={track.index}>{mediaTrackLabel(track, index + 1, 'Subtitle')}</option>)}
+                        </select>
+                    </label>
+                    <label className="tr-stream-select hidden sm:inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-2.5 py-2 text-xs text-white/90 focus-within:ring-2 focus-within:ring-violet-400" title="Audio">
+                        <AudioLines className="h-4 w-4 shrink-0" aria-hidden="true"/>
+                        <select aria-label="Audio track" value={selectedAudioStream ?? ''}
+                            disabled={mediaTracks.audio_tracks.length < 2}
+                            onChange={event => { if (event.target.value) handleAudioTrackChange(Number(event.target.value)); }}
+                            className="w-[65px] max-w-[115px] cursor-pointer bg-transparent text-white outline-none disabled:opacity-60">
+                            <option value="">Audio</option>
+                            {mediaTracks.audio_tracks.map((track, index) =>
+                                <option value={track.index} key={track.index}>{mediaTrackLabel(track, index + 1, 'Audio')}</option>)}
+                        </select>
+                    </label>
+                    <button type="button" onClick={onDownload} disabled={!onDownload} aria-label="Download video"
+                        className="hidden sm:flex items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-xs font-medium hover:bg-white/10 disabled:opacity-40">
+                        <Download className="h-4 w-4"/> Download
                     </button>
-                    <button
-                        onClick={onClose}
-                        data-player-close
-                        aria-label="Close video player"
-                        className="w-10 h-10 flex items-center justify-center text-white/50 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-all"
-                        title="Close (Esc)"
-                    >
-                        <X className="w-5 h-5" />
+                    <button type="button" data-player-close onClick={onClose} aria-label="Close video player"
+                        title="Close (Esc)" className="ml-1 rounded-lg p-2 text-white/80 transition hover:bg-white/10 hover:text-white">
+                        <X className="h-5 w-5"/>
                     </button>
-                </div>
+                </header>
 
-                {/* Video container */}
-                <div className={`bg-black overflow-hidden flex items-center justify-center relative ${isFullscreen ? 'w-full h-full rounded-none shadow-none ring-0' : 'w-full aspect-video rounded-xl shadow-2xl ring-1 ring-white/10'}`}>
+                <div className={'tr-stream-video relative flex min-h-0 items-center justify-center overflow-hidden bg-black ' +
+                    (isFullscreen ? 'h-full w-full' : 'w-full aspect-video')}>
                     {/* fMP4 remux loading overlay */}
                     {fmp4Remuxing && (
                         <div role="status" className="flex flex-col items-center gap-4 text-white absolute inset-0 bg-black/80 z-10">
@@ -1582,7 +1874,7 @@ export function AdaptiveMediaPlayer({
                             <div className="flex flex-col items-center gap-1">
                                 <p className="text-sm font-medium">Converting to streaming format...</p>
                                 <p className="text-[11px] text-white/30 mt-1">
-                                    Remuxing MP4 for optimal playback. This only happens once per file.
+                                    Preparing video and audio the decoder can play.
                                 </p>
                             </div>
                         </div>
@@ -1700,9 +1992,11 @@ export function AdaptiveMediaPlayer({
                             // pendingSeekRef restores position/play intent.
                             key={`${nativeDecoderRevision}:${nativeMediaUrl}`}
                             ref={fallbackVideoRef}
+                            crossOrigin="anonymous"
                             aria-label={`Video: ${file.name}`}
-                            src={nativeMediaUrl}
-                            controls={!fmp4StreamUrl || sourceDuration === null}
+                            onClick={togglePlayback}
+                            src={fmp4Remuxing ? undefined : nativeMediaUrl}
+                            controls={false}
                             controlsList="nodownload"
                             // WebKitGTK's automatic HTTP preload enables GStreamer
                             // downloadbuffer, whose /var/tmp cache path can fail
@@ -1742,6 +2036,7 @@ export function AdaptiveMediaPlayer({
                             {subtitleUrl && (
                                 <track
                                     key={`${subtitleUrl}_${remuxWindowRef.current.start}`}
+                                    ref={showSubtitleTrack}
                                     kind="subtitles"
                                     src={subtitleUrl}
                                     srcLang={mediaTracks.subtitle_tracks.find(track => track.index === selectedSubtitleStream)?.language || 'und'}
@@ -1757,8 +2052,10 @@ export function AdaptiveMediaPlayer({
                     {isHlsMode && (
                         <video
                             ref={hlsVideoCallbackRef}
+                            crossOrigin="anonymous"
                             aria-label={`Video: ${file.name}`}
-                            controls={hlsPhase === 'ready'}
+                            onClick={togglePlayback}
+                            controls={false}
                             controlsList="nodownload"
                             autoPlay
                             className={`w-full h-full object-contain ${hlsPhase === 'ready' ? 'opacity-100' : 'opacity-0 absolute inset-0 pointer-events-none'}`}
@@ -1766,6 +2063,7 @@ export function AdaptiveMediaPlayer({
                             {subtitleUrl && (
                                 <track
                                     key={subtitleUrl}
+                                    ref={showSubtitleTrack}
                                     kind="subtitles"
                                     src={subtitleUrl}
                                     srcLang={mediaTracks.subtitle_tracks.find(track => track.index === selectedSubtitleStream)?.language || 'und'}
@@ -1780,8 +2078,10 @@ export function AdaptiveMediaPlayer({
                     {showOriginalVideo && (
                         <video
                             ref={mseVideoRef}
+                            crossOrigin="anonymous"
                             aria-label={`Video: ${file.name}`}
-                            controls
+                            onClick={togglePlayback}
+                            controls={false}
                             controlsList="nodownload"
                             autoPlay
                             className={`w-full h-full object-contain ${(isMseLoading || msePhase === 'error') ? 'opacity-0' : 'opacity-100'}`}
@@ -1789,6 +2089,7 @@ export function AdaptiveMediaPlayer({
                             {subtitleUrl && (
                                 <track
                                     key={subtitleUrl}
+                                    ref={showSubtitleTrack}
                                     kind="subtitles"
                                     src={subtitleUrl}
                                     srcLang={mediaTracks.subtitle_tracks.find(track => track.index === selectedSubtitleStream)?.language || 'und'}
@@ -1798,279 +2099,138 @@ export function AdaptiveMediaPlayer({
                             )}
                         </video>
                     )}
+                    {/* D opens diagnostics only on request; no duplicate control surface. */}
+                    {debugOverlay && (
+                        <div className="pointer-events-auto absolute bottom-4 left-4 z-30 w-52 rounded-xl border border-white/15 bg-black/85 p-3 font-mono text-[10px] text-white/80 backdrop-blur-md">
+                            <div className="mb-2 flex items-center gap-2 font-semibold"><Activity className="h-3.5 w-3.5"/> Playback diagnostics</div>
+                            <div className="flex justify-between gap-2"><span>Mode</span><span>{isHlsMode ? 'HLS' : 'Original'}</span></div>
+                            <div className="flex justify-between gap-2"><span>Speed</span><span>{measuredKbps > 0 ? Math.round(measuredKbps) + ' kbps' : '—'}</span></div>
+                            <div className="flex justify-between gap-2"><span>Buffered</span><span>{debugBufferedSecs.toFixed(1)} s</span></div>
+                            <div className="flex justify-between gap-2"><span>Playing</span><span>{playingResolution ? playingResolution.w + '×' + playingResolution.h : 'Unknown'}</span></div>
+                            <button type="button" onClick={handleClearTranscodeCache} disabled={clearingCache}
+                                className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-red-300 disabled:opacity-50">
+                                <Trash2 className="h-3 w-3"/>{clearingCache ? 'Clearing cache…' : 'Clear this video’s HLS cache'}
+                            </button>
+                        </div>
+                    )}
                 </div>
 
-                {useFallback && !isHlsMode && fmp4StreamUrl && sourceDuration !== null && (
-                    <div className={isFullscreen ? 'absolute bottom-14 left-4 right-4 z-30' : 'mt-3 w-full'}>
-                        <PlaybackTimeline currentTime={movieTime} duration={sourceDuration}
-                            paused={pendingSeekRef.current ? !pendingSeekRef.current.play : nativePaused}
-                            onSeek={seekTo} onTogglePlay={togglePlayback} />
-                    </div>
-                )}
-
-                {(mediaTracks.audio_tracks.length > 1 || mediaTracks.subtitle_tracks.length > 0) && (
-                    <div className={`${isFullscreen ? 'absolute bottom-28 left-1/2 -translate-x-1/2 z-30' : 'mt-3'} flex items-center gap-3 rounded-xl border border-white/10 bg-black/70 px-3 py-2 text-xs text-white/80 backdrop-blur-md`}>
-                        {mediaTracks.audio_tracks.length > 1 && (
-                            <label className="flex items-center gap-2">
-                                <span className="text-white/45">Audio</span>
-                                <select
-                                    value={selectedAudioStream ?? ''}
-                                    onChange={(event) => handleAudioTrackChange(Number(event.target.value))}
-                                    className="rounded-md border border-white/10 bg-black/70 px-2 py-1 text-xs text-white outline-none"
+                {/* Single transport bar for native, MSE and HLS playback. */}
+                <footer className={'tr-stream-chrome z-40 flex shrink-0 items-center gap-3 border-t border-white/10 bg-[#151522] px-4 sm:px-6 py-3.5 transition-opacity duration-300 ' +
+                    (isFullscreen ? 'absolute inset-x-0 bottom-0 border-0 bg-gradient-to-t from-black/90 to-black/30' : 'relative') +
+                    (chromeHidden ? ' opacity-0 pointer-events-none' : ' opacity-100')}>
+                    <button type="button" onClick={togglePlayback}
+                        aria-label={nativePaused ? 'Play video' : 'Pause video'}
+                        title="Play/Pause (Space)"
+                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-600 shadow-[0_0_20px_rgba(124,58,237,.4)] transition hover:bg-violet-500">
+                        {nativePaused ? <Play className="h-5 w-5 fill-current"/> : <Pause className="h-5 w-5 fill-current"/>}
+                    </button>
+                    <button type="button" onClick={() => seekBy(-10)} aria-label="Back 10 seconds"
+                        title="Back 10 seconds (Left/J)" className="rounded-lg p-2 text-white/85 hover:bg-white/10">
+                        <RotateCcw className="h-5 w-5"/>
+                    </button>
+                    <button type="button" onClick={() => seekBy(10)} aria-label="Forward 10 seconds"
+                        title="Forward 10 seconds (Right/L)" className="rounded-lg p-2 text-white/85 hover:bg-white/10">
+                        <RotateCw className="h-5 w-5"/>
+                    </button>
+                    <span className="min-w-[47px] shrink-0 text-center font-mono text-[11px] text-white/80 sm:text-xs">
+                        {formatPlayerClock(movieTime)}
+                    </span>
+                    <input type="range" aria-label="Video position" title="Seek"
+                        min={0} max={Math.max(durationToShow, 0.01)} step={0.1}
+                        value={Math.min(Math.max(0, scrubPosition), Math.max(durationToShow, 0.01))}
+                        disabled={!Number.isFinite(durationToShow) || durationToShow <= 0}
+                        onChange={event => setScrubTime(Number(event.target.value))}
+                        onPointerUp={event => commitScrub(Number(event.currentTarget.value))}
+                        onKeyUp={event => {
+                            if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
+                                commitScrub(Number(event.currentTarget.value));
+                            }
+                        }}
+                        onBlur={event => {
+                            if (scrubTime !== null) commitScrub(Number(event.currentTarget.value));
+                        }}
+                        className="tr-stream-range min-w-0 flex-1 cursor-pointer disabled:opacity-35"
+                        style={{ background: 'linear-gradient(to right, #8354f7 ' + playedPercent + '%, rgba(255,255,255,.24) ' + playedPercent + '%)' }}
+                    />
+                    <span className="hidden min-w-[47px] shrink-0 text-center font-mono text-[11px] text-white/80 sm:block sm:text-xs">
+                        {formatPlayerClock(durationToShow)}
+                    </span>
+                    <button type="button" onClick={toggleMute} aria-label={isMuted ? 'Unmute video' : 'Mute video'}
+                        title={isMuted ? 'Unmute (M)' : 'Mute (M)'} className="shrink-0 rounded-lg p-1.5 text-white/85 hover:bg-white/10">
+                        {isMuted || volume === 0 ? <VolumeX className="h-5 w-5"/> :
+                            volume < 0.5 ? <Volume1 className="h-5 w-5"/> : <Volume2 className="h-5 w-5"/>}
+                    </button>
+                    <input type="range" aria-label="Volume" min={0} max={1} step={0.05}
+                        value={isMuted ? 0 : volume} onChange={event => handleVolumeChange(Number(event.target.value))}
+                        className="tr-stream-range hidden w-20 cursor-pointer sm:block"
+                        style={{ background: 'linear-gradient(to right, #8354f7 ' + (isMuted ? 0 : volume * 100) + '%, rgba(255,255,255,.24) ' + (isMuted ? 0 : volume * 100) + '%)' }}
+                    />
+                    <select aria-label="Playback speed" value={playbackRate}
+                        onChange={event => setPlaybackRate(Number(event.target.value))}
+                        className="hidden cursor-pointer rounded-xl border border-white/20 bg-white/5 px-2.5 py-2 text-xs text-white outline-none focus:ring-2 focus:ring-violet-400 sm:block">
+                        <option value={0.5}>0.5×</option>
+                        <option value={0.75}>0.75×</option>
+                        <option value={1}>1.0×</option>
+                        <option value={1.25}>1.25×</option>
+                        <option value={1.5}>1.5×</option>
+                        <option value={2}>2.0×</option>
+                    </select>
+                    {externalVideoPlayers.length > 0 && (
+                        <div className="relative shrink-0">
+                            <button
+                                type="button"
+                                data-testid="external-player-menu-button"
+                                aria-haspopup="menu"
+                                aria-expanded={externalPlayerMenuOpen}
+                                aria-label="Open video with an external player"
+                                title="Open with an installed player"
+                                disabled={openingExternalPlayer !== null}
+                                onClick={() => {
+                                    revealControls();
+                                    setExternalPlayerMenuOpen(open => !open);
+                                }}
+                                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-2.5 text-xs font-medium text-white/90 transition hover:bg-white/10 disabled:opacity-50 sm:px-3"
+                            >
+                                <ExternalLink className="h-4 w-4" aria-hidden="true" />
+                                <span className="hidden sm:inline">Open with</span>
+                                <ChevronDown className="h-3.5 w-3.5 text-white/60" aria-hidden="true" />
+                            </button>
+                            {externalPlayerMenuOpen && (
+                                <div
+                                    role="menu"
+                                    aria-label="Installed external video players"
+                                    className="absolute bottom-full right-0 z-50 mb-2 min-w-44 overflow-hidden rounded-xl border border-white/15 bg-[#1c1b2a] p-1.5 shadow-2xl"
                                 >
-                                    {mediaTracks.audio_tracks.map((track, index) => (
-                                        <option key={track.index} value={track.index}>
-                                            {mediaTrackLabel(track, index + 1, 'Audio')}
-                                        </option>
+                                    <p className="px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-white/40">
+                                        Open video with
+                                    </p>
+                                    {externalVideoPlayers.map(player => (
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            key={player.id}
+                                            disabled={openingExternalPlayer !== null}
+                                            onClick={() => { void handleOpenExternalPlayer(player.id); }}
+                                            className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs text-white/90 transition hover:bg-white/10 disabled:opacity-50"
+                                        >
+                                            {openingExternalPlayer === player.id
+                                                ? <Loader2 className="h-4 w-4 animate-spin text-violet-300" />
+                                                : <ExternalLink className="h-4 w-4 text-violet-300" />}
+                                            <span>{player.name}</span>
+                                        </button>
                                     ))}
-                                </select>
-                            </label>
-                        )}
-
-                        {mediaTracks.subtitle_tracks.length > 0 && (
-                            <label className="flex items-center gap-2">
-                                <span className="text-white/45">Subtitles</span>
-                                <select
-                                    value={selectedSubtitleStream ?? ''}
-                                    disabled={subtitleLoading}
-                                    onChange={(event) => {
-                                        const value = event.target.value;
-                                        handleSubtitleTrackChange(value === '' ? null : Number(value));
-                                    }}
-                                    className="rounded-md border border-white/10 bg-black/70 px-2 py-1 text-xs text-white outline-none disabled:opacity-50"
-                                >
-                                    <option value="">{subtitleLoading ? 'Preparing…' : 'Off'}</option>
-                                    {mediaTracks.subtitle_tracks.map((track, index) => (
-                                        <option key={track.index} value={track.index}>
-                                            {mediaTrackLabel(track, index + 1, 'Subtitle')}
-                                        </option>
-                                    ))}
-                                </select>
-                            </label>
-                        )}
-                    </div>
-                )}
-
-                {/* Quality overlay badge on video */}
-                {(displayPhase === 'playing' || displayPhase === 'ready') && (
-                    <div className={`absolute ${isFullscreen ? 'bottom-36 left-4' : 'top-3 right-3'} z-20 flex items-center gap-2`}>
-                        {/* Quality / mode badge */}
-                        <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-xs font-medium text-white/90 shadow-lg pointer-events-none">
-                            {isHlsMode && hlsQuality ? QUALITY_LABELS[hlsQuality] : `${effectiveQuality === 'original' ? 'Original' : QUALITY_LABELS[effectiveQuality]}${measuredKbps > 0 && effectiveQuality !== 'original' ? ` · ${(measuredKbps / 1000).toFixed(0)}k` : ''}`}
-                        </div>
-                        {/* Resolution badge */}
-                        {(sourceResolution || playingResolution) && (
-                            <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-sm border border-white/10 text-[10px] font-medium text-white/70 shadow-lg pointer-events-none flex items-center gap-1.5">
-                                {sourceResolution && (
-                                    <span>Source: {sourceResolution.w}×{sourceResolution.h}</span>
-                                )}
-                                {playingResolution && (!sourceResolution || playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h) && (
-                                    <span>· Playing: {playingResolution.w}×{playingResolution.h}</span>
-                                )}
-                            </div>
-                        )}
-                    </div>
-                )}
-
-                {/* Debug overlay (lower-left, toggle with D key) */}
-                {debugOverlay && (
-                    <div className={`absolute z-40 pointer-events-none ${isFullscreen ? 'bottom-20 left-4' : 'bottom-4 left-4'}`}>
-                        <div className="px-3 py-2 rounded-lg bg-black/80 backdrop-blur-sm border border-white/10 text-[10px] font-mono text-white/80 shadow-xl space-y-1">
-                            <div className="flex items-center gap-2 text-[11px] font-semibold text-white/60 mb-0.5">
-                                <Activity className="w-3 h-3" />
-                                Debug
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Speed</span>
-                                <span>{isHlsMode ? '—' : measuredKbps > 999 ? `${(measuredKbps / 1000).toFixed(1)} Mbps` : `${Math.round(measuredKbps)} Kbps`}</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Cap</span>
-                                <span>{effectiveQuality === 'original' ? 'Unlimited' : `${QUALITY_LABELS[effectiveQuality]}${!transcodeCapabilities?.available ? ' (throttle)' : ''}`}</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Buffered</span>
-                                <span>{debugBufferedSecs.toFixed(1)}s</span>
-                            </div>
-                            <div className="flex justify-between gap-4">
-                                <span className="text-white/40">Mode</span>
-                                <span className={isHlsMode ? 'text-emerald-400' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'text-amber-400' : 'text-white/60'}>
-                                    {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Bandwidth capped' : 'Original'}
-                                </span>
-                            </div>
-                            {(sourceResolution || playingResolution) && (
-                                <div className="flex justify-between gap-4">
-                                    <span className="text-white/40">Size</span>
-                                    <span>
-                                        {playingResolution ? `${playingResolution.w}×${playingResolution.h}` : ''}
-                                        {playingResolution && sourceResolution && (playingResolution.w !== sourceResolution.w || playingResolution.h !== sourceResolution.h)
-                                            ? ` (src: ${sourceResolution.w}×${sourceResolution.h})`
-                                            : sourceResolution ? ` ${sourceResolution.w}×${sourceResolution.h}` : ''}
-                                    </span>
                                 </div>
                             )}
-                            {/* Clear transcode cache button */}
-                            <div className="pt-1.5 mt-1 border-t border-white/5">
-                                <button
-                                    onClick={handleClearTranscodeCache}
-                                    disabled={clearingCache}
-                                    className="pointer-events-auto flex items-center gap-1.5 text-[9px] text-red-400/60 hover:text-red-400 transition-colors disabled:opacity-50"
-                                    title={`Clear all transcoded HLS variants for ${fileKey}`}
-                                >
-                                    <Trash2 className="w-3 h-3" />
-                                    {clearingCache ? 'Clearing...' : 'Clear Transcodes'}
-                                </button>
-                            </div>
                         </div>
-                    </div>
-                )}
-
-                {/* Fullscreen overlay toolbar */}
-                {isFullscreen && (displayPhase !== 'error' && displayPhase !== 'failed') && (
-                    <div className="absolute bottom-0 left-0 right-0 z-30 bg-gradient-to-t from-black/90 via-black/60 to-transparent p-4 pt-12 pointer-events-none">
-                        <div className="flex items-center justify-between pointer-events-auto">
-                            <div className="flex items-center gap-3">
-                                {/* Play/Pause */}
-                                <button
-                                    onClick={togglePlayback}
-                                    aria-label={nativePaused ? "Play video" : "Pause video"}
-                                    className="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-full transition-all"
-                                    title="Play/Pause (Space)"
-                                >
-                                    <Play className="w-5 h-5" />
-                                </button>
-
-                                {/* Volume */}
-                                <div className="flex items-center gap-1.5"
-                                    onMouseEnter={() => setShowVolumeSlider(true)}
-                                    onMouseLeave={() => setShowVolumeSlider(false)}
-                                >
-                                    <button onClick={toggleMute} aria-label={isMuted ? "Unmute video" : "Mute video"} className="p-1.5 text-white/60 hover:text-white rounded-full hover:bg-white/10" title={isMuted ? 'Unmute' : 'Mute'}>
-                                        {isMuted || volume === 0 ? <VolumeX className="w-4 h-4" /> : volume < 0.5 ? <Volume1 className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                                    </button>
-                                    <div className={`overflow-hidden transition-all duration-200 ${showVolumeSlider ? 'w-20 opacity-100' : 'w-0 opacity-0'}`}>
-                                        <input
-                                            type="range"
-                                            aria-label="Volume"
-                                            min={0} max={1} step={0.05}
-                                            value={isMuted ? 0 : volume}
-                                            onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
-                                            className="w-20 h-1 appearance-none bg-white/20 rounded-full cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white"
-                                        />
-                                    </div>
-                                </div>
-
-                                {/* File name */}
-                                <span className="text-sm text-white/80 truncate max-w-[200px]">{file.name}</span>
-                            </div>
-
-                            <div className="flex items-center gap-2">
-                                {/* Quality selector in fullscreen */}
-                                {!useFallback && (
-                                    <QualitySelector
-                                        currentQuality={effectiveQuality}
-                                        onChange={handleQualityChange}
-                                        adaptiveMode={adaptiveMode}
-                                        onToggleAdaptive={() => setAdaptiveMode(!adaptiveMode)}
-                                        measuredSpeedKbps={measuredKbps}
-                                        transcodeCapabilities={transcodeCapabilities}
-                                        variantStates={hlsVariantStates}
-                                        sourceHeight={sourceHeight}
-                                    />
-                                )}
-
-                                {/* Exit fullscreen */}
-                                <button
-                                    onClick={exitFullscreen}
-                                    aria-label="Exit fullscreen"
-                                    className="w-10 h-10 flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 rounded-full transition-all"
-                                    title="Exit fullscreen (F)"
-                                >
-                                    <Minimize2 className="w-5 h-5" />
-                                </button>
-
-                                {/* Close */}
-                                <button
-                                    onClick={onClose}
-                                    aria-label="Close video player"
-                                    className="w-10 h-10 flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 rounded-full transition-all"
-                                    title="Close (Esc)"
-                                >
-                                    <X className="w-5 h-5" />
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )}
-
-                {/* Bottom bar: file info + volume + quality selector (non-fullscreen) */}
-                {!isFullscreen && <div className="mt-3 w-full flex items-center justify-between px-1 gap-3">
-                    <div className="text-left min-w-0 flex-1">
-                        <h3 className="text-sm font-medium text-white truncate max-w-md">{file.name}</h3>
-                        <p className="text-[11px] text-white/40 flex items-center gap-2">
-                            {isHlsMode && hlsQuality && (
-                                <span className="text-telegram-primary">{QUALITY_LABELS[hlsQuality]}</span>
-                            )}
-                            {hasVideoTrack && !isHlsMode && tracks.find(t => t.type === 'video') && (
-                                <span>
-                                    {tracks.find(t => t.type === 'video')?.width}p
-
-                                </span>
-                            )}
-                            {typeof currentIndex === 'number' && typeof totalItems === 'number' && totalItems > 0 && (
-                                <span>{currentIndex + 1}/{totalItems}</span>
-                            )}
-                        </p>
-                    </div>
-
-                    {/* Mode indicator + Quality selector */}
-                    <div className="flex items-center gap-2">
-                        {/* Playback mode badge */}
-                        <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${
-                            isHlsMode
-                                ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
-                                : effectiveQuality !== 'original' && !transcodeCapabilities?.available
-                                    ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
-                                    : 'text-white/40 bg-white/5 border-white/10'
-                        }`}>
-                            {isHlsMode ? 'HLS' : effectiveQuality !== 'original' && !transcodeCapabilities?.available ? 'Throttled' : 'Original'}
-                        </span>
-                    {displayPhase !== 'error' && displayPhase !== 'failed' && (
-                        <QualitySelector
-                            currentQuality={effectiveQuality}
-                            onChange={handleQualityChange}
-                            adaptiveMode={adaptiveMode}
-                            onToggleAdaptive={() => setAdaptiveMode(!adaptiveMode)}
-                            measuredSpeedKbps={measuredKbps}
-                            transcodeCapabilities={transcodeCapabilities}
-                            variantStates={hlsVariantStates}
-                            sourceHeight={sourceHeight}
-                        />
                     )}
-                    </div>
-                </div>}
-
-                {/* Keyboard shortcut hints */}
-                {!isFullscreen && <div className="mt-2 flex items-center gap-4 text-[10px] text-white/25 select-none">
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">← →</kbd> Navigate
-                    </span>
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">Space</kbd> Play/Pause
-                    </span>
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">F</kbd> Fullscreen
-                    </span>
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">Esc</kbd> Close
-                    </span>
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">M</kbd> Mute
-                    </span>
-                    <span className="flex items-center gap-1">
-                        <kbd className="px-1 py-0.5 rounded bg-white/10 text-white/40 text-[9px] font-mono">D</kbd> Debug
-                    </span>
-                </div>}
+                    <button type="button" onClick={toggleFullscreen}
+                        aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+                        title={isFullscreen ? 'Exit fullscreen (F)' : 'Fullscreen (F)'}
+                        className="shrink-0 rounded-lg p-2 text-white/85 hover:bg-white/10">
+                        {isFullscreen ? <Minimize2 className="h-5 w-5"/> : <Maximize2 className="h-5 w-5"/>}
+                    </button>
+                </footer>
             </div>
         </div>
     );

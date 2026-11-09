@@ -69,6 +69,9 @@ impl<T> InodeLifetimes<T> {
         }
         self.prune(ino);
     }
+    pub(super) fn open_count(&self, ino: u64) -> u64 {
+        self.entries.get(&ino).map_or(0, |entry| entry.opens)
+    }
 }
 
 pub(super) struct FrozenV2Locations {

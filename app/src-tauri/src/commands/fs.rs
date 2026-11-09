@@ -12,17 +12,55 @@ use grammers_session::Session;
 use grammers_tl_types as tl;
 use serde::Serialize;
 use sqlite;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::watch;
 
 // One watch channel per transfer id; flipping it to true cancels every
 // concurrently running part of that transfer.
 static UPLOAD_CANCELLATIONS: OnceLock<Mutex<HashMap<String, watch::Sender<bool>>>> =
     OnceLock::new();
+
+// Prevent rapid channel switching from launching multiple full refreshes for
+// the same cached listing. The cache itself is durable in the local SQLite DB.
+static CHANNEL_LISTING_REFRESHES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static CHANNEL_LISTING_ACCOUNT_ID: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+
+fn channel_listing_refreshes() -> &'static Mutex<HashSet<String>> {
+    CHANNEL_LISTING_REFRESHES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn channel_listing_account_id_cache() -> &'static Mutex<Option<i64>> {
+    CHANNEL_LISTING_ACCOUNT_ID.get_or_init(|| Mutex::new(None))
+}
+
+pub fn clear_channel_listing_account_id() {
+    if let Ok(mut account_id) = channel_listing_account_id_cache().lock() {
+        *account_id = None;
+    }
+}
+
+async fn get_channel_listing_account_id(client: &grammers_client::Client) -> Result<i64, String> {
+    if let Ok(account_id) = channel_listing_account_id_cache().lock() {
+        if let Some(account_id) = *account_id {
+            return Ok(account_id);
+        }
+    }
+
+    let account_id = client
+        .get_me()
+        .await
+        .map_err(|error| error.to_string())?
+        .raw
+        .id();
+    if let Ok(mut cached) = channel_listing_account_id_cache().lock() {
+        *cached = Some(account_id);
+    }
+    Ok(account_id)
+}
 
 fn get_upload_cancellations() -> &'static Mutex<HashMap<String, watch::Sender<bool>>> {
     UPLOAD_CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -716,8 +754,55 @@ pub async fn cmd_delete_folder(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    // A shared channel is NEVER a Telegram channel to delete or leave.
+    if folder_id < 0 {
+        let record = {
+            let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+            crate::commands::shared_channels::record(&conn, folder_id)?
+                .filter(|record| record.deleted_at.is_none())
+                .ok_or("Shared channel no longer exists")?
+        };
+        let client =
+            state.client.lock().await.clone().ok_or(
+                "Telegram must be connected to verify shared-channel contents before removal",
+            )?;
+        let peer =
+            resolve_peer(&client, Some(record.storage_channel_id), &state.peer_cache).await?;
+        crate::commands::shared_channels::ensure_remote_channel_empty(
+            &client,
+            &peer,
+            &record.logical_id,
+        )
+        .await?;
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        crate::commands::shared_channels::remove_empty_shared(&conn, folder_id)?;
+        return Ok(true);
+    }
     let role = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        // Deleting the real Telegram channel would destroy the storage of
+        // *all* dependent TeraRelay channels. Refuse until those are removed.
+        let mut dependents = conn
+            .prepare(
+                "SELECT COUNT(*) FROM shared_channel_views
+             WHERE storage_channel_id = ? AND deleted_at IS NULL",
+            )
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        dependents.bind((1, folder_id)).map_err(|e| e.to_string())?;
+        let active = if dependents
+            .next()
+            .map_err(|e: sqlite::Error| e.to_string())?
+            == sqlite::State::Row
+        {
+            dependents.read::<i64, _>(0).map_err(|e| e.to_string())?
+        } else {
+            0
+        };
+        if active > 0 {
+            return Err(format!(
+                "This Telegram channel stores files for {active} other TeraRelay channels. Remove those shared channels first; the real Telegram channel was NOT deleted."
+            ));
+        }
         crate::commands::logical_channels::role_for_backing_channel(&conn, folder_id)?
     };
     let is_member = role.as_deref() == Some("member");
@@ -807,6 +892,12 @@ pub async fn cmd_rename_folder(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<bool, String> {
+    // Rename the TeraRelay logical view only, not its shared Telegram storage.
+    if folder_id < 0 {
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        crate::commands::shared_channels::rename_shared(&conn, folder_id, &new_name)?;
+        return Ok(true);
+    }
     {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::require_owner_role(&conn, folder_id)?;
@@ -1132,6 +1223,80 @@ impl SpeedWindow {
 // Keeping the storage boundary explicit avoids UI/unit ambiguity and stays
 // below Telegram's normal per-document upload ceiling with safety headroom.
 const SPLIT_PART_SIZE: u64 = 2_000_000_000;
+/// Decimal 4 GB fits Telegram's Premium upload-part limit with 512 KiB MTProto
+/// chunks. The ordinary 2 GB boundary remains the fail-closed default.
+const PREMIUM_SPLIT_PART_SIZE: u64 = 4_000_000_000;
+
+/// Account capability is read from the same authenticated Grammers client as
+/// Boost uploads. None means Telegram could not verify the tier, not "Free".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TelegramAccountTier {
+    pub is_premium: Option<bool>,
+    pub max_part_size_bytes: u64,
+}
+
+fn account_tier_for_verified_flag(is_premium: Option<bool>) -> TelegramAccountTier {
+    TelegramAccountTier {
+        is_premium,
+        max_part_size_bytes: if is_premium == Some(true) {
+            PREMIUM_SPLIT_PART_SIZE
+        } else {
+            SPLIT_PART_SIZE
+        },
+    }
+}
+
+/// Read-only account tier for the dashboard. Does not start a transfer or
+/// mutate the Telegram session. TDLib upload authorization remains separately
+/// checked against this same account immediately before TDLib uploads.
+#[tauri::command]
+pub async fn cmd_telegram_account_tier(
+    state: State<'_, TelegramState>,
+) -> Result<TelegramAccountTier, String> {
+    let client = state.client.lock().await.clone();
+    let Some(client) = client else {
+        return Ok(account_tier_for_verified_flag(None));
+    };
+
+    let verified =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), client.get_me()).await {
+            Ok(Ok(me)) => match me.raw {
+                tl::enums::User::User(user) => Some(user.premium),
+                tl::enums::User::Empty(_) => None,
+            },
+            _ => None,
+        };
+    Ok(account_tier_for_verified_flag(verified))
+}
+
+fn upload_part_size_for_account(
+    is_premium: bool,
+    saved_part_size: Option<u64>,
+    configured_part_size: u64,
+) -> Result<u64, String> {
+    let maximum = if is_premium {
+        PREMIUM_SPLIT_PART_SIZE
+    } else {
+        SPLIT_PART_SIZE
+    };
+    if let Some(saved) = saved_part_size {
+        if saved == 0 || saved > maximum {
+            return Err(
+                "Saved upload uses a Premium-sized part that this account cannot currently upload. The original checkpoint and remote parts are preserved. Restore Premium access or start a new 2 GB-part upload."
+                    .to_string(),
+            );
+        }
+        return Ok(saved);
+    }
+    // Preserve the small-part developer test override, but never allow an
+    // override or an unverified account to exceed Telegram's safe limit.
+    if configured_part_size != SPLIT_PART_SIZE {
+        Ok(configured_part_size.clamp(1, maximum))
+    } else {
+        Ok(maximum)
+    }
+}
+
 const SPLIT_MARKER: &str = ".tgdpart";
 
 pub fn split_part_size() -> u64 {
@@ -1147,8 +1312,8 @@ pub fn split_part_size() -> u64 {
 // small number of split documents side by side fills idle network time without
 // changing the stored file format. Downloads are less flood-sensitive and can
 // use a wider lane count.
-const UPLOAD_MAX_CONNECTIONS: usize = 8;
-const UPLOAD_INITIAL_CONNECTIONS: usize = 4;
+const UPLOAD_MAX_CONNECTIONS: usize = 16;
+const UPLOAD_INITIAL_CONNECTIONS: usize = 8;
 const UPLOAD_PART_WORKERS: usize = 16;
 const UPLOAD_MIN_PART_WORKERS: usize = 8;
 const UPLOAD_MAX_PART_WORKERS: usize = 32;
@@ -2060,6 +2225,7 @@ pub async fn cmd_upload_file(
     source_sha256: Option<String>,
     source_identity: Option<String>,
     upload_name: Option<String>,
+    folder_upload_root: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
@@ -2108,6 +2274,7 @@ pub async fn cmd_upload_file(
         source_sha256,
         source_identity,
         upload_name,
+        folder_upload_root,
         app_handle,
         state,
         tdlib_state,
@@ -2137,6 +2304,7 @@ async fn cmd_upload_file_inner(
     source_sha256: Option<String>,
     source_identity: Option<String>,
     upload_name: Option<String>,
+    folder_upload_root: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     tdlib_state: State<'_, crate::tdlib_fast::TdlibFastState>,
@@ -2144,6 +2312,13 @@ async fn cmd_upload_file_inner(
     bw_state: State<'_, Arc<BandwidthManager>>,
     net_config: State<'_, std::sync::Arc<NetworkConfig>>,
 ) -> Result<UploadFileResult, String> {
+    // Folder uploads pass the exact canonical root returned by the native
+    // inventory command. Recheck it for every queued file to stop a moved or
+    // symlink-substituted source from escaping the originally selected folder.
+    if let Some(expected_root) = folder_upload_root.as_deref() {
+        validate_folder_upload_source(&path, expected_root).await?;
+    }
+
     let explicit_transfer_engine = transfer_engine.is_some();
     let transfer_engine =
         crate::commands::transfer_engine::TransferEngine::parse(transfer_engine.as_deref())?;
@@ -2157,21 +2332,20 @@ async fn cmd_upload_file_inner(
     // the existing Grammers/MTProto path everywhere else.
     let use_tdlib = transfer_engine.uses_tdlib() && tdlib_platform_supported;
 
-    let logical_channel_id = if let Some(backing_channel_id) = folder_id {
+    let (logical_channel_id, physical_folder_id) = if let Some(view_channel_id) = folder_id {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, folder_id)?;
-        Some(
-            crate::commands::logical_channels::logical_channel_id_for_backing(
-                &conn,
-                backing_channel_id,
-            )?
-            .ok_or_else(|| {
-                "TeraRelay logical channel metadata is missing. Sync channels and retry."
-                    .to_string()
-            })?,
-        )
+        let physical_id = crate::commands::shared_channels::physical_id(&conn, folder_id)?;
+        let logical_id = crate::commands::logical_channels::logical_channel_id_for_backing(
+            &conn,
+            view_channel_id,
+        )?
+        .ok_or_else(|| {
+            "TeraRelay logical channel metadata is missing. Sync channels and retry.".to_string()
+        })?;
+        (Some(logical_id), physical_id)
     } else {
-        None
+        (None, None)
     };
     let logical_file_id = logical_channel_id
         .as_ref()
@@ -2283,9 +2457,62 @@ async fn cmd_upload_file_inner(
         }
     };
 
-    // Multipart numbering is checked independently of file size. The
-    // manifest preflight runs before any data upload or large allocation.
-    let part_size = split_part_size().max(1);
+    // Resolve the capability from the *main authenticated Telegram account*
+    // for both MTProto Boost and TDLib. TDLib may have a separate authorization;
+    // it must never be trusted as the sole proof that this uploader is Premium.
+    // An unavailable/unknown result fails closed to the existing 2 GB layout.
+    let (account_id, mut is_premium) =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), client.get_me()).await {
+            Ok(Ok(me)) => match me.raw {
+                tl::enums::User::User(user) => (Some(user.id), user.premium),
+                tl::enums::User::Empty(user) => (Some(user.id), false),
+            },
+            _ => {
+                log::warn!("Telegram account capability unavailable; using standard upload limits");
+                (None, false)
+            }
+        };
+
+    if use_tdlib {
+        match (
+            account_id,
+            crate::tdlib_fast::tdlib_account_capability(tdlib_state.inner()).await,
+        ) {
+            (Some(main_id), Some((tdlib_id, tdlib_premium))) if main_id == tdlib_id => {
+                is_premium &= tdlib_premium;
+            }
+            (Some(_), Some(_)) => {
+                bw_state.release_up(size);
+                return Err("TDLib is signed into a different Telegram account. Reconnect the TDLib transfer engine before uploading.".to_string());
+            }
+            _ => {
+                // TDLib session identity may not have settled yet. Retain the
+                // existing small-file behavior until both accounts are verified.
+                is_premium = false;
+                log::warn!("TDLib Premium capability unknown; using standard upload limits");
+            }
+        }
+    }
+
+    // An interrupted upload keeps its original physical layout even if the
+    // user upgrades to Premium in the meantime. A downgrade never silently
+    // rewrites or deletes an existing Premium checkpoint.
+    let saved_part_size = crate::commands::transfers::UploadJournal::saved_part_size(
+        db_pool.inner(),
+        &path,
+        &tid,
+        folder_id,
+    )
+    .inspect_err(|_| bw_state.release_up(size))?;
+    let part_size = upload_part_size_for_account(is_premium, saved_part_size, split_part_size())
+        .inspect_err(|_| bw_state.release_up(size))?;
+    log::info!(
+        "Telegram upload size policy: premium={}, bytes_per_document={}, resumed_layout={}",
+        is_premium,
+        part_size,
+        saved_part_size.is_some(),
+    );
+    // Multipart numbering and manifest capacity are checked before upload.
     let total_parts =
         checked_upload_part_count(size, part_size).inspect_err(|_| bw_state.release_up(size))?;
     crate::commands::logical_files::ensure_upload_manifest_capacity(
@@ -2307,7 +2534,23 @@ async fn cmd_upload_file_inner(
     )
     .await
     .inspect_err(|_| bw_state.release_up(size))?;
+    if let Some(account_id) = account_id {
+        journal
+            .bind_account(account_id)
+            .inspect_err(|_| bw_state.release_up(size))?;
+    }
     let logical_file_id = journal.snapshot.logical_file_id.clone();
+    // Physical multipart names must be unique per logical file when several
+    // TeraRelay views share the same Telegram history. Otherwise a same-name
+    // upload in another view could accidentally reuse the wrong saved part.
+    let physical_part_base = if folder_id.is_some_and(|id| id < 0) {
+        logical_file_id
+            .as_ref()
+            .map(|id| format!("tr-{id}"))
+            .ok_or("Shared upload has no stable file identity")?
+    } else {
+        file_name.clone()
+    };
     if journal.snapshot.source.size != size {
         bw_state.release_up(size);
         return Err(
@@ -2322,7 +2565,7 @@ async fn cmd_upload_file_inner(
         &client,
         &peer,
         &path,
-        &file_name,
+        &physical_part_base,
         total_parts,
         part_size,
         &journal,
@@ -2471,7 +2714,7 @@ async fn cmd_upload_file_inner(
     let upload_result: Result<(), String> = if use_tdlib {
         log::info!("Upload transport: {}", transfer_engine.label());
 
-        let destination = match folder_id {
+        let destination = match physical_folder_id {
             Some(id) => crate::tdlib_fast::FastDestination::Channel(id),
             None => crate::tdlib_fast::FastDestination::SavedMessages,
         };
@@ -2524,7 +2767,7 @@ async fn cmd_upload_file_inner(
             let prepare_part = |idx: u32| {
                 let app_handle = app_handle.clone();
                 let source_path = path.clone();
-                let logical_name = file_name.clone();
+                let logical_name = physical_part_base.clone();
                 let expected_source = expected_source.clone();
                 async move {
                     crate::commands::transfers::verify_source(&source_path, &expected_source)
@@ -2606,7 +2849,22 @@ async fn cmd_upload_file_inner(
                     );
                     let prepare_future = prepare_part(next_idx);
 
-                    let (upload_result, next_result) = tokio::join!(upload_future, prepare_future);
+                    // Premium-sized TDLib files are staged locally. Never
+                    // prepare two 4 GB parts concurrently: that doubles peak
+                    // disk consumption and risks ENOSPC on smaller drives.
+                    let (upload_result, next_result) = if len > SPLIT_PART_SIZE {
+                        let uploaded = upload_future.await;
+                        let succeeded = uploaded.is_ok();
+                        cleanup_temp(temp_path.clone()).await;
+                        let next = if succeeded {
+                            prepare_future.await
+                        } else {
+                            Err("Upload stopped before preparing the next part".to_string())
+                        };
+                        (uploaded, next)
+                    } else {
+                        tokio::join!(upload_future, prepare_future)
+                    };
 
                     cleanup_temp(temp_path).await;
 
@@ -2709,7 +2967,7 @@ async fn cmd_upload_file_inner(
                 let (doc_name, base_caption) = if total_parts == 1 {
                     (file_name.clone(), String::new())
                 } else {
-                    let part_name = split_part_name(&file_name, idx, total_parts as u32);
+                    let part_name = split_part_name(&physical_part_base, idx, total_parts as u32);
                     (part_name.clone(), part_name)
                 };
 
@@ -3157,6 +3415,63 @@ async fn matching_upload_manifest(
     Ok(None)
 }
 
+async fn recover_logical_move_destination(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    source: &crate::commands::logical_files::LogicalFileManifestV1,
+    target_channel_id: &str,
+) -> Result<Option<crate::commands::logical_files::LogicalFileManifestV1>, String> {
+    let Some(manifest_id) = find_logical_manifest_message_ids(client, peer, &source.file_id)
+        .await?
+        .into_iter()
+        .max()
+    else {
+        return Ok(None);
+    };
+    let message = get_messages_in_batches(client, peer, &[manifest_id])
+        .await?
+        .into_iter()
+        .flatten()
+        .next()
+        .ok_or("The existing destination manifest disappeared. Refresh and retry the move.")?;
+    let media = message
+        .media()
+        .ok_or("The existing destination manifest is missing its document")?;
+    let destination = crate::commands::logical_files::download_manifest(
+        client,
+        &media,
+        Some(&source.file_id),
+        Some(target_channel_id),
+    )
+    .await?;
+    if !source.matches_move_destination(&destination, target_channel_id) {
+        return Err("The destination already contains a conflicting file manifest. The source was preserved.".into());
+    }
+
+    let ids: Vec<i32> = destination
+        .chunks
+        .iter()
+        .map(|chunk| chunk.message_id as i32)
+        .collect();
+    let sizes: HashMap<i32, u64> = get_messages_in_batches(client, peer, &ids)
+        .await?
+        .into_iter()
+        .flatten()
+        .filter_map(|message| match message.media() {
+            Some(Media::Document(document)) => Some((message.id(), document.size() as u64)),
+            _ => None,
+        })
+        .collect();
+    if destination
+        .chunks
+        .iter()
+        .any(|chunk| sizes.get(&(chunk.message_id as i32)) != Some(&chunk.size))
+    {
+        return Err("The existing destination is incomplete. The source was preserved.".into());
+    }
+    Ok(Some(destination))
+}
+
 async fn upload_logical_manifest_document(
     client: &grammers_client::Client,
     app_handle: &tauri::AppHandle,
@@ -3397,6 +3712,7 @@ pub async fn initiate_upload(
         None,
         None,
         None,
+        None,
         app_handle,
         state,
         tdlib_state,
@@ -3437,6 +3753,12 @@ pub async fn cmd_rename_file(
             None
         }
     };
+
+    // A shared view must never rename or delete a message owned by another
+    // view, even if a caller supplies a valid physical Telegram message ID.
+    if folder_id.is_some_and(|id| id < 0) && logical_manifest.is_none() {
+        return Err("This file does not belong to the selected shared TeraRelay channel. Refresh and retry.".into());
+    }
 
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
@@ -3616,6 +3938,12 @@ pub(crate) async fn delete_file_inner(
             None
         }
     };
+
+    // A shared view must never rename or delete a message owned by another
+    // view, even if a caller supplies a valid physical Telegram message ID.
+    if folder_id.is_some_and(|id| id < 0) && logical_manifest.is_none() {
+        return Err("This file does not belong to the selected shared TeraRelay channel. Refresh and retry.".into());
+    }
 
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
@@ -4801,6 +5129,8 @@ pub struct DownloadFileRequest {
     folder_id: Option<i64>,
     transfer_id: Option<String>,
     transfer_engine: Option<String>,
+    #[serde(default)]
+    no_overwrite: bool,
 }
 
 #[tauri::command]
@@ -4828,6 +5158,12 @@ pub async fn cmd_download_file(
     let save_path = req.save_path;
     let folder_id = req.folder_id;
     let message_id = req.message_id;
+    // The displayed shared channel has its own file identity, but TDLib's
+    // destination must always be the physical Telegram peer.
+    let physical_folder_id = {
+        let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        crate::commands::shared_channels::physical_id(&conn, folder_id)?
+    };
 
     #[cfg(target_os = "android")]
     let (actual_save_path, android_output_uri) = {
@@ -4873,6 +5209,14 @@ pub async fn cmd_download_file(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let actual_save_path = save_path.clone();
 
+    if req.no_overwrite {
+        match tokio::fs::symlink_metadata(&actual_save_path).await {
+            Ok(_) => return Err(crate::download_output::DESTINATION_EXISTS.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot inspect download destination: {error}")),
+        }
+    }
+
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
@@ -4882,9 +5226,12 @@ pub async fn cmd_download_file(
             folder_id,
             actual_save_path
         );
-        if let Err(e) = tokio::fs::write(&actual_save_path, b"Mock Content").await {
-            return Err(e.to_string());
-        }
+        let mut output =
+            crate::download_output::DownloadOutput::create(&actual_save_path, &tid).await?;
+        tokio::fs::write(output.path(), b"Mock Content")
+            .await
+            .map_err(|error| error.to_string())?;
+        output.publish(req.no_overwrite).await?;
         return Ok("Download successful".to_string());
     }
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
@@ -4913,6 +5260,10 @@ pub async fn cmd_download_file(
     } else {
         None
     };
+
+    if folder_id.is_some_and(|id| id < 0) && logical_manifest.is_none() {
+        return Err("This file does not belong to the selected shared TeraRelay channel. Refresh and retry.".into());
+    }
 
     let part_ids: Vec<i32> = if let Some(manifest) = logical_manifest.as_ref() {
         manifest
@@ -5094,7 +5445,7 @@ pub async fn cmd_download_file(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let destination = match folder_id {
+        let destination = match physical_folder_id {
             Some(id) => crate::tdlib_fast::FastDestination::Channel(id),
             None => crate::tdlib_fast::FastDestination::SavedMessages,
         };
@@ -5429,7 +5780,7 @@ pub async fn cmd_download_file(
         }
     }
     output
-        .publish()
+        .publish(req.no_overwrite)
         .await
         .inspect_err(|_| bw_state.release_down(total_size))?;
 
@@ -5505,6 +5856,24 @@ pub async fn cmd_move_files(
     .await
 }
 
+async fn remove_cross_channel_move_source(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    ids: &[i32],
+) -> Result<(), String> {
+    let Err(error) = client.delete_messages(peer, ids).await else {
+        return Ok(());
+    };
+    // Telegram can remove the source before the response is lost. Only a
+    // complete lookup confirming that every message is gone resolves that error.
+    match get_messages_in_batches(client, peer, ids).await {
+        Ok(messages) if messages.len() == ids.len() && messages.iter().all(Option::is_none) => {
+            Ok(())
+        }
+        _ => Err(error.to_string()),
+    }
+}
+
 pub(crate) async fn move_files_inner(
     message_ids: Vec<i32>,
     source_folder_id: Option<i64>,
@@ -5513,8 +5882,12 @@ pub(crate) async fn move_files_inner(
     state: &TelegramState,
     db_pool: &DbConnection,
 ) -> Result<bool, String> {
-    let (source_logical_channel_id, target_logical_channel_id) = {
+    let (source_logical_channel_id, target_logical_channel_id, same_physical_storage) = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        let source_storage =
+            crate::commands::shared_channels::physical_id(&conn, source_folder_id)?;
+        let target_storage =
+            crate::commands::shared_channels::physical_id(&conn, target_folder_id)?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, source_folder_id)?;
         crate::commands::logical_channels::ensure_channel_can_upload(&conn, target_folder_id)?;
 
@@ -5536,12 +5909,21 @@ pub(crate) async fn move_files_inner(
             }
             None => None,
         };
-        (source, target)
+        (
+            source,
+            target,
+            source_storage.is_some() && source_storage == target_storage,
+        )
     };
 
     if source_folder_id == target_folder_id {
         return Ok(true);
     }
+
+    // Do not let two requests in this app forward the same source before
+    // either has published its destination manifest.
+    static MOVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _move = MOVE_LOCK.lock().await;
     let client_opt = { state.client.lock().await.clone() };
     #[cfg(debug_assertions)]
     if client_opt.is_none() {
@@ -5592,6 +5974,84 @@ pub(crate) async fn move_files_inner(
         }
     }
 
+    let involves_shared_channel =
+        source_folder_id.is_some_and(|id| id < 0) || target_folder_id.is_some_and(|id| id < 0);
+    if involves_shared_channel && manifest_seed_ids.len() != message_ids.len() {
+        return Err("Only verified manifest-backed files may be moved into or out of shared-storage channels. Refresh the source channel and retry.".into());
+    }
+
+    if same_physical_storage {
+        // Reclassifying a file between two TeraRelay views of the SAME Telegram
+        // peer must never forward/delete the physical chunks. Publish only a
+        // new ownership manifest. The newest manifest wins across both views.
+        let target_logical = target_logical_channel_id
+            .as_deref()
+            .ok_or("Shared storage move requires a logical target channel")?;
+        if logical_manifests.len() != message_ids.len() {
+            return Err(
+                "Only manifest-backed files can move between channels sharing one storage".into(),
+            );
+        }
+        for mut manifest in logical_manifests {
+            let old_logical_id = manifest.logical_channel_id.clone();
+            let old_control_ids =
+                find_logical_manifest_message_ids(&client, &source_peer, &manifest.file_id).await?;
+            manifest.logical_channel_id = target_logical.to_string();
+            let newest_id =
+                upload_logical_manifest_document(&client, &app_handle, &manifest, &target_peer)
+                    .await?;
+            let stale: Vec<_> = old_control_ids
+                .into_iter()
+                .filter(|id| i64::from(*id) != newest_id)
+                .collect();
+            if !stale.is_empty() {
+                if let Err(error) = client.delete_messages(&source_peer, &stale).await {
+                    log::warn!("Shared-channel move left older control documents: {error}. Newer ownership manifest remains authoritative.");
+                }
+            }
+            // Telegram has accepted the new owner. Update the logical cache
+            // and its default native Drive folder as one SQLite savepoint.
+            let changed_drive_entry = {
+                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                conn.execute("SAVEPOINT shared_view_move")
+                    .map_err(|e: sqlite::Error| e.to_string())?;
+                let result = (|| {
+                    crate::commands::logical_files::persist_manifest(&conn, &manifest)?;
+                    crate::commands::drive_metadata::reflect_shared_channel_move_in_drive(
+                        &conn,
+                        &manifest.file_id,
+                        &old_logical_id,
+                        target_logical,
+                    )
+                })();
+                crate::drive_posix::finish_savepoint(&conn, "shared_view_move", result).map_err(
+                    |error| {
+                        format!(
+                        "File moved on Telegram, but its local Drive index needs refresh: {error}"
+                    )
+                    },
+                )?
+            };
+            if let Some((old_parent, old_name, new_parent, new_name, entry_id)) =
+                changed_drive_entry
+            {
+                crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                    &app_handle,
+                    Some(&old_parent),
+                    &old_name,
+                    Some(&entry_id),
+                );
+                crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                    &app_handle,
+                    Some(&new_parent),
+                    &new_name,
+                    Some(&entry_id),
+                );
+            }
+        }
+        return Ok(true);
+    }
+
     let mut legacy_message_ids: Vec<i32> = message_ids
         .into_iter()
         .filter(|id| !manifest_seed_ids.contains(id))
@@ -5601,71 +6061,92 @@ pub(crate) async fn move_files_inner(
     if let Some(target_logical_channel_id) = target_logical_channel_id.as_deref() {
         // Logical channel -> logical channel: forward only the physical chunks,
         // then publish a target manifest containing the NEW Telegram message IDs.
-        for mut manifest in logical_manifests {
+        for source_manifest in logical_manifests {
+            let old_logical_id = source_manifest.logical_channel_id.clone();
             let source_manifest_ids =
-                find_logical_manifest_message_ids(&client, &source_peer, &manifest.file_id).await?;
-            let source_chunk_ids: Vec<i32> = manifest
+                find_logical_manifest_message_ids(&client, &source_peer, &source_manifest.file_id)
+                    .await?;
+            let recovered = recover_logical_move_destination(
+                &client,
+                &target_peer,
+                &source_manifest,
+                target_logical_channel_id,
+            )
+            .await?;
+            if let Some(source_manifest_id) = source_manifest_ids.iter().copied().max() {
+                if matching_upload_manifest(
+                    &client,
+                    &source_peer,
+                    &source_manifest,
+                    Some(i64::from(source_manifest_id)),
+                )
+                .await?
+                .is_none()
+                {
+                    return Err(
+                        "The source file changed during the move. Refresh and retry.".into(),
+                    );
+                }
+            } else if recovered.is_none() {
+                return Err(
+                    "The source manifest is missing. Refresh before retrying the move.".into(),
+                );
+            }
+
+            let source_chunk_ids: Vec<i32> = source_manifest
                 .chunks
                 .iter()
                 .map(|chunk| chunk.message_id as i32)
                 .collect();
+            let manifest = if let Some(destination) = recovered {
+                destination
+            } else {
+                let forwarded = client
+                    .forward_messages(&target_peer, &source_chunk_ids, &source_peer)
+                    .await
+                    .map_err(|e| format!("Forward logical file failed: {e}"))?;
+                let target_chunk_ids: Vec<_> = forwarded
+                    .iter()
+                    .flatten()
+                    .map(|message| message.id())
+                    .collect();
+                let complete = forwarded.len() == source_manifest.chunks.len()
+                    && forwarded.iter().zip(&source_manifest.chunks).all(|(message, chunk)| {
+                        matches!(
+                            message.as_ref().and_then(|message| message.media()),
+                            Some(Media::Document(document)) if document.size() as u64 == chunk.size
+                        )
+                    });
+                if !complete {
+                    if !target_chunk_ids.is_empty() {
+                        let _ = client
+                            .delete_messages(&target_peer, &target_chunk_ids)
+                            .await;
+                    }
+                    return Err("Telegram did not forward every expected file chunk. The source was preserved.".into());
+                }
 
-            let forwarded = client
-                .forward_messages(&target_peer, &source_chunk_ids, &source_peer)
-                .await
-                .map_err(|e| format!("Forward logical file failed: {e}"))?;
-
-            let mut target_chunk_ids = Vec::with_capacity(forwarded.len());
-            for forwarded_message in forwarded {
-                match forwarded_message {
-                    Some(message) => target_chunk_ids.push(message.id()),
-                    None => {
-                        if !target_chunk_ids.is_empty() {
-                            let _ = client
-                                .delete_messages(&target_peer, &target_chunk_ids)
-                                .await;
-                        }
-                        return Err(
-                            "Telegram did not forward every logical file chunk; the target copy was rolled back."
-                                .to_string(),
-                        );
+                let mut manifest = source_manifest;
+                manifest.logical_channel_id = target_logical_channel_id.to_string();
+                for (chunk, id) in manifest.chunks.iter_mut().zip(target_chunk_ids) {
+                    chunk.message_id = i64::from(id);
+                }
+                if let Err(error) =
+                    upload_logical_manifest_document(&client, &app_handle, &manifest, &target_peer)
+                        .await
+                {
+                    // A failed response may follow a successful publish. Keep
+                    // the chunks and confirm the exact manifest before deleting the source.
+                    if !matches!(
+                        matching_upload_manifest(&client, &target_peer, &manifest, None).await,
+                        Ok(Some(_))
+                    ) {
+                        return Err(format!(
+                            "Could not verify publication of the destination manifest. The source was preserved: {error}"
+                        ));
                     }
                 }
-            }
-            if target_chunk_ids.len() != manifest.chunks.len() {
-                if !target_chunk_ids.is_empty() {
-                    let _ = client
-                        .delete_messages(&target_peer, &target_chunk_ids)
-                        .await;
-                }
-                return Err(
-                    "Forwarded logical file chunk count did not match the manifest; the target copy was rolled back."
-                        .to_string(),
-                );
-            }
-
-            manifest.logical_channel_id = target_logical_channel_id.to_string();
-            for (chunk, new_message_id) in manifest.chunks.iter_mut().zip(target_chunk_ids.iter()) {
-                chunk.message_id = *new_message_id as i64;
-            }
-
-            let target_manifest_id = match upload_logical_manifest_document(
-                &client,
-                &app_handle,
-                &manifest,
-                &target_peer,
-            )
-            .await
-            {
-                Ok(id) => id as i32,
-                Err(error) => {
-                    let _ = client
-                        .delete_messages(&target_peer, &target_chunk_ids)
-                        .await;
-                    return Err(format!(
-                        "Forwarded chunks were rolled back because the target TeraRelay manifest could not be published: {error}"
-                    ));
-                }
+                manifest
             };
 
             let mut source_delete_ids = source_chunk_ids;
@@ -5673,29 +6154,47 @@ pub(crate) async fn move_files_inner(
             source_delete_ids.sort_unstable();
             source_delete_ids.dedup();
 
-            if let Err(error) = client
-                .delete_messages(&source_peer, &source_delete_ids)
+            remove_cross_channel_move_source(&client, &source_peer, &source_delete_ids)
                 .await
-            {
-                let mut rollback_ids = target_chunk_ids;
-                rollback_ids.push(target_manifest_id);
-                rollback_ids.sort_unstable();
-                rollback_ids.dedup();
-                let _ = client.delete_messages(&target_peer, &rollback_ids).await;
-                return Err(format!(
-                    "Could not remove the source logical file; the target copy was rolled back: {error}"
-                ));
-            }
+                .map_err(|error| {
+                    format!(
+                        "The destination copy is safe, but source removal could not be confirmed. Retry the move to finish cleanup: {error}"
+                    )
+                })?;
 
             let persist_result = {
                 let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
-                crate::commands::logical_files::persist_manifest(&conn, &manifest)
+                if involves_shared_channel {
+                    conn.execute("SAVEPOINT cross_storage_shared_move")
+                        .map_err(|e: sqlite::Error| e.to_string())?;
+                    let result = (|| {
+                        crate::commands::logical_files::persist_manifest(&conn, &manifest)?;
+                        crate::commands::drive_metadata::reflect_shared_channel_move_in_drive(
+                            &conn,
+                            &manifest.file_id,
+                            &old_logical_id,
+                            target_logical_channel_id,
+                        )
+                    })();
+                    crate::drive_posix::finish_savepoint(&conn, "cross_storage_shared_move", result)
+                } else {
+                    crate::commands::logical_files::persist_manifest(&conn, &manifest).map(|_| None)
+                }
             };
-            if let Err(error) = persist_result {
-                log::warn!(
-                    "Logical move completed remotely but local target manifest cache update failed: {}",
+            match persist_result {
+                Ok(Some((old_parent, old_name, new_parent, new_name, entry_id))) => {
+                    crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                        &app_handle, Some(&old_parent), &old_name, Some(&entry_id),
+                    );
+                    crate::commands::drive_metadata::notify_native_drive_entry_changed(
+                        &app_handle, Some(&new_parent), &new_name, Some(&entry_id),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "Logical move completed remotely but local target/Drive cache update failed: {}",
                     error
-                );
+                ),
             }
         }
     } else {
@@ -5772,24 +6271,292 @@ pub(crate) async fn move_files_inner(
     source_delete_ids.sort_unstable();
     source_delete_ids.dedup();
 
-    if let Err(error) = client
-        .delete_messages(&source_peer, &source_delete_ids)
+    remove_cross_channel_move_source(&client, &source_peer, &source_delete_ids)
         .await
-    {
-        let _ = client
-            .delete_messages(&target_peer, &target_forwarded_ids)
-            .await;
-        return Err(format!(
-            "Delete original failed; the target copy was rolled back: {error}"
-        ));
-    }
+        .map_err(|error| {
+            format!(
+                "The destination copy is safe, but source removal could not be confirmed. Check both locations before retrying: {error}"
+            )
+        })?;
 
     Ok(true)
+}
+
+// A metadata key can have several Telegram messages after a rename/move.
+// Try those versions newest first; other keys need not wait for this one.
+async fn resolve_channel_manifest_groups<K, C, V, Download, DownloadFuture>(
+    groups: impl IntoIterator<Item = (K, Vec<(i64, C)>)>,
+    download: Download,
+) -> Vec<(i64, V)>
+where
+    K: Clone,
+    Download: Fn(K, C) -> DownloadFuture,
+    DownloadFuture: std::future::Future<Output = Option<V>>,
+{
+    use futures::stream::{self, StreamExt};
+
+    let download = &download;
+    let mut resolved: Vec<_> = stream::iter(groups)
+        .map(|(key, candidates)| async move {
+            for (message_id, candidate) in candidates {
+                if let Some(manifest) = download(key.clone(), candidate).await {
+                    return Some((message_id, manifest));
+                }
+            }
+            None
+        })
+        .buffer_unordered(8)
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
+    // Stack collapse used Telegram history order; keep it even though the
+    // download of a later candidate can finish first.
+    resolved.sort_unstable_by_key(|(message_id, _)| std::cmp::Reverse(*message_id));
+    resolved
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn channel_manifest_downloads_overlap_without_selecting_an_older_valid_version() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let fast_started = AtomicBool::new(false);
+    let slow_candidates = vec![
+        (12, (Some(wait), None)),
+        (10, (None, Some("latest valid"))),
+        (9, (None, Some("stale"))),
+    ];
+    let fast_candidates = vec![(11, (None, Some("independent")))];
+    let groups = [("slow", slow_candidates), ("fast", fast_candidates)];
+    let mut resolution = std::pin::pin!(resolve_channel_manifest_groups(
+        groups,
+        |key, (wait, value)| {
+            let fast_started = &fast_started;
+            async move {
+                if key == "fast" {
+                    fast_started.store(true, Ordering::SeqCst);
+                }
+                if let Some(wait) = wait {
+                    wait.await.unwrap();
+                }
+                value
+            }
+        },
+    ));
+
+    assert!(futures::poll!(resolution.as_mut()).is_pending());
+    assert!(fast_started.load(Ordering::SeqCst));
+    release.send(()).unwrap();
+    assert_eq!(
+        resolution.await,
+        [(11, "independent"), (10, "latest valid")]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn channel_file_listing_cache_round_trips_without_cross_channel_leaks() {
+    let conn = sqlite::open(":memory:").unwrap();
+    conn.execute(
+        "CREATE TABLE channel_file_listing_cache (
+            folder_key TEXT PRIMARY KEY NOT NULL,
+            files_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+    )
+    .unwrap();
+    let db: DbConnection = Arc::new(Mutex::new(conn));
+    let file = FileMetadata {
+        id: 7,
+        folder_id: Some(42),
+        name: "episode.mp4".to_string(),
+        size: 1234,
+        mime_type: Some("video/mp4".to_string()),
+        file_ext: Some("mp4".to_string()),
+        created_at: "2026-11-08".to_string(),
+        icon_type: "file".to_string(),
+        is_split: false,
+        logical_file_id: Some("logical-file-7".to_string()),
+        stack_id: None,
+        stack_name: None,
+        stack_version_count: 0,
+        stack_label: None,
+    };
+
+    write_cached_channel_listing(&db, 1001, None, std::slice::from_ref(&file)).unwrap();
+    let channel_file = FileMetadata {
+        folder_id: Some(42),
+        ..file.clone()
+    };
+    write_cached_channel_listing(&db, 1001, Some(42), &[channel_file]).unwrap();
+
+    let other_account_file = FileMetadata {
+        name: "private-account-file.mp4".to_string(),
+        ..file.clone()
+    };
+    write_cached_channel_listing(&db, 2002, Some(42), &[other_account_file]).unwrap();
+
+    assert_eq!(
+        read_cached_channel_listing(&db, 1001, None).unwrap()[0].name,
+        "episode.mp4"
+    );
+    assert_eq!(
+        read_cached_channel_listing(&db, 1001, Some(42)).unwrap()[0].folder_id,
+        Some(42)
+    );
+    assert_eq!(
+        read_cached_channel_listing(&db, 2002, Some(42)).unwrap()[0].name,
+        "private-account-file.mp4"
+    );
+    assert!(read_cached_channel_listing(&db, 1001, Some(43)).is_none());
+    assert!(read_cached_channel_listing(&db, 2002, None).is_none());
+}
+
+#[derive(Clone, Serialize)]
+struct ChannelFilesUpdated {
+    folder_id: Option<i64>,
+    files: Vec<FileMetadata>,
+}
+
+const MAX_CACHED_CHANNEL_LISTING_BYTES: usize = 16 * 1024 * 1024;
+
+fn channel_listing_cache_key(account_id: i64, folder_id: Option<i64>) -> String {
+    let folder =
+        folder_id.map_or_else(|| "personal-vault".to_string(), |id| format!("folder:{id}"));
+    format!("account:{account_id}:{folder}")
+}
+
+fn read_cached_channel_listing(
+    db_pool: &DbConnection,
+    account_id: i64,
+    folder_id: Option<i64>,
+) -> Option<Vec<FileMetadata>> {
+    let conn = db_pool.lock().ok()?;
+    let mut stmt = conn
+        .prepare("SELECT files_json FROM channel_file_listing_cache WHERE folder_key = ?1")
+        .ok()?;
+    let key = channel_listing_cache_key(account_id, folder_id);
+    stmt.bind((1, key.as_str())).ok()?;
+    if stmt.next().ok()? != sqlite::State::Row {
+        return None;
+    }
+    let json = stmt.read::<String, _>(0).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn write_cached_channel_listing(
+    db_pool: &DbConnection,
+    account_id: i64,
+    folder_id: Option<i64>,
+    files: &[FileMetadata],
+) -> Result<(), String> {
+    let json = serde_json::to_string(files).map_err(|error| error.to_string())?;
+    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    let key = channel_listing_cache_key(account_id, folder_id);
+    if json.len() > MAX_CACHED_CHANNEL_LISTING_BYTES {
+        let mut remove = conn
+            .prepare("DELETE FROM channel_file_listing_cache WHERE folder_key = ?1")
+            .map_err(|error| error.to_string())?;
+        remove
+            .bind((1, key.as_str()))
+            .map_err(|error| error.to_string())?;
+        remove.next().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO channel_file_listing_cache (folder_key, files_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder_key) DO UPDATE SET
+                 files_json = excluded.files_json,
+                 updated_at_ms = excluded.updated_at_ms",
+        )
+        .map_err(|error| error.to_string())?;
+    stmt.bind((1, key.as_str()))
+        .map_err(|error| error.to_string())?;
+    stmt.bind((2, json.as_str()))
+        .map_err(|error| error.to_string())?;
+    stmt.bind((3, chrono::Utc::now().timestamp_millis()))
+        .map_err(|error| error.to_string())?;
+    stmt.next().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn queue_cached_channel_listing_refresh(
+    app: AppHandle,
+    account_id: i64,
+    folder_id: Option<i64>,
+    client: grammers_client::Client,
+    active_client: Arc<tokio::sync::Mutex<Option<grammers_client::Client>>>,
+    peer_cache: Arc<tokio::sync::RwLock<HashMap<i64, Peer>>>,
+    db_pool: DbConnection,
+) {
+    let cache_key = channel_listing_cache_key(account_id, folder_id);
+    {
+        let Ok(mut active) = channel_listing_refreshes().lock() else {
+            return;
+        };
+        if !active.insert(cache_key.clone()) {
+            return;
+        }
+    }
+
+    tauri::async_runtime::spawn(async move {
+        match get_files_from_telegram(folder_id, client, peer_cache, db_pool.clone()).await {
+            Ok(files) => {
+                // A refresh can outlive logout/account switching. Never publish
+                // results from an old Telegram identity into the new session.
+                let current_client = active_client.lock().await.clone();
+                let active_account_id = match current_client {
+                    Some(current) => current.get_me().await.ok().map(|user| user.raw.id()),
+                    None => None,
+                };
+                if active_account_id == Some(account_id) {
+                    if let Err(error) =
+                        write_cached_channel_listing(&db_pool, account_id, folder_id, &files)
+                    {
+                        log::warn!(
+                            "Could not update cached file listing for {folder_id:?}: {error}"
+                        );
+                    }
+                    let _ = app.emit("files-updated", ChannelFilesUpdated { folder_id, files });
+                } else {
+                    log::debug!("Discarded stale channel listing refresh for {folder_id:?} after account change");
+                }
+            }
+            Err(error) => {
+                log::warn!("Background file-list refresh failed for {folder_id:?}: {error}");
+            }
+        }
+
+        if let Ok(mut active) = channel_listing_refreshes().lock() {
+            active.remove(&cache_key);
+        }
+    });
+}
+
+/// Fetch only the Telegram media types the channel listing can display.
+/// Searching documents/photos avoids paginating through text-only history and
+/// lets both independent media indexes progress concurrently.
+async fn collect_channel_media_messages(
+    client: &grammers_client::Client,
+    peer: &grammers_client::types::Peer,
+    filter: tl::enums::MessagesFilter,
+) -> Result<Vec<grammers_client::types::Message>, String> {
+    let mut messages = client.search_messages(peer).filter(filter);
+    let mut collected = Vec::new();
+    while let Some(message) = messages.next().await.map_err(|error| error.to_string())? {
+        collected.push(message);
+    }
+    Ok(collected)
 }
 
 #[tauri::command]
 pub async fn cmd_get_files(
     folder_id: Option<i64>,
+    app: AppHandle,
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<Vec<FileMetadata>, String> {
@@ -5805,31 +6572,94 @@ pub async fn cmd_get_files(
         }
         return Ok(Vec::new()); // No mock files for now
     }
+
     let client = client_opt.ok_or_else(|| "Client not connected".to_string())?;
+    let account_id = get_channel_listing_account_id(&client).await?;
+    let peer_cache = state.peer_cache.clone();
+    let active_client = state.client.clone();
+    let db_pool = db_pool.inner().clone();
+
+    // A previously opened channel renders from its durable account-scoped
+    // listing immediately. Reconciliation continues in the background.
+    if let Some(cached) = read_cached_channel_listing(&db_pool, account_id, folder_id) {
+        queue_cached_channel_listing_refresh(
+            app,
+            account_id,
+            folder_id,
+            client,
+            active_client,
+            peer_cache,
+            db_pool,
+        );
+        return Ok(cached);
+    }
+
+    let files = get_files_from_telegram(folder_id, client, peer_cache, db_pool.clone()).await?;
+    if let Err(error) = write_cached_channel_listing(&db_pool, account_id, folder_id, &files) {
+        log::warn!("Could not persist file listing for {folder_id:?}: {error}");
+    }
+    Ok(files)
+}
+
+async fn get_files_from_telegram(
+    folder_id: Option<i64>,
+    client: grammers_client::Client,
+    peer_cache: Arc<tokio::sync::RwLock<HashMap<i64, Peer>>>,
+    db_pool: DbConnection,
+) -> Result<Vec<FileMetadata>, String> {
     let mut files = Vec::new();
 
-    let logical_channel_id = if let Some(backing_channel_id) = folder_id {
+    let (logical_channel_id, physical_folder_id, is_shared_view) = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
-        crate::commands::logical_channels::logical_channel_id_for_backing(
-            &conn,
-            backing_channel_id,
-        )?
-    } else {
-        None
+        let logical = match folder_id {
+            Some(id) => {
+                crate::commands::logical_channels::logical_channel_id_for_backing(&conn, id)?
+            }
+            None => None,
+        };
+        let physical = crate::commands::shared_channels::physical_id(&conn, folder_id)?;
+        (logical, physical, folder_id.is_some_and(|id| id < 0))
     };
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    enum ManifestKind {
+        File,
+        Stack,
+    }
+    enum ChannelManifest {
+        File(crate::commands::logical_files::LogicalFileManifestV1),
+        Stack(crate::commands::file_stacks::FileStackManifestV1),
+    }
+    let mut manifest_groups: HashMap<(ManifestKind, String), Vec<(i64, Media)>> = HashMap::new();
+    let mut foreign_chunk_message_ids = std::collections::HashSet::new();
     let mut active_remote_manifest_ids = std::collections::HashSet::new();
-    let mut active_stack_ids = std::collections::HashSet::new();
     let mut stack_manifests = Vec::new();
 
-    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
+    let peer = resolve_peer(&client, physical_folder_id, &peer_cache).await?;
 
     // Part messages of split files, keyed by (base name, total parts):
     // (idx, message id, part size, mime, created_at)
     type MultipartPartGroup = Vec<(u32, i64, u64, Option<String>, String)>;
     let mut part_groups: HashMap<(String, u32), MultipartPartGroup> = HashMap::new();
 
-    let mut msgs = client.iter_messages(&peer);
-    while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
+    // The previous implementation paginated every channel message,
+    // including plain text that can never appear in this file listing.
+    // Telegram's filtered searches fetch document and photo messages only.
+    let (mut document_messages, photo_messages) = tokio::try_join!(
+        collect_channel_media_messages(
+            &client,
+            &peer,
+            tl::enums::MessagesFilter::InputMessagesFilterDocument,
+        ),
+        collect_channel_media_messages(
+            &client,
+            &peer,
+            tl::enums::MessagesFilter::InputMessagesFilterPhotos,
+        ),
+    )?;
+    document_messages.extend(photo_messages);
+    document_messages.sort_unstable_by_key(|message| std::cmp::Reverse(message.id()));
+
+    for msg in document_messages {
         if let Some(media) = msg.media() {
             // TeraRelay Drive keeps its global virtual-directory index in a
             // hidden Saved Messages control document. Hide it everywhere,
@@ -5844,89 +6674,22 @@ pub async fn cmd_get_files(
                 }
             }
 
-            // Manifest documents are storage metadata, never user files. A
-            // receiver with an empty local DB downloads them here and rebuilds
-            // the exact same logical index from Telegram.
-            if let (Some(logical_channel_id), Media::Document(document)) =
-                (logical_channel_id.as_deref(), &media)
-            {
-                let document_name = document.name().to_string();
-
-                // Version-stack metadata is a hidden control document, just like
-                // logical-file manifests. The newest valid copy for each stack is
-                // authoritative; stale copies are ignored and never shown as files.
-                if let Some(stack_id) =
-                    crate::commands::file_stacks::stack_manifest_id(&document_name, msg.text())
-                {
-                    if active_stack_ids.contains(&stack_id) {
-                        continue;
-                    }
-                    match crate::commands::file_stacks::download_stack_manifest(
-                        &client,
-                        &media,
-                        Some(&stack_id),
-                        Some(logical_channel_id),
-                    )
-                    .await
-                    {
-                        Ok(manifest) => {
-                            active_stack_ids.insert(stack_id);
-                            stack_manifests.push(manifest);
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "Ignoring invalid TeraRelay stack metadata {} in channel {:?}: {}",
-                                stack_id,
-                                folder_id,
-                                error
-                            );
-                        }
-                    }
-                    continue;
-                }
-
-                if let Some(file_id) =
-                    crate::commands::logical_files::manifest_file_id(&document_name, msg.text())
-                {
-                    if active_remote_manifest_ids.contains(&file_id) {
-                        continue;
-                    }
-
-                    match crate::commands::logical_files::download_manifest(
-                        &client,
-                        &media,
-                        Some(&file_id),
-                        Some(logical_channel_id),
-                    )
-                    .await
-                    {
-                        Ok(manifest) => {
-                            let persist_result = {
-                                let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
-                                crate::commands::logical_files::persist_manifest(&conn, &manifest)
-                            };
-                            match persist_result {
-                                Ok(()) => {
-                                    active_remote_manifest_ids.insert(file_id);
-                                }
-                                Err(error) => {
-                                    log::warn!(
-                                        "Ignoring TeraRelay manifest {} because local indexing failed: {}",
-                                        file_id,
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "Ignoring invalid TeraRelay manifest {} in channel {:?}: {}",
-                                file_id,
-                                folder_id,
-                                error
-                            );
-                        }
-                    }
+            // Hidden manifests rebuild the local logical index. Collect them
+            // by identity in Telegram's newest-first order so the downloads
+            // can run concurrently without trusting older copies.
+            if let (Some(_), Media::Document(document)) = (logical_channel_id.as_ref(), &media) {
+                let name = document.name();
+                let key = crate::commands::file_stacks::stack_manifest_id(name, msg.text())
+                    .map(|id| (ManifestKind::Stack, id))
+                    .or_else(|| {
+                        crate::commands::logical_files::manifest_file_id(name, msg.text())
+                            .map(|id| (ManifestKind::File, id))
+                    });
+                if let Some(key) = key {
+                    manifest_groups
+                        .entry(key)
+                        .or_default()
+                        .push((i64::from(msg.id()), media));
                     continue;
                 }
             }
@@ -5990,6 +6753,68 @@ pub async fn cmd_get_files(
         }
     }
 
+    if let Some(logical_channel_id) = logical_channel_id.as_deref() {
+        let client = &client;
+        let resolved = resolve_channel_manifest_groups(
+            manifest_groups,
+            |(kind, id), media| async move {
+                let result = match kind {
+                    ManifestKind::File => crate::commands::logical_files::download_manifest(
+                        client,
+                        &media,
+                        Some(&id),
+                        None,
+                    )
+                    .await
+                    .map(ChannelManifest::File),
+                    ManifestKind::Stack => crate::commands::file_stacks::download_stack_manifest(
+                        client,
+                        &media,
+                        Some(&id),
+                        Some(logical_channel_id),
+                    )
+                    .await
+                    .map(ChannelManifest::Stack),
+                };
+                match result {
+                    Ok(manifest) => Some(manifest),
+                    Err(error) => {
+                        log::warn!(
+                            "Ignoring invalid TeraRelay {kind:?} metadata {id} in channel {folder_id:?}: {error}"
+                        );
+                        None
+                    }
+                }
+            },
+        )
+        .await;
+
+        for (_, manifest) in resolved {
+            match manifest {
+                ChannelManifest::Stack(manifest) => stack_manifests.push(manifest),
+                ChannelManifest::File(manifest) => {
+                    // The newest valid file manifest wins across all views
+                    // sharing this peer; an older copy cannot resurrect a move.
+                    if manifest.logical_channel_id != logical_channel_id {
+                        foreign_chunk_message_ids
+                            .extend(manifest.chunks.iter().map(|chunk| chunk.message_id));
+                        continue;
+                    }
+                    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+                    match crate::commands::logical_files::persist_manifest(&conn, &manifest) {
+                        Ok(()) => {
+                            active_remote_manifest_ids.insert(manifest.file_id);
+                        }
+                        Err(error) => log::warn!(
+                            "Ignoring TeraRelay manifest {} because local indexing failed: {error}",
+                            manifest.file_id,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     // Collapse each part group into a single entry, id = part 1's message id.
     // Incomplete groups (interrupted upload) are still shown; download reports
     // the exact missing part.
@@ -6016,6 +6841,14 @@ pub async fn cmd_get_files(
             stack_version_count: 0,
             stack_label: None,
         });
+    }
+
+    // A shared TeraRelay channel never displays physical messages that were
+    // not claimed by its own verified logical-file manifests.
+    if is_shared_view {
+        files.clear();
+    } else {
+        files.retain(|file| !foreign_chunk_message_ids.contains(&file.id));
     }
 
     // Manifest-first channels replace physical Telegram documents with one
@@ -6181,6 +7014,110 @@ pub async fn cmd_search_global(
     Ok(files)
 }
 
+/// Read cloud file manifests before assigning a new local logical-channel ID.
+/// Restrict new-device bootstrap to bounded history and validate downloaded
+/// manifests, never trusting a filename or channel title as identity proof.
+async fn recover_channel_manifests(
+    client: &grammers_client::Client,
+    peer: &Peer,
+    max_messages: usize,
+    shared_logical_ids: &std::collections::HashSet<String>,
+) -> Result<
+    (
+        Option<String>,
+        Vec<crate::commands::logical_files::LogicalFileManifestV1>,
+    ),
+    String,
+> {
+    let mut logical_id: Option<String> = None;
+    let mut manifests = Vec::new();
+    let mut messages = client.iter_messages(peer).limit(max_messages + 1);
+    let mut seen = std::collections::HashSet::new();
+    let mut scanned = 0usize;
+    while let Some(message) = messages.next().await.map_err(|e| e.to_string())? {
+        scanned += 1;
+        if scanned > max_messages {
+            return Err(format!(
+                "Channel recovery exceeded {max_messages} Telegram messages. Existing storage is unchanged; retry recovery with a larger history window."
+            ));
+        }
+        let Some(Media::Document(document)) = message.media() else {
+            continue;
+        };
+        let Some(file_id) =
+            crate::commands::logical_files::manifest_file_id(document.name(), message.text())
+        else {
+            continue;
+        };
+        if seen.contains(&file_id) {
+            continue;
+        }
+        let media = Media::Document(document);
+        match crate::commands::logical_files::download_manifest(
+            client,
+            &media,
+            Some(&file_id),
+            None,
+        )
+        .await
+        {
+            Ok(manifest) => {
+                // The shared backing Telegram channel contains multiple
+                // verified TeraRelay logical identities. Each shared view has
+                // its own registry entry; never adopt its ID as the physical
+                // dedicated channel's identity during fresh-device recovery.
+                if shared_logical_ids.contains(&manifest.logical_channel_id) {
+                    seen.insert(file_id);
+                    continue;
+                }
+                if logical_id
+                    .as_ref()
+                    .is_some_and(|id| id != &manifest.logical_channel_id)
+                {
+                    return Err("Channel contains conflicting verified TeraRelay logical identities; refusing unsafe automatic recovery".into());
+                }
+                // A corrupt newer copy must not hide a valid older manifest.
+                seen.insert(file_id);
+                logical_id = Some(manifest.logical_channel_id.clone());
+                manifests.push(manifest);
+            }
+            Err(error) => {
+                log::warn!(
+                    "Ignoring corrupt channel recovery manifest {}: {}",
+                    file_id,
+                    error
+                );
+            }
+        }
+    }
+    Ok((logical_id, manifests))
+}
+
+async fn channel_has_recent_terarelay_manifest(
+    client: &grammers_client::Client,
+    peer: &Peer,
+) -> Result<bool, String> {
+    let mut messages = client.iter_messages(peer).limit(64);
+    while let Some(message) = messages.next().await.map_err(|e| e.to_string())? {
+        let Some(Media::Document(document)) = message.media() else {
+            continue;
+        };
+        let Some(file_id) =
+            crate::commands::logical_files::manifest_file_id(document.name(), message.text())
+        else {
+            continue;
+        };
+        let media = Media::Document(document);
+        if crate::commands::logical_files::download_manifest(client, &media, Some(&file_id), None)
+            .await
+            .is_ok()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // The backing Telegram title is not the stable TeraRelay identity. Users may
 // rename a channel in Telegram (removing [TR]) without deleting its storage.
 fn is_tera_channel_for_scan(title: &str, known_backing: bool) -> bool {
@@ -6217,24 +7154,52 @@ pub async fn cmd_scan_folders(
     // Keep a snapshot of known backing IDs outside the Telegram network loop.
     // An external title edit must not hide an existing TeraRelay channel just
     // because its [TR] marker is no longer present in Telegram's title.
-    let known_backing_ids = {
+    let (known_backing_ids, recovery_needed_ids, shared_ids_by_storage) = {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+        let mut shared_ids_by_storage: std::collections::HashMap<
+            i64,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+        for view in crate::commands::shared_channels::records(&conn)? {
+            // Include deleted views: old control documents still exist, and
+            // must never be mistaken for the physical channel identity.
+            shared_ids_by_storage
+                .entry(view.storage_channel_id)
+                .or_default()
+                .insert(view.logical_id);
+        }
         let mut statement = conn
             .prepare(
-                "SELECT backing_channel_id FROM logical_channels WHERE role != 'drive_storage'",
+                "SELECT c.backing_channel_id,
+                        EXISTS(SELECT 1 FROM logical_files f WHERE f.logical_channel_id = c.logical_id)
+                 FROM logical_channels c WHERE c.role != 'drive_storage'",
             )
             .map_err(|error: sqlite::Error| error.to_string())?;
         let mut ids = std::collections::HashSet::new();
+        let mut recovery_needed = std::collections::HashSet::new();
         while let sqlite::State::Row = statement.next().map_err(|error| error.to_string())? {
-            ids.insert(
-                statement
-                    .read::<i64, _>(0)
-                    .map_err(|error| error.to_string())?,
-            );
+            let id = statement
+                .read::<i64, _>(0)
+                .map_err(|error| error.to_string())?;
+            let has_files = statement
+                .read::<i64, _>(1)
+                .map_err(|error| error.to_string())?
+                != 0;
+            ids.insert(id);
+            if !has_files {
+                recovery_needed.insert(id);
+            }
         }
-        ids
+        (ids, recovery_needed, shared_ids_by_storage)
     };
 
+    let mut recovered_channels: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Vec<crate::commands::logical_files::LogicalFileManifestV1>,
+    )> = Vec::new();
     let mut folders = Vec::new();
     let mut dialogs = client.iter_dialogs();
     let mut discovered = HashMap::new();
@@ -6273,7 +7238,7 @@ pub async fn cmd_scan_folders(
                     let is_public = username.is_some();
                     folders.push(FolderMetadata {
                         id,
-                        name: display_name,
+                        name: display_name.clone(),
                         parent_id: None,
                         username,
                         is_public,
@@ -6281,6 +7246,26 @@ pub async fn cmd_scan_folders(
                         display_order: 0,
                         role: Some(if c.raw.creator { "owner" } else { "member" }.to_string()),
                     });
+                    if !known_backing_ids.contains(&id) || recovery_needed_ids.contains(&id) {
+                        match recover_channel_manifests(
+                            &client,
+                            &dialog.peer,
+                            50_000,
+                            &shared_ids_by_storage.get(&id).cloned().unwrap_or_default(),
+                        )
+                        .await
+                        {
+                            Ok((Some(logical_id), manifests)) => recovered_channels.push((
+                                id,
+                                logical_id,
+                                display_name,
+                                if c.raw.creator { "owner" } else { "member" }.to_string(),
+                                manifests,
+                            )),
+                            Ok((None, _)) => {}
+                            Err(error) => log::warn!("Channel {} recovery deferred: {}", id, error),
+                        }
+                    }
                     continue;
                 }
 
@@ -6319,6 +7304,51 @@ pub async fn cmd_scan_folders(
                         Err(e) => log::warn!(" -> Failed to get full info: {}", e),
                     }
                 }
+                // A channel with a renamed title and description can still be
+                // identified by a valid remote file manifest. Never classify
+                // arbitrary channel media as TeraRelay without validation.
+                if c.raw.creator && !folders.iter().any(|folder| folder.id == id) {
+                    match channel_has_recent_terarelay_manifest(&client, &dialog.peer).await {
+                        Ok(true) => {
+                            folders.push(FolderMetadata {
+                                id,
+                                name: name.clone(),
+                                parent_id: None,
+                                username: c.raw.username.clone(),
+                                is_public: c.raw.username.is_some(),
+                                group_id: None,
+                                display_order: 0,
+                                role: Some("owner".into()),
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            log::warn!("Renamed channel {} discovery deferred: {}", id, error)
+                        }
+                    }
+                }
+                if folders.iter().any(|folder| folder.id == id)
+                    && (!known_backing_ids.contains(&id) || recovery_needed_ids.contains(&id))
+                {
+                    match recover_channel_manifests(
+                        &client,
+                        &dialog.peer,
+                        50_000,
+                        &shared_ids_by_storage.get(&id).cloned().unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        Ok((Some(logical_id), manifests)) => recovered_channels.push((
+                            id,
+                            logical_id,
+                            name.clone(),
+                            "owner".to_string(),
+                            manifests,
+                        )),
+                        Ok((None, _)) => {}
+                        Err(error) => log::warn!("Channel {} recovery deferred: {}", id, error),
+                    }
+                }
             }
             Peer::User(u) => {
                 discovered.insert(u.raw.id(), dialog.peer.clone());
@@ -6342,10 +7372,395 @@ pub async fn cmd_scan_folders(
         cache_len
     );
 
-    // Enrich folders via the local DB
+    // Bootstrap the verified remote IDs *before* the normal folder enrichment
+    // creates any local placeholder IDs. Use one savepoint per channel so a
+    // malformed manifest cannot partially replace valid local metadata.
     let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    for (backing_id, logical_id, name, role, manifests) in recovered_channels {
+        conn.execute("SAVEPOINT channel_recovery")
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        let adopted = (|| -> Result<(), String> {
+            crate::commands::logical_channels::adopt_verified_channel_id(
+                &conn,
+                backing_id,
+                &logical_id,
+                &name,
+                &role,
+            )?;
+            for manifest in &manifests {
+                crate::commands::logical_files::persist_manifest(&conn, manifest)?;
+            }
+            Ok(())
+        })();
+        match adopted {
+            Ok(()) => conn
+                .execute("RELEASE SAVEPOINT channel_recovery")
+                .map_err(|e: sqlite::Error| e.to_string())?,
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK TO SAVEPOINT channel_recovery");
+                let _ = conn.execute("RELEASE SAVEPOINT channel_recovery");
+                log::warn!(
+                    "Channel {} recovery preserved existing data: {}",
+                    backing_id,
+                    error
+                );
+            }
+        }
+    }
+    // Add first-class shared-storage channels only when their real backing
+    // Telegram channel was seen in this scan. Unknown/deleted parents are not
+    // silently presented as usable channels.
+    let discovered_owners: std::collections::HashSet<i64> = folders
+        .iter()
+        .filter(|folder| folder.id > 0 && folder.role.as_deref() == Some("owner"))
+        .map(|folder| folder.id)
+        .collect();
+    for view in crate::commands::shared_channels::records(&conn)? {
+        if view.deleted_at.is_none() && discovered_owners.contains(&view.storage_channel_id) {
+            folders.push(FolderMetadata {
+                id: view.channel_id,
+                parent_id: None,
+                name: view.name,
+                username: None,
+                is_public: false,
+                group_id: None,
+                display_order: 0,
+                role: Some("owner".into()),
+            });
+        }
+    }
+    crate::commands::shared_channels::refresh_aliases(&conn)?;
     let enriched = crate::commands::folder_groups::get_enriched_folders_internal(&conn, folders)?;
     Ok(enriched)
+}
+
+/// A bounded, symlink-safe snapshot of the regular files in a selected upload folder.
+/// Paths are absolute local sources; relative_path is the original Drive path below the folder.
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderUploadFile {
+    pub path: String,
+    pub relative_path: String,
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderUploadManifest {
+    pub folder_name: String,
+    /// Canonical selected root used to reject source-path substitutions at upload time.
+    pub source_root: String,
+    pub files: Vec<FolderUploadFile>,
+    /// All nested directories, including empty ones, relative to the selected root.
+    pub directories: Vec<String>,
+    pub total_size: u64,
+}
+
+const MAX_FOLDER_UPLOAD_FILES: usize = 10_000;
+const MAX_FOLDER_UPLOAD_DIRECTORIES: usize = 2_000;
+const MAX_FOLDER_UPLOAD_ENTRIES: usize = MAX_FOLDER_UPLOAD_FILES + MAX_FOLDER_UPLOAD_DIRECTORIES;
+
+fn folder_upload_relative_path(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map_err(|_| {
+            format!(
+                "Folder entry escaped the selected directory: {}",
+                path.display()
+            )
+        })?
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .filter(|part| {
+                    !part.is_empty()
+                        && *part != "."
+                        && *part != ".."
+                        && !part.contains('/')
+                        && !part.contains('\\')
+                })
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "Folder contains an unsupported path name: {}",
+                        path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("/"))
+}
+
+#[tauri::command]
+pub async fn cmd_list_folder_upload_files(
+    folder_path: String,
+) -> Result<FolderUploadManifest, String> {
+    tokio::task::spawn_blocking(move || list_folder_upload_files_blocking(folder_path))
+        .await
+        .map_err(|error| format!("Folder inspection task failed: {error}"))?
+}
+
+fn list_folder_upload_files_blocking(folder_path: String) -> Result<FolderUploadManifest, String> {
+    let source = std::path::Path::new(&folder_path)
+        .canonicalize()
+        .map_err(|error| format!("Could not open selected folder: {error}"))?;
+    if !source.is_dir() {
+        return Err("The selected upload source is not a folder".to_string());
+    }
+    let source_root = source
+        .to_str()
+        .ok_or_else(|| "The selected folder path is not valid UTF-8".to_string())?
+        .to_string();
+    let folder_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "The selected folder has no supported name".to_string())?
+        .to_string();
+
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut total_size = 0u64;
+    let mut entries_seen = 0usize;
+    for entry in walkdir::WalkDir::new(&source)
+        .min_depth(1)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|error| {
+            format!("Could not safely inspect the selected folder. No files were queued: {error}")
+        })?;
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > MAX_FOLDER_UPLOAD_ENTRIES {
+            return Err(format!("Folder contains more than {MAX_FOLDER_UPLOAD_ENTRIES} entries; split it into smaller uploads"));
+        }
+        let kind = entry.file_type();
+        if kind.is_symlink() {
+            return Err(format!(
+                "Folder contains a symbolic link ({}). Remove links and retry so files outside the selected folder are never uploaded accidentally.",
+                entry.path().display()
+            ));
+        }
+        let relative_path = folder_upload_relative_path(&source, entry.path())?;
+        if kind.is_dir() {
+            if directories.len() >= MAX_FOLDER_UPLOAD_DIRECTORIES {
+                return Err(format!(
+                    "Folder contains more than {MAX_FOLDER_UPLOAD_DIRECTORIES} subfolders"
+                ));
+            }
+            directories.push(relative_path);
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(format!(
+                "Folder contains an unsupported special file: {}",
+                entry.path().display()
+            ));
+        }
+        if files.len() >= MAX_FOLDER_UPLOAD_FILES {
+            return Err(format!(
+                "Folder contains more than {MAX_FOLDER_UPLOAD_FILES} files"
+            ));
+        }
+        let canonical_file = entry.path().canonicalize().map_err(|error| {
+            format!(
+                "Could not resolve folder file {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !canonical_file.starts_with(&source) {
+            return Err(format!(
+                "Folder file escaped the selected directory: {}",
+                entry.path().display()
+            ));
+        }
+        let metadata =
+            std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "Folder file changed while being inspected: {}",
+                entry.path().display()
+            ));
+        }
+        let name = entry
+            .file_name()
+            .to_str()
+            .filter(|name| {
+                !name.is_empty()
+                    && *name != "."
+                    && *name != ".."
+                    && !name.contains('/')
+                    && !name.contains('\\')
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Folder contains an unsupported file name: {}",
+                    entry.path().display()
+                )
+            })?
+            .to_string();
+        total_size = total_size
+            .checked_add(metadata.len())
+            .ok_or_else(|| "The selected folder is too large to calculate safely".to_string())?;
+        let source_path = canonical_file.to_str().ok_or_else(|| {
+            format!(
+                "Folder path is not valid UTF-8: {}",
+                canonical_file.display()
+            )
+        })?;
+        files.push(FolderUploadFile {
+            path: source_path.to_string(),
+            relative_path,
+            name,
+            size: metadata.len(),
+        });
+    }
+
+    Ok(FolderUploadManifest {
+        folder_name,
+        source_root,
+        files,
+        directories,
+        total_size,
+    })
+}
+
+/// Revalidate the source selected during folder enumeration immediately before
+/// upload. A changed folder root, symlink substitution, or path redirected outside
+/// that root must never turn a folder upload into an arbitrary local-file upload.
+async fn validate_folder_upload_source(path: &str, expected_root: &str) -> Result<(), String> {
+    let root_input = std::path::Path::new(expected_root);
+    let root = tokio::fs::canonicalize(root_input)
+        .await
+        .map_err(|error| format!("Selected folder is no longer available: {error}"))?;
+    if root != root_input {
+        return Err(
+            "Selected folder path changed after it was inspected. Select the folder again."
+                .to_string(),
+        );
+    }
+
+    let source_input = std::path::Path::new(path);
+    let metadata = tokio::fs::symlink_metadata(source_input)
+        .await
+        .map_err(|error| format!("Selected folder file is no longer available: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("A selected folder file was replaced by a symbolic link or non-file. Select the folder again.".to_string());
+    }
+    let source = tokio::fs::canonicalize(source_input)
+        .await
+        .map_err(|error| format!("Cannot resolve selected folder file: {error}"))?;
+    if source != source_input || !source.starts_with(&root) || source == root {
+        return Err(
+            "A selected folder file moved outside the original folder. Select the folder again."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod folder_upload_manifest_tests {
+    use super::{list_folder_upload_files_blocking, validate_folder_upload_source};
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "terarelay-folder-upload-{label}-{:032x}",
+            rand::random::<u128>()
+        ))
+    }
+
+    #[test]
+    fn folder_inventory_preserves_nested_paths_and_empty_directories() {
+        let root = test_root("nested");
+        std::fs::create_dir_all(root.join("Season 01")).unwrap();
+        std::fs::create_dir_all(root.join("Extras/Empty")).unwrap();
+        std::fs::write(root.join("Season 01/Episode 01.mkv"), b"episode").unwrap();
+        std::fs::write(root.join("poster.jpg"), b"poster").unwrap();
+
+        let manifest = list_folder_upload_files_blocking(root.to_string_lossy().into()).unwrap();
+        assert_eq!(
+            manifest.folder_name,
+            root.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(manifest.total_size, 13);
+        assert!(manifest.files.iter().any(|file| {
+            file.relative_path == "Season 01/Episode 01.mkv" && file.name == "Episode 01.mkv"
+        }));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| { file.relative_path == "poster.jpg" && file.name == "poster.jpg" }));
+        assert!(manifest.directories.contains(&"Season 01".to_string()));
+        assert!(manifest.directories.contains(&"Extras".to_string()));
+        assert!(manifest.directories.contains(&"Extras/Empty".to_string()));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_inventory_rejects_symlinks_before_queueing_any_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink");
+        let outside = test_root("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        symlink(outside.join("secret.txt"), root.join("escape.txt")).unwrap();
+
+        let error = list_folder_upload_files_blocking(root.to_string_lossy().into()).unwrap_err();
+        assert!(error.contains("symbolic link"));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn folder_upload_revalidates_root_and_rejects_outside_or_symlinked_files() {
+        let root = test_root("source-validation");
+        let outside = test_root("source-validation-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let inside_file = root.join("episode.mkv");
+        let outside_file = outside.join("outside.mkv");
+        std::fs::write(&inside_file, b"episode").unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        let root_path = root.to_string_lossy().into_owned();
+        let inside_path = inside_file.to_string_lossy().into_owned();
+        let outside_path = outside_file.to_string_lossy().into_owned();
+
+        validate_folder_upload_source(&inside_path, &root_path)
+            .await
+            .unwrap();
+
+        let outside_error = validate_folder_upload_source(&outside_path, &root_path)
+            .await
+            .unwrap_err();
+        assert!(outside_error.contains("moved outside"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked_file = root.join("linked-episode.mkv");
+            symlink(&outside_file, &linked_file).unwrap();
+            let linked_path = linked_file.to_string_lossy().into_owned();
+            let symlink_error = validate_folder_upload_source(&linked_path, &root_path)
+                .await
+                .unwrap_err();
+            assert!(symlink_error.contains("symbolic link"));
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
 }
 
 /// Zip a folder's contents into a temp file and return the path.
@@ -7079,6 +8494,9 @@ pub async fn cmd_toggle_folder_visibility(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<FolderMetadata, String> {
+    if folder_id < 0 {
+        return Err("Shared-storage channels cannot change visibility of their Telegram backing. Change the dedicated storage channel instead.".into());
+    }
     {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::require_owner_role(&conn, folder_id)?;
@@ -7310,6 +8728,9 @@ pub async fn cmd_export_folder_invite(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<FolderInviteInfo, String> {
+    if folder_id < 0 {
+        return Err("Shared-storage channels have no independent Telegram invite. Invite members to the dedicated backing channel instead.".into());
+    }
     {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         crate::commands::logical_channels::require_owner_role(&conn, folder_id)?;
@@ -8295,6 +9716,7 @@ pub async fn cmd_upload_from_url(
         None,
         None,
         Some(file_name),
+        None,
         app_handle.clone(),
         state,
         tdlib_state,
@@ -8326,11 +9748,12 @@ pub async fn cmd_upload_from_url(
 #[cfg(test)]
 mod split_tests {
     use super::{
-        adapt_download_lanes, adapt_upload_parallelism, checked_upload_part_count, clean_file_uri,
-        ordered_part_ids, parse_part_name, split_part_caption, split_part_name,
-        telegram_upload_chunk_size, upload_media_kind, upload_pool_plan, upload_similarity_key,
-        BOOST_RAW_DOWNLOAD_CHUNK_SIZE, SPLIT_PART_SIZE, UPLOAD_MAIN_SINGLE_WORKERS,
-        UPLOAD_PART_WORKERS,
+        account_tier_for_verified_flag, adapt_download_lanes, adapt_upload_parallelism,
+        checked_upload_part_count, clean_file_uri, ordered_part_ids, parse_part_name,
+        split_part_caption, split_part_name, telegram_upload_chunk_size, upload_media_kind,
+        upload_part_size_for_account, upload_pool_plan, upload_similarity_key,
+        BOOST_RAW_DOWNLOAD_CHUNK_SIZE, PREMIUM_SPLIT_PART_SIZE, SPLIT_PART_SIZE,
+        UPLOAD_MAIN_SINGLE_WORKERS, UPLOAD_PART_WORKERS,
     };
     use std::collections::HashMap;
 
@@ -8366,17 +9789,27 @@ mod split_tests {
 
     #[test]
     fn upload_pool_matches_reference_connection_policy() {
+        // Premium uses the same Telegram 4 GiB file limit; this only increases
+        // connections per currently uploading file, never the file-part size.
         assert_eq!(
-            upload_pool_plan(true, 8, 1),
-            ("media-pool", 8, 4, false, UPLOAD_PART_WORKERS)
+            upload_pool_plan(true, 16, 1),
+            ("media-pool", 16, 8, false, UPLOAD_PART_WORKERS)
         );
         assert_eq!(
-            upload_pool_plan(false, 8, 3),
+            upload_pool_plan(true, 8, 1),
+            ("media-pool", 8, 8, false, UPLOAD_PART_WORKERS)
+        );
+        assert_eq!(
+            upload_pool_plan(false, 16, 3),
             ("tmp-session-pool", 3, 3, true, UPLOAD_PART_WORKERS)
         );
         assert_eq!(
-            upload_pool_plan(false, 8, 1),
+            upload_pool_plan(false, 16, 1),
             ("main-single", 1, 1, true, UPLOAD_MAIN_SINGLE_WORKERS)
+        );
+        assert_eq!(
+            upload_pool_plan(true, 1, 1),
+            ("media-pool", 1, 1, false, UPLOAD_PART_WORKERS)
         );
     }
 
@@ -8447,6 +9880,64 @@ mod split_tests {
             512 * 1024
         );
         assert_eq!(telegram_upload_chunk_size(1, "media-pool"), 512 * 1024);
+    }
+
+    #[test]
+    fn account_tier_display_never_mislabels_unknown_as_free_or_premium() {
+        let premium = account_tier_for_verified_flag(Some(true));
+        assert_eq!(premium.is_premium, Some(true));
+        assert_eq!(premium.max_part_size_bytes, PREMIUM_SPLIT_PART_SIZE);
+
+        let free = account_tier_for_verified_flag(Some(false));
+        assert_eq!(free.is_premium, Some(false));
+        assert_eq!(free.max_part_size_bytes, SPLIT_PART_SIZE);
+
+        let unknown = account_tier_for_verified_flag(None);
+        assert_eq!(unknown.is_premium, None);
+        assert_eq!(unknown.max_part_size_bytes, SPLIT_PART_SIZE);
+    }
+
+    #[test]
+    fn premium_upload_layout_is_account_based_and_preserves_resumes() {
+        assert_eq!(
+            upload_part_size_for_account(false, None, SPLIT_PART_SIZE).unwrap(),
+            SPLIT_PART_SIZE
+        );
+        assert_eq!(
+            upload_part_size_for_account(true, None, SPLIT_PART_SIZE).unwrap(),
+            PREMIUM_SPLIT_PART_SIZE
+        );
+        assert_eq!(
+            upload_part_size_for_account(true, Some(SPLIT_PART_SIZE), SPLIT_PART_SIZE).unwrap(),
+            SPLIT_PART_SIZE
+        );
+        assert_eq!(
+            upload_part_size_for_account(true, Some(PREMIUM_SPLIT_PART_SIZE), SPLIT_PART_SIZE)
+                .unwrap(),
+            PREMIUM_SPLIT_PART_SIZE
+        );
+        assert!(upload_part_size_for_account(
+            false,
+            Some(PREMIUM_SPLIT_PART_SIZE),
+            SPLIT_PART_SIZE
+        )
+        .unwrap_err()
+        .contains("preserved"));
+        assert_eq!(
+            upload_part_size_for_account(false, None, 1024).unwrap(),
+            1024
+        );
+        assert_eq!(
+            upload_part_size_for_account(false, None, PREMIUM_SPLIT_PART_SIZE).unwrap(),
+            SPLIT_PART_SIZE
+        );
+        assert_eq!(PREMIUM_SPLIT_PART_SIZE.div_ceil(512 * 1024), 7630);
+        assert_eq!(
+            PREMIUM_SPLIT_PART_SIZE.div_ceil(512 * 1024) * 512 * 1024 >= PREMIUM_SPLIT_PART_SIZE,
+            true
+        );
+        assert_eq!(4_000_000_001u64.div_ceil(PREMIUM_SPLIT_PART_SIZE), 2);
+        assert_eq!(8_000_000_001u64.div_ceil(PREMIUM_SPLIT_PART_SIZE), 3);
     }
 
     #[test]

@@ -4,6 +4,26 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-09
+
+### Folder uploads and channel organization
+- Improve folder uploads with a structured per-file queue, clearer episode rows, and ordered processing instead of presenting a large folder as one opaque upload.
+- Show uploaded folder contents together in the channel timeline, anchored to the earliest contained file so folder entries remain in chronological order.
+- Support nested folder inventory and whole-folder deletion, including empty folders, with explicit handling for the files inside.
+
+### Drive, transfer, and account reliability
+- Expand Drive metadata, directory, read-lifetime, streaming-cache, and recovery handling to make large libraries and interrupted operations more predictable.
+- Harden channel-scoped file identity and shared-channel aliases; clear process-local channel identity when logging out so another account does not inherit stale listing state.
+- Improve durable transfer queue sequencing and recovery coverage, including retry and finalization behavior.
+
+### Video playback
+- Improve progressive HLS/fMP4 cleanup, remux, and seeking behavior across interrupted or completed playback sessions.
+- Add an in-player **Open with** menu for detected installed VLC and mpv players. The external player receives the authenticated local stream rather than requiring a second copy of the video.
+
+### Validation
+- Extend focused UI, transfer-recovery, Drive range/read-recovery, and native-media regression coverage.
+- Public desktop release distribution for this version is Linux x86_64 only. Windows, macOS, Android, and iOS release builds/installers are withheld.
+
 ## [0.2.3] - 2026-10-30
 
 - Fix uploads to newly created Telegram channels when their per-channel message IDs overlap an older channel. Migrate the invalid global chunk-ID index without deleting existing Drive records or changing channel identities.
@@ -144,6 +164,7 @@ These measurements are test results, not guaranteed speeds. See [PERFORMANCE.md]
 - Worldwide public file sharing is not implemented
 - Cross-platform build/package validation is not exhaustive runtime/device testing
 
+[0.2.4]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.4
 [0.2.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Yashwanth034/TeraRelay/releases/tag/v0.1.1

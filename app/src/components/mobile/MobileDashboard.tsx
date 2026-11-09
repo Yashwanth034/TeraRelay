@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Folder, Download, Menu, LogOut, RefreshCw, UploadCloud, MoreVertical, Trash2, Pencil, Globe, Shield, Lock, ChevronDown, Wifi, Activity, Zap, Eye, EyeOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
@@ -124,6 +125,7 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
   // Real files loader
   const { data: allFiles = [], isLoading } = useQuery({
     queryKey: ['files', activeFolderId],
+    staleTime: 30_000,
     queryFn: () => invoke<any[]>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
       ...f,
       sizeStr: formatBytes(f.size),
@@ -131,6 +133,33 @@ export default function MobileDashboard({ onLogout }: { onLogout?: () => void })
     }))),
     enabled: !!store,
   });
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<{
+      folder_id: number | null;
+      files: Array<{
+        id: number; name: string; size: number; icon_type: string; folder_id: number | null;
+        created_at: string; mime_type?: string; file_ext?: string; is_split?: boolean;
+        logical_file_id?: string; stack_id?: string; stack_name?: string;
+        stack_version_count?: number; stack_label?: string;
+      }>;
+    }>('files-updated', ({ payload }) => {
+      queryClient.setQueryData(['files', payload.folder_id], payload.files.map(file => ({
+        ...file,
+        sizeStr: formatBytes(file.size),
+        type: file.icon_type || (file.name.endsWith('/') ? 'folder' : 'file'),
+      })));
+    }).then(stop => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(error => console.warn('Could not subscribe to channel file refresh:', error));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [queryClient]);
 
   const { handleManualUpload, handleVersionUpload } = useFileUpload(activeFolderId, store, allFiles);
 

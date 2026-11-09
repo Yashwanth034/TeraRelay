@@ -186,6 +186,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     // Transcode cache state
     const [transcodeCache, setTranscodeCache] = useState<DetailedCacheInfo | null>(null);
     const [cacheLoading, setCacheLoading] = useState(false);
+    const [streamingCacheInfo, setStreamingCacheInfo] = useState<{ current_bytes: number; max_bytes: number } | null>(null);
+    const [streamingCacheError, setStreamingCacheError] = useState<string | null>(null);
+    const [clearingStreamingCache, setClearingStreamingCache] = useState(false);
     const [clearingVariant, setClearingVariant] = useState<string | null>(null); // file_key:quality being cleared
     const [activeTab, setActiveTab] = useState<SettingsTab>('general');
     const [latencyMs, setLatencyMs] = useState<number | null>(null);
@@ -862,6 +865,20 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         }
     }, []);
 
+    const refreshStreamingCache = useCallback(async () => {
+        try {
+            const info = await invoke<{ current_bytes: number; max_bytes: number }>('cmd_get_transcode_cache_info');
+            setStreamingCacheInfo(info);
+            setStreamingCacheError(null);
+        } catch (error) {
+            setStreamingCacheError(String(error));
+        }
+    }, []);
+
+    useEffect(() => {
+        if (isOpen && activeTab === 'general') void refreshStreamingCache();
+    }, [isOpen, activeTab, refreshStreamingCache]);
+
     // Load transcode cache when on general tab
     useEffect(() => {
         if (isOpen && activeTab === 'general' && SHOW_ADVANCED_SETTINGS) {
@@ -1331,64 +1348,26 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     {t('settings.transfers')}
                                 </h3>
 
-                                {/* Max Concurrent Uploads */}
-                                <div className="tr-setting-row flex items-center justify-between p-3">
-                                    <div className="flex items-center gap-2">
-                                        <Upload className="w-4 h-4 text-telegram-subtext" />
+                                {/* Sequential transfer policy applies even to previously saved parallel settings. */}
+                                <div className="tr-setting-row flex items-center justify-between gap-3 p-3">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                        <Upload className="w-4 h-4 shrink-0 text-telegram-subtext" />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">{t('settings.concurrent_uploads')}</p>
-                                            <p className="text-xs text-telegram-subtext">{t('settings.max_uploads_desc')}</p>
+                                            <p className="text-sm font-medium text-telegram-text">Uploads</p>
+                                            <p className="text-xs text-telegram-subtext">Files upload in the order queued, one after another.</p>
                                         </div>
                                     </div>
-                                    <div className="flex items-center gap-2">
-                                        <button
-                                            onClick={() => updateSetting('maxConcurrentUploads', Math.max(1, settings.maxConcurrentUploads - 1))}
-                                            aria-label={`${t('settings.concurrent_uploads')} -`}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
-                                        >
-                                            -
-                                        </button>
-                                        <span className="text-sm text-telegram-text font-medium w-5 text-center">
-                                            {settings.maxConcurrentUploads}
-                                        </span>
-                                        <button
-                                            onClick={() => updateSetting('maxConcurrentUploads', Math.min(10, settings.maxConcurrentUploads + 1))}
-                                            aria-label={`${t('settings.concurrent_uploads')} +`}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
-                                        >
-                                            +
-                                        </button>
-                                    </div>
+                                    <span className="shrink-0 text-xs font-semibold text-telegram-text">1 at a time</span>
                                 </div>
-
-                                {/* Max Concurrent Downloads */}
-                                <div className="tr-setting-row flex items-center justify-between p-3">
-                                    <div className="flex items-center gap-2">
-                                        <Download className="w-4 h-4 text-telegram-subtext" />
+                                <div className="tr-setting-row flex items-center justify-between gap-3 p-3">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                        <Download className="w-4 h-4 shrink-0 text-telegram-subtext" />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">{t('settings.concurrent_downloads')}</p>
-                                            <p className="text-xs text-telegram-subtext">{t('settings.max_downloads_desc')}</p>
+                                            <p className="text-sm font-medium text-telegram-text">Downloads</p>
+                                            <p className="text-xs text-telegram-subtext">Files download in the order queued, one after another.</p>
                                         </div>
                                     </div>
-                                    <div className="flex items-center gap-2">
-                                        <button
-                                            onClick={() => updateSetting('maxConcurrentDownloads', Math.max(1, settings.maxConcurrentDownloads - 1))}
-                                            aria-label={`${t('settings.concurrent_downloads')} -`}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
-                                        >
-                                            -
-                                        </button>
-                                        <span className="text-sm text-telegram-text font-medium w-5 text-center">
-                                            {settings.maxConcurrentDownloads}
-                                        </span>
-                                        <button
-                                            onClick={() => updateSetting('maxConcurrentDownloads', Math.min(10, settings.maxConcurrentDownloads + 1))}
-                                            aria-label={`${t('settings.concurrent_downloads')} +`}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
-                                        >
-                                            +
-                                        </button>
-                                    </div>
+                                    <span className="shrink-0 text-xs font-semibold text-telegram-text">1 at a time</span>
                                 </div>
 
                             {SHOW_ADVANCED_SETTINGS && (<>
@@ -2345,6 +2324,61 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     >
                                         {clearing ? t('settings.clearing') : t('settings.clear')}
                                     </button>
+                                </div>
+
+                                {/* Visible streaming storage controls. Unlike Clear Local Cache,
+                                    these touch only generated HLS/fMP4 and cached source files. */}
+                                <div className="tr-setting-row flex flex-wrap items-center justify-between gap-3 rounded-lg border border-telegram-border/60 bg-telegram-hover/30 p-3">
+                                    <div className="flex min-w-0 items-center gap-2.5">
+                                        <HardDrive className="h-4 w-4 shrink-0 text-telegram-subtext" />
+                                        <div>
+                                            <p className="text-sm font-medium text-telegram-text">Temporary streaming storage</p>
+                                            <p className="text-xs text-telegram-subtext">
+                                                {streamingCacheInfo
+                                                    ? `${(streamingCacheInfo.current_bytes / 1048576).toFixed(1)} MB used · automatic cleanup after playback stops`
+                                                    : streamingCacheError
+                                                        ? 'Could not read streaming storage — try Refresh'
+                                                        : 'Checking local streaming cache…'}
+                                            </p>
+                                            <p className="mt-1 text-[11px] text-telegram-subtext">
+                                                Conversion can temporarily use more than its {streamingCacheInfo
+                                                    ? (streamingCacheInfo.max_bytes / 1073741824).toFixed(0)
+                                                    : '5'} GB cache target while playing. Real downloads are never removed.
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <div className="flex shrink-0 items-center gap-2">
+                                        <button type="button" onClick={() => void refreshStreamingCache()}
+                                            aria-label="Refresh streaming cache usage"
+                                            className="rounded-lg border border-telegram-border px-2.5 py-2 text-xs text-telegram-text hover:bg-telegram-hover">
+                                            <RefreshCw className="h-4 w-4"/>
+                                        </button>
+                                        <button type="button"
+                                            disabled={clearingStreamingCache || !streamingCacheInfo || streamingCacheInfo.current_bytes === 0}
+                                            onClick={async () => {
+                                                const ok = await confirm({
+                                                    title: 'Clear temporary streaming data?',
+                                                    message: 'Only TeraRelay-generated streaming cache is removed. Close video players first. Telegram files and saved downloads are not affected.',
+                                                    confirmText: 'Clear streaming data',
+                                                    variant: 'danger',
+                                                });
+                                                if (!ok) return;
+                                                setClearingStreamingCache(true);
+                                                try {
+                                                    const result = await invoke<string>('cmd_clear_streaming_cache');
+                                                    toast.success(result);
+                                                    await refreshStreamingCache();
+                                                } catch (error) {
+                                                    toast.error('Streaming cache was not cleared: ' + String(error));
+                                                    await refreshStreamingCache();
+                                                } finally {
+                                                    setClearingStreamingCache(false);
+                                                }
+                                            }}
+                                            className="rounded-lg bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-400 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40">
+                                            {clearingStreamingCache ? 'Clearing…' : 'Clear streaming cache'}
+                                        </button>
+                                    </div>
                                 </div>
 
                             {SHOW_ADVANCED_SETTINGS && (<>

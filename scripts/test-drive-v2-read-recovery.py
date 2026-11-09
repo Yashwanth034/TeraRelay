@@ -16,7 +16,8 @@ segments = [
     ("    fn open_private_read(", "    // A single native read"),
     ("    fn read_cached_block(", "    /// Concurrent remote FUSE"),
     ("    fn write_cached_block_atomic(", "    #[cfg(test)]\n    mod concurrent_cache_publish_tests"),
-    ("    fn read_range_response(", "    fn create_private_file("),
+    ("    fn fetch_verified_loopback_range(", "    /// Require the precise requested range"),
+    ("    fn read_range_response(", "    #[cfg(all(test, target_os = \"linux\"))]\n    mod drive_large_range_retry_tests"),
 ]
 helpers = "\n".join(source[source.index(start):source.index(end, source.index(start))]
                     for start, end in segments)
@@ -25,7 +26,7 @@ b=source.index("        fn fetch_remote_block(",a)
 method=source[a:b]
 deps=root/"app/src-tauri/target/debug/deps"
 externs=[]
-for name in ["reqwest","urlencoding","sha2","libc","rand"]:
+for name in ["reqwest","urlencoding","sha2","libc","rand","log"]:
     paths=sorted(deps.glob("lib"+name+"-*.rlib"),key=lambda p:p.stat().st_mtime,reverse=True)
     assert paths,"Compile development Rust tests first"
     externs+=["--extern",name+"="+str(paths[0])]
@@ -74,7 +75,7 @@ mod drive_crypto {
 }
 struct DriveFileRecord { storage_version:u32,plaintext_size:Option<u64>,total_size:u64,file_id:String,encryption_version:u32,crypto_id:Option<String> }
 struct TeraRelayFs { db:Arc<Mutex<Location>>,app:FixtureApp,cache_root:PathBuf,http:reqwest::blocking::Client,stream_port:u16,stream_token:String }
-''' + helpers + "\nimpl TeraRelayFs {\nfn evict_cache_best_effort(&self) {}\n" + method + "\n}\n" + r'''
+''' + helpers + "\nimpl TeraRelayFs {\nfn evict_cache_best_effort(&self) {}\n" + method + "\nfn fetch_loopback_range(&self,url:&str,start:u64,end:u64)->Result<Vec<u8>,String>{fetch_verified_loopback_range(&self.http,url,start,end)}\n}\n" + r'''
 struct Fixture { fs:TeraRelayFs,file:DriveFileRecord,requests:Arc<AtomicUsize>,stop:Arc<AtomicBool>,worker:Option<std::thread::JoinHandle<()>>,root:PathBuf }
 impl Fixture {
  fn new(responses:Vec<Vec<u8>>)->Self {
@@ -147,11 +148,13 @@ impl Drop for Fixture { fn drop(&mut self) {self.stop.store(true,Ordering::SeqCs
  let f=Fixture::new(vec![b"verified".to_vec()]);f.seed(b"bad");
  assert_eq!(f.read().unwrap(),b"verified");assert_eq!(std::fs::read(f.cache()).unwrap(),b"verified");
 }
-#[test] fn a_dropped_connection_never_publishes_partial_cache_and_next_read_recovers() {
+#[test] fn transient_short_read_retries_and_only_publishes_complete_verified_data() {
  let f=Fixture::new(vec![b"ver".to_vec(),b"verified".to_vec()]);
- assert!(f.read().is_err());assert!(!f.cache().exists());
- assert_eq!(f.read().unwrap(),b"verified");assert_eq!(f.requests.load(Ordering::SeqCst),2);
+ assert_eq!(f.read().unwrap(),b"verified");
+ assert_eq!(f.requests.load(Ordering::SeqCst),2);
  assert_eq!(std::fs::read(f.cache()).unwrap(),b"verified");
+ assert_eq!(f.read().unwrap(),b"verified");
+ assert_eq!(f.requests.load(Ordering::SeqCst),2,"verified cache must avoid refetching");
 }
 #[test] fn wrong_remote_content_is_rejected_without_a_successful_cache_entry() {
  let f=Fixture::new(vec![b"corrupt!".to_vec()]);

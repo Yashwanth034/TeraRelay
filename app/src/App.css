@@ -1,5 +1,65 @@
 @import "tailwindcss";
 
+/* Make native WebKit/GTK form controls match the selected TeraRelay theme.
+   Without a color scheme the OS paints select menus white even when the
+   surrounding app uses dark background/text tokens. Keep light/custom
+   themes accessible, including the popup option and optgroup surfaces. */
+:root { color-scheme: dark; }
+:root.light { color-scheme: light; }
+:root select,
+:root select option,
+:root select optgroup {
+  color: var(--color-telegram-text);
+  background-color: var(--color-telegram-surface);
+}
+
+/* Streaming modal: one premium-looking control system, never native controls.
+   These rules are scoped to playback and do not affect other TeraRelay UI. */
+.tr-stream-player .tr-stream-range {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 6px;
+  border: 0;
+  border-radius: 999px;
+  outline: none;
+}
+.tr-stream-player .tr-stream-range::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #a78bfa;
+  background: #faf8ff;
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, .18);
+}
+.tr-stream-player .tr-stream-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #a78bfa;
+  background: #faf8ff;
+}
+.tr-stream-player .tr-stream-select select {
+  color-scheme: dark;
+  background: transparent;
+  min-width: 0;
+}
+.tr-stream-player .tr-stream-select option {
+  color: #f7f7ff;
+  background: #1c1b2a;
+}
+.tr-stream-player video {
+  background: #000;
+  cursor: inherit;
+}
+.tr-stream-player:fullscreen {
+  height: 100vh;
+  width: 100vw;
+  max-width: none;
+  border: 0;
+  border-radius: 0;
+}
 /* Neutral base palettes. User themes override these tokens through themeEngine. */
 @theme {
   --color-telegram-bg: #141414;

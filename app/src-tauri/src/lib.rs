@@ -474,6 +474,11 @@ pub fn run() {
                 e
             })?;
             let cache_root = app_data_dir.join("streaming");
+            // Streaming HLS/source data is temporary by default. A prior
+            // process has no active FFmpeg workers: clear its leftovers on
+            // start, without touching Telegram sessions or downloads.
+            transcode::clean_previous_session_stream_cache(&cache_root);
+            fmp4_remux::clean_previous_session_fmp4_cache(&cache_root);
             let startup_fmp4_root = cache_root.join("fmp4");
             let transcode_manager = transcode::TranscodeManager::new(cache_root);
             // Detect FFmpeg only on desktop. Mobile builds do not ship or launch
@@ -734,6 +739,10 @@ pub fn run() {
             commands::cmd_get_files,
             commands::cmd_drive_sync_metadata,
             commands::cmd_drive_get_snapshot,
+            commands::cmd_drive_get_channel_file_paths,
+            commands::cmd_drive_delete_empty_channel_folder_tree,
+            commands::cmd_drive_prepare_folder_upload,
+            commands::cmd_drive_move_uploaded_file_to_directory,
             commands::cmd_drive_namespace_audit,
             commands::cmd_drive_time_capsule_list,
             commands::cmd_drive_time_capsule_capture,
@@ -877,6 +886,7 @@ pub fn run() {
             commands::cmd_download_file,
             commands::cmd_move_files,
             commands::cmd_create_folder,
+            commands::shared_channels::cmd_create_shared_folder,
             commands::cmd_delete_folder,
             commands::cmd_rename_folder,
             commands::cmd_rename_file,
@@ -889,17 +899,21 @@ pub fn run() {
             commands::cmd_scan_folders,
             commands::cmd_search_global,
             commands::cmd_check_connection,
+            commands::cmd_telegram_account_tier,
             commands::cmd_is_network_available,
             commands::cmd_test_proxy_traffic,
             commands::cmd_reconnect_with_network_settings,
             commands::cmd_clean_cache,
             commands::cmd_get_thumbnail,
             commands::cmd_get_stream_info,
+            commands::external_video_players::cmd_list_external_video_players,
+            commands::external_video_players::cmd_open_video_in_external_player,
             commands::cmd_cancel_transfer,
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
             commands::cmd_delete_image_thumbnail,
+            commands::cmd_list_folder_upload_files,
             commands::cmd_zip_folder,
             commands::cmd_delete_temp_zip,
             commands::cmd_apply_proxy_settings,
@@ -930,10 +944,13 @@ pub fn run() {
             commands::cmd_get_video_metadata_batch,
             transcode::cmd_get_transcode_capabilities,
             transcode::cmd_prepare_transcoded_stream,
+            transcode::cmd_begin_stream_session,
+            transcode::cmd_end_stream_session,
             transcode::cmd_get_transcode_status,
             transcode::cmd_cancel_transcode,
             transcode::cmd_get_master_playlist_info,
             transcode::cmd_get_transcode_cache_info,
+            transcode::cmd_clear_streaming_cache,
             transcode::cmd_set_transcode_cache_limit,
             transcode::cmd_get_cached_variants,
             transcode::cmd_get_detailed_transcode_cache,

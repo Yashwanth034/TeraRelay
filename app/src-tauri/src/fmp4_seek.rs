@@ -54,12 +54,13 @@ async fn probe_interval(
                 "-rw_timeout",
                 "20000000",
                 "-select_streams",
-                "v:0",
+                "V:0",
                 "-read_intervals",
                 &format!("{timestamp:.6}%+#1"),
                 "-show_packets",
+                "-show_streams",
                 "-show_entries",
-                "format=start_time:packet=pts_time,flags",
+                "format=start_time:packet=pts_time,flags:stream=codec_name,pix_fmt",
                 "-of",
                 "json",
             ])
@@ -87,21 +88,57 @@ async fn probe_interval(
         .map_err(|error| format!("Invalid video seek probe: {error}"))
 }
 
-pub(super) async fn probe_seek_anchor(
+async fn seek_anchor_from_probe(
     ffprobe: &Path,
     source: &str,
     requested: f64,
+    initial: serde_json::Value,
 ) -> Result<SeekAnchor, String> {
-    let initial = probe_interval(ffprobe, source, requested).await?;
     let source_start = finite_number(&initial["format"]["start_time"]).unwrap_or(0.0);
     // ffprobe intervals use source timestamps; the player uses elapsed movie time.
-    // Sources can start before zero because of AAC priming, or at a nonzero PTS.
     let probe = if source_start.abs() > 0.000001 {
         probe_interval(ffprobe, source, requested + source_start).await?
     } else {
         initial
     };
     parse_anchor(&probe, requested)
+}
+
+/// Copy only broadly supported H.264. For other codecs, or if a trustworthy
+/// keyframe anchor cannot be found, decode and seek by elapsed movie time.
+pub(super) async fn prepare_remux_window(
+    ffprobe: &Path,
+    source: &str,
+    requested: f64,
+) -> (Option<SeekAnchor>, bool) {
+    if let Ok(probe) = probe_interval(ffprobe, source, requested).await {
+        let video = &probe["streams"][0];
+        let copy_compatible = video["codec_name"].as_str() == Some("h264")
+            && matches!(video["pix_fmt"].as_str(), Some("yuv420p" | "yuvj420p"));
+        if copy_compatible {
+            if requested == 0.0 {
+                return (None, false);
+            }
+            if let Ok(anchor) = seek_anchor_from_probe(ffprobe, source, requested, probe).await {
+                return (Some(anchor), false);
+            }
+        }
+    }
+    let anchor = (requested > 0.0).then_some(SeekAnchor {
+        source_timestamp: requested,
+        window_start: requested,
+    });
+    (anchor, true)
+}
+
+#[cfg(test)]
+pub(super) async fn probe_seek_anchor(
+    ffprobe: &Path,
+    source: &str,
+    requested: f64,
+) -> Result<SeekAnchor, String> {
+    let initial = probe_interval(ffprobe, source, requested).await?;
+    seek_anchor_from_probe(ffprobe, source, requested, initial).await
 }
 
 #[cfg(test)]

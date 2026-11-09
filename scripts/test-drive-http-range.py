@@ -5,17 +5,18 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parent.parent
 source = (root / "app/src-tauri/src/drive_mount.rs").read_text()
-start = source.index("        fn fetch_stream_range(")
+start = source.index("        fn fetch_loopback_range(")
 end = source.index("        fn fetch_encrypted_plain_chunk(", start)
 method = source[start:end]
-helper = ""
-if "    fn read_range_response(" in source:
-    a = source.index("    fn read_range_response(")
-    b = source.index("    fn create_private_file(", a)
-    helper = source[a:b]
+# Reuse the production retry helper and strict 206/Content-Range validator.
+# Do not include in-source unit test modules in this isolated Rust fixture.
+helper = source[
+    source.index("    fn fetch_verified_loopback_range("):
+    source.index("    #[cfg(all(test, target_os = \"linux\"))]\n    mod drive_large_range_retry_tests")
+]
 deps = root / "app/src-tauri/target/debug/deps"
 externs = []
-for name in ["reqwest", "urlencoding"]:
+for name in ["reqwest", "urlencoding", "log"]:
     found = sorted(deps.glob("lib" + name + "-*.rlib"), key=lambda p: p.stat().st_mtime, reverse=True)
     assert found, "Compile development Rust tests before this check"
     externs += ["--extern", name + "=" + str(found[0])]

@@ -150,6 +150,9 @@ pub struct DriveManifestV1 {
     pub entries: Vec<DriveEntryRecord>,
     #[serde(default)]
     pub storage_channels: Vec<DriveStorageManifestRecord>,
+    /// First-class TeraRelay channels sharing one real Telegram storage peer.
+    #[serde(default)]
+    pub shared_channels: Vec<crate::commands::shared_channels::SharedChannelRecord>,
     #[serde(default)]
     pub objects: Vec<DriveObjectRecord>,
     #[serde(default)]
@@ -1098,11 +1101,14 @@ fn available_imported_name(
             (false, 1) => format!(" {suffix}"),
             (false, n) => format!(" {suffix}-{n}"),
         };
-        let reserve = marker.len().saturating_add(extension.len());
-        if reserve >= 255 {
-            return Err("Imported Drive name suffix is too long".to_string());
-        }
-        let max_stem = 255 - reserve;
+        // An unusually long extension may not fit beside the collision
+        // suffix. Treat it as part of the stem rather than failing the import.
+        let (stem, extension) = if marker.len() + extension.len() >= 255 {
+            (requested, "")
+        } else {
+            (stem, extension.as_str())
+        };
+        let max_stem = 255 - marker.len() - extension.len();
         let mut end = stem.len().min(max_stem);
         while !stem.is_char_boundary(end) {
             end -= 1;
@@ -1113,6 +1119,156 @@ fn available_imported_name(
         }
     }
     Err("Could not choose a unique imported Drive name".into())
+}
+
+/// Telegram filenames need not be valid on every Drive platform. Keep the
+/// recognizable name and extension rather than throwing away the entire label.
+fn portable_imported_file_name(name: &str) -> String {
+    if let Ok(name) = validate_drive_name(name) {
+        return name;
+    }
+
+    let sanitized: String = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_end_matches(|ch: char| ch == '.' || ch.is_whitespace());
+    if sanitized.is_empty() {
+        return "file".into();
+    }
+
+    let mut candidate = sanitized.to_string();
+    if candidate.len() > 255 {
+        // Keep a usable extension where possible, and never split a UTF-8
+        // character even when the source name exceeds the Drive byte limit.
+        let (stem, extension) = sanitized
+            .rfind('.')
+            .filter(|dot| *dot > 0 && sanitized.len() - dot < 255)
+            .map_or((sanitized, ""), |dot| sanitized.split_at(dot));
+        let mut end = stem.len().min(255 - extension.len());
+        while !stem.is_char_boundary(end) {
+            end -= 1;
+        }
+        candidate = format!("{}{extension}", stem[..end].trim_end());
+        candidate.truncate(
+            candidate
+                .trim_end_matches(|ch: char| ch == '.' || ch.is_whitespace())
+                .len(),
+        );
+    }
+
+    if let Ok(name) = validate_drive_name(&candidate) {
+        return name;
+    }
+    // Only a reserved Windows basename remains after cleanup. Prefix it
+    // without losing the extension; shrink one byte first if necessary.
+    if candidate.len() == 255 {
+        let stem_end = candidate.find('.').unwrap_or(candidate.len());
+        let mut end = stem_end.saturating_sub(1);
+        while !candidate.is_char_boundary(end) {
+            end -= 1;
+        }
+        candidate.replace_range(end..stem_end, "");
+    }
+    validate_drive_name(&format!("_{candidate}")).unwrap_or_else(|_| "file".to_string())
+}
+
+fn is_legacy_imported_file_fallback(name: &str, file_id: &str) -> bool {
+    if name == "file" {
+        return true;
+    }
+    let suffix: String = file_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(6)
+        .collect();
+    let Some(marker) = name
+        .strip_prefix("file (")
+        .and_then(|v| v.strip_suffix(')'))
+    else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    if marker == suffix {
+        return true;
+    }
+    marker
+        .strip_prefix(suffix.as_str())
+        .and_then(|v| v.strip_prefix('-'))
+        .and_then(|v| v.parse::<usize>().ok().map(|index| (v, index)))
+        .is_some_and(|(v, index)| (2..=10000).contains(&index) && index.to_string() == v)
+}
+
+/// Repair only entries that still look exactly like the old importer's
+/// generated placeholder. Never rename other Drive entries, copies, or moves.
+fn repair_legacy_imported_file_names(
+    conn: &sqlite::Connection,
+    dir_id: &str,
+    logical_id: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.entry_id, e.file_id, e.display_name, f.display_name
+             FROM drive_file_entries e
+             JOIN logical_files f ON f.file_id = e.file_id
+             JOIN drive_directories d ON d.id = e.directory_id
+             WHERE e.directory_id = ?1 AND f.logical_channel_id = ?2
+               AND f.status = 'complete' AND e.entry_id = 'import-' || e.file_id
+               AND f.display_name NOT LIKE '.terarelay-drive-file-%'
+               AND e.created_at = f.created_at AND e.trashed_at IS NULL
+               AND d.trashed_at IS NULL
+               AND (e.display_name = 'file' OR e.display_name GLOB 'file (*)')
+               AND NOT EXISTS (
+                   SELECT 1 FROM drive_entries_v2 v WHERE v.entry_id = e.entry_id
+               )
+             ORDER BY e.created_at, e.entry_id",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.bind((1, dir_id)).map_err(|e| e.to_string())?;
+    stmt.bind((2, logical_id)).map_err(|e| e.to_string())?;
+    let mut repairs = Vec::new();
+    while let sqlite::State::Row = stmt.next().map_err(|e| e.to_string())? {
+        let entry_id = stmt.read::<String, _>(0).map_err(|e| e.to_string())?;
+        let file_id = stmt.read::<String, _>(1).map_err(|e| e.to_string())?;
+        let old_name = stmt.read::<String, _>(2).map_err(|e| e.to_string())?;
+        let source_name = stmt.read::<String, _>(3).map_err(|e| e.to_string())?;
+        // The old importer could replace a valid Telegram filename with a
+        // generic "file (id)" label too; repair based on the exact generated
+        // placeholder, not on whether the original name needs sanitization.
+        if is_legacy_imported_file_fallback(&old_name, &file_id) {
+            let requested = portable_imported_file_name(&source_name);
+            if requested != "file" && requested != old_name {
+                repairs.push((entry_id, file_id, requested));
+            }
+        }
+    }
+    drop(stmt);
+
+    let changed = !repairs.is_empty();
+    for (entry_id, file_id, requested) in repairs {
+        let name = available_imported_name(conn, Some(dir_id), &requested, &file_id, true)?;
+        let mut update = conn
+            .prepare("UPDATE drive_file_entries SET display_name = ?1, updated_at = ?2 WHERE entry_id = ?3")
+            .map_err(|e| e.to_string())?;
+        update.bind((1, name.as_str())).map_err(|e| e.to_string())?;
+        update.bind((2, now)).map_err(|e| e.to_string())?;
+        update
+            .bind((3, entry_id.as_str()))
+            .map_err(|e| e.to_string())?;
+        update.next().map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
 }
 
 pub fn ensure_imported_layout(conn: &sqlite::Connection) -> Result<bool, String> {
@@ -1139,7 +1295,7 @@ fn ensure_imported_layout_scoped(
             .prepare(
                 "SELECT logical_id, name
              FROM logical_channels
-             WHERE role != 'drive_storage'
+             WHERE role NOT IN ('drive_storage', 'shared_deleted')
                AND (?1 IS NULL OR logical_id = (
                    SELECT logical_channel_id FROM logical_files WHERE file_id = ?1
                ))
@@ -1207,6 +1363,10 @@ fn ensure_imported_layout_scoped(
                 changed = true;
             }
 
+            if only_file_id.is_none() {
+                changed |= repair_legacy_imported_file_names(conn, &dir_id, &logical_id, now)?;
+            }
+
             let mut files = conn
                 .prepare(
                     "SELECT f.file_id, f.display_name, f.created_at
@@ -1245,8 +1405,7 @@ fn ensure_imported_layout_scoped(
             for (file_id, file_name, created_at) in unmapped {
                 // Already-mapped files were excluded in the indexed SQL query,
                 // rather than pulled into memory and looked up one by one.
-                let requested =
-                    validate_drive_name(&file_name).unwrap_or_else(|_| "file".to_string());
+                let requested = portable_imported_file_name(&file_name);
                 let name =
                     available_imported_name(conn, Some(&dir_id), &requested, &file_id, true)?;
 
@@ -1379,6 +1538,43 @@ pub(crate) fn publish_completed_upload_to_drive(
         Ok(Some((parent, name, new_folder_name, entry_id)))
     })();
     crate::drive_posix::finish_savepoint(conn, "drive_completed_upload_publish", result)
+}
+
+/// Keep the default imported Drive folder aligned when a TeraRelay file
+/// changes its owning logical channel without moving Telegram chunks.
+/// User-organized files in custom Drive folders are intentionally left alone.
+pub(crate) fn reflect_shared_channel_move_in_drive(
+    conn: &sqlite::Connection,
+    file_id: &str,
+    old_logical_id: &str,
+    new_logical_id: &str,
+) -> Result<Option<(String, String, String, String, String)>, String> {
+    ensure_imported_layout_scoped(conn, Some(file_id))?;
+    let old_dir = imported_directory_id(old_logical_id);
+    let new_dir = imported_directory_id(new_logical_id);
+    let entry_id = format!("import-{file_id}");
+    let mut stmt = conn
+        .prepare(
+            "SELECT directory_id, display_name FROM drive_file_entries
+         WHERE entry_id = ? AND trashed_at IS NULL",
+        )
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    stmt.bind((1, entry_id.as_str()))
+        .map_err(|e| e.to_string())?;
+    if stmt.next().map_err(|e: sqlite::Error| e.to_string())? != sqlite::State::Row {
+        return Ok(None);
+    }
+    let parent = stmt
+        .read::<Option<String>, _>(0)
+        .map_err(|e| e.to_string())?;
+    let old_name = stmt.read::<String, _>(1).map_err(|e| e.to_string())?;
+    drop(stmt);
+    if parent.as_deref() != Some(old_dir.as_str()) {
+        return Ok(None); // Preserve explicit user Drive organization.
+    }
+    let new_name = available_imported_name(conn, Some(&new_dir), &old_name, file_id, true)?;
+    rename_drive_file(conn, &entry_id, Some(&new_dir), &new_name)?;
+    Ok(Some((old_dir, old_name, new_dir, new_name, entry_id)))
 }
 
 /// Nullable persisted Drive fields must distinguish SQL NULL from malformed
@@ -2281,6 +2477,532 @@ pub fn create_drive_directory(
     crate::drive_posix::finish_savepoint(conn, "drive_create_directory", result)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DriveUploadDirectory {
+    pub relative_path: String,
+    pub directory_id: String,
+}
+
+/// Compact channel-feed view of the same persisted Drive hierarchy used by
+/// folder uploads. Paths are relative to the channel's imported Drive root.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriveChannelFilePaths {
+    pub directories: Vec<String>,
+    /// Stable Drive directory IDs keyed by the channel-relative path.
+    pub directory_ids: HashMap<String, String>,
+    /// Creation timestamps (Unix milliseconds) keyed by the channel-relative path.
+    pub directory_created_at: HashMap<String, i64>,
+    pub file_paths: HashMap<String, String>,
+}
+
+fn drive_channel_file_paths(
+    conn: &sqlite::Connection,
+    logical_channel_id: &str,
+) -> Result<DriveChannelFilePaths, String> {
+    init_drive_schema(conn)?;
+    let root_id = imported_directory_id(logical_channel_id);
+    let mut directories_by_id = HashMap::<String, String>::new();
+    let mut directories = conn
+        .prepare(
+            "WITH RECURSIVE folders(id, parent_id, path, depth, seen) AS (
+                SELECT id, parent_id, name, 1, '|' || id || '|'
+                FROM drive_directories
+                WHERE parent_id = ?1 AND trashed_at IS NULL
+                UNION ALL
+                SELECT child.id, child.parent_id,
+                       folders.path || '/' || child.name,
+                       folders.depth + 1,
+                       folders.seen || child.id || '|'
+                FROM drive_directories child
+                JOIN folders ON child.parent_id = folders.id
+                WHERE child.trashed_at IS NULL
+                  AND folders.depth < 64
+                  AND instr(folders.seen, '|' || child.id || '|') = 0
+            )
+            SELECT folders.id, folders.path, drive_directories.created_at
+             FROM folders
+             JOIN drive_directories ON drive_directories.id = folders.id
+             ORDER BY folders.depth ASC, folders.path COLLATE NOCASE ASC",
+        )
+        .map_err(|error: sqlite::Error| error.to_string())?;
+    directories
+        .bind((1, root_id.as_str()))
+        .map_err(|error| error.to_string())?;
+    let mut directory_paths = Vec::new();
+    let mut directory_ids = HashMap::new();
+    let mut directory_created_at = HashMap::new();
+    while let sqlite::State::Row = directories.next().map_err(|error| error.to_string())? {
+        let id = directories
+            .read::<String, _>("id")
+            .map_err(|error| error.to_string())?;
+        let path = directories
+            .read::<String, _>("path")
+            .map_err(|error| error.to_string())?;
+        let created_at = directories
+            .read::<i64, _>("created_at")
+            .map_err(|error| error.to_string())?;
+        // Treat synced/corrupt directory names as untrusted metadata. Never
+        // surface an absolute path or traversal component to the frontend.
+        if path.is_empty()
+            || path.len() > 4096
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path.split('/').count() > 64
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            continue;
+        }
+        directories_by_id.insert(id.clone(), path.clone());
+        directory_ids.insert(path.clone(), id);
+        directory_created_at.insert(path.clone(), created_at);
+        directory_paths.push(path);
+    }
+    drop(directories);
+
+    let mut entries = conn
+        .prepare(
+            "SELECT e.file_id, e.directory_id
+             FROM drive_file_entries e
+             JOIN logical_files f ON f.file_id = e.file_id
+             WHERE f.logical_channel_id = ?1
+               AND f.status = 'complete'
+               AND e.trashed_at IS NULL
+             ORDER BY e.updated_at DESC, e.entry_id ASC",
+        )
+        .map_err(|error: sqlite::Error| error.to_string())?;
+    entries
+        .bind((1, logical_channel_id))
+        .map_err(|error| error.to_string())?;
+    let mut file_paths = HashMap::new();
+    while let sqlite::State::Row = entries.next().map_err(|error| error.to_string())? {
+        let file_id = entries
+            .read::<String, _>("file_id")
+            .map_err(|error| error.to_string())?;
+        let directory_id = entries
+            .read::<Option<String>, _>("directory_id")
+            .map_err(|error| error.to_string())?;
+        if let Some(path) = directory_id
+            .as_deref()
+            .and_then(|id| directories_by_id.get(id))
+        {
+            file_paths.entry(file_id).or_insert_with(|| path.clone());
+        }
+    }
+    Ok(DriveChannelFilePaths {
+        directories: directory_paths,
+        directory_ids,
+        directory_created_at,
+        file_paths,
+    })
+}
+
+#[tauri::command]
+pub fn cmd_drive_get_channel_file_paths(
+    folder_id: i64,
+    db_pool: State<'_, DbConnection>,
+) -> Result<DriveChannelFilePaths, String> {
+    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    init_drive_schema(&conn)?;
+    let logical_id =
+        crate::commands::logical_channels::logical_channel_id_for_backing(&conn, folder_id)?;
+    let Some(logical_id) = logical_id else {
+        return Ok(DriveChannelFilePaths {
+            directories: Vec::new(),
+            directory_ids: HashMap::new(),
+            directory_created_at: HashMap::new(),
+            file_paths: HashMap::new(),
+        });
+    };
+    drive_channel_file_paths(&conn, &logical_id)
+}
+
+fn ensure_imported_channel_drive_root(
+    conn: &sqlite::Connection,
+    logical_channel_id: &str,
+) -> Result<DriveDirectoryRecord, String> {
+    let id = imported_directory_id(logical_channel_id);
+    if let Some(existing) = crate::drive_lookup::directory(conn, &id)? {
+        if existing.parent_id.is_some()
+            || existing.backing_logical_channel_id.as_deref() != Some(logical_channel_id)
+        {
+            return Err("The channel's Drive root has an unexpected identity".to_string());
+        }
+        return Ok(existing);
+    }
+
+    let mut check = conn
+        .prepare("SELECT 1 FROM drive_directories WHERE id = ? LIMIT 1")
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    check.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+    if check.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        return Err(
+            "The channel's Drive root is in Trash; restore it before uploading a folder"
+                .to_string(),
+        );
+    }
+    drop(check);
+
+    let mut channel = conn
+        .prepare("SELECT name FROM logical_channels WHERE logical_id = ? LIMIT 1")
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    channel
+        .bind((1, logical_channel_id))
+        .map_err(|e| e.to_string())?;
+    if channel.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+        return Err("The selected TeraRelay channel no longer exists".to_string());
+    }
+    let requested = channel
+        .read::<String, _>("name")
+        .map_err(|e| e.to_string())?;
+    drop(channel);
+    let requested =
+        validate_drive_name(&requested).unwrap_or_else(|_| "TeraRelay Storage".to_string());
+    let name = available_imported_name(conn, None, &requested, logical_channel_id, false)?;
+    let now = now_ms();
+
+    conn.execute("SAVEPOINT drive_upload_root_create")
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO drive_directories
+                 (id,parent_id,name,backing_logical_channel_id,created_at,updated_at,trashed_at)
+                 VALUES (?,NULL,?,?,?,?,NULL)",
+            )
+            .map_err(|e: sqlite::Error| e.to_string())?;
+        insert.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        insert.bind((2, name.as_str())).map_err(|e| e.to_string())?;
+        insert
+            .bind((3, logical_channel_id))
+            .map_err(|e| e.to_string())?;
+        insert.bind((4, now)).map_err(|e| e.to_string())?;
+        insert.bind((5, now)).map_err(|e| e.to_string())?;
+        insert.next().map_err(|e| e.to_string())?;
+        mark_drive_dirty(conn)?;
+        Ok(DriveDirectoryRecord {
+            id: id.clone(),
+            parent_id: None,
+            name: name.clone(),
+            backing_logical_channel_id: Some(logical_channel_id.to_string()),
+            created_at: now,
+            updated_at: now,
+            trashed_at: None,
+        })
+    })();
+    crate::drive_posix::finish_savepoint(conn, "drive_upload_root_create", result)
+}
+
+fn find_active_child_directory(
+    conn: &sqlite::Connection,
+    parent_id: &str,
+    requested_name: &str,
+) -> Result<Option<DriveDirectoryRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,parent_id,name,backing_logical_channel_id,created_at,updated_at
+             FROM drive_directories WHERE parent_id = ? AND trashed_at IS NULL",
+        )
+        .map_err(|e: sqlite::Error| e.to_string())?;
+    stmt.bind((1, parent_id)).map_err(|e| e.to_string())?;
+    let wanted = portable_name_key(requested_name);
+    while let sqlite::State::Row = stmt.next().map_err(|e| e.to_string())? {
+        let name = stmt.read::<String, _>("name").map_err(|e| e.to_string())?;
+        if portable_name_key(&name) != wanted {
+            continue;
+        }
+        let created_at = stmt
+            .read::<i64, _>("created_at")
+            .map_err(|e| e.to_string())?;
+        let updated_at = stmt
+            .read::<i64, _>("updated_at")
+            .map_err(|e| e.to_string())?;
+        if updated_at < created_at {
+            return Err("Drive upload folder has invalid timestamps".to_string());
+        }
+        return Ok(Some(DriveDirectoryRecord {
+            id: stmt.read::<String, _>("id").map_err(|e| e.to_string())?,
+            parent_id: stmt
+                .read::<Option<String>, _>("parent_id")
+                .map_err(|e| e.to_string())?,
+            name,
+            backing_logical_channel_id: drive_nullable_text(&stmt, "backing_logical_channel_id")?,
+            created_at,
+            updated_at,
+            trashed_at: None,
+        }));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+pub fn cmd_drive_prepare_folder_upload(
+    folder_id: i64,
+    folder_name: String,
+    relative_directories: Vec<String>,
+    relative_files: Vec<String>,
+    app_handle: AppHandle,
+    db_pool: State<'_, DbConnection>,
+) -> Result<Vec<DriveUploadDirectory>, String> {
+    if relative_directories.len() > 2_000 || relative_files.len() > 10_000 {
+        return Err("Folder upload exceeds the safe file or directory count".to_string());
+    }
+    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    init_drive_schema(&conn)?;
+    crate::commands::logical_channels::ensure_channel_can_upload(&conn, Some(folder_id))?;
+    let logical_id =
+        crate::commands::logical_channels::logical_channel_id_for_backing(&conn, folder_id)?
+            .ok_or_else(|| "The selected channel has no TeraRelay Drive identity".to_string())?;
+    let folder_name = validate_drive_name(&folder_name)?;
+    let root = ensure_imported_channel_drive_root(&conn, &logical_id)?;
+
+    // Create the collection and every nested directory in one outer savepoint.
+    // A malformed component cannot leave half a folder tree behind.
+    conn.execute("SAVEPOINT drive_prepare_folder_upload")
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        ensure_name_available(&conn, Some(&root.id), &folder_name, None, None, None).or_else(
+            |error| {
+                // An existing same-name collection is a safe idempotent retry target
+                // only when the node is a directory, not a file or another node type.
+                if find_active_child_directory(&conn, &root.id, &folder_name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            },
+        )?;
+        let collection = match find_active_child_directory(&conn, &root.id, &folder_name)? {
+            Some(existing) => existing,
+            None => create_drive_directory(&conn, Some(&root.id), &folder_name)?,
+        };
+
+        let mut requested = relative_directories;
+        requested.sort_by_key(|path| (path.split('/').count(), path.to_lowercase()));
+        requested.dedup();
+        let mut resolved: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut result = vec![DriveUploadDirectory {
+            relative_path: String::new(),
+            directory_id: collection.id.clone(),
+        }];
+        for path in requested {
+            if path.is_empty()
+                || path.starts_with('/')
+                || path.ends_with('/')
+                || path.contains('\\')
+                || path.contains('\0')
+            {
+                return Err("Folder upload contains an invalid relative directory path".to_string());
+            }
+            let components: Vec<&str> = path.split('/').collect();
+            if components.len() > 64
+                || components
+                    .iter()
+                    .any(|part| part.is_empty() || *part == "." || *part == "..")
+            {
+                return Err(
+                    "Folder upload contains an unsafe or excessively deep relative directory path"
+                        .to_string(),
+                );
+            }
+            let mut parent_id = collection.id.clone();
+            let mut prefix = String::new();
+            for component in components {
+                let component = validate_drive_name(component)?;
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(&component);
+                if let Some(existing_id) = resolved.get(&prefix) {
+                    parent_id = existing_id.clone();
+                    continue;
+                }
+                let child = match find_active_child_directory(&conn, &parent_id, &component)? {
+                    Some(existing) => existing,
+                    None => create_drive_directory(&conn, Some(&parent_id), &component)?,
+                };
+                parent_id = child.id.clone();
+                resolved.insert(prefix.clone(), parent_id.clone());
+                result.push(DriveUploadDirectory {
+                    relative_path: prefix.clone(),
+                    directory_id: parent_id.clone(),
+                });
+            }
+        }
+
+        // Preflight every destination name before creating any upload jobs.
+        // Drive uses portable case-insensitive names even on case-sensitive hosts.
+        let mut reserved_names = HashSet::new();
+        for path in relative_files {
+            if path.is_empty()
+                || path.starts_with('/')
+                || path.ends_with('/')
+                || path.contains('\\')
+                || path.contains('\0')
+            {
+                return Err("Folder upload contains an invalid relative file path".to_string());
+            }
+            let components: Vec<&str> = path.split('/').collect();
+            if components.len() > 65
+                || components
+                    .iter()
+                    .any(|part| part.is_empty() || *part == "." || *part == "..")
+            {
+                return Err(
+                    "Folder upload contains an unsafe or excessively deep relative file path"
+                        .to_string(),
+                );
+            }
+            let mut normalized = Vec::with_capacity(components.len());
+            for component in components {
+                normalized.push(validate_drive_name(component)?);
+            }
+            let file_name = normalized
+                .pop()
+                .ok_or("Folder upload file name is missing")?;
+            let parent_path = normalized.join("/");
+            let parent_id = resolved
+                .get(&parent_path)
+                .map(String::as_str)
+                .unwrap_or(collection.id.as_str());
+            let key = (parent_id.to_string(), portable_name_key(&file_name));
+            if !reserved_names.insert(key) {
+                return Err(format!(
+                    "Folder contains duplicate Drive filenames at '{path}'"
+                ));
+            }
+            ensure_name_available(&conn, Some(parent_id), &file_name, None, None, None).map_err(
+                |_| {
+                    format!(
+                        "A Drive item named '{file_name}' already exists in the destination folder"
+                    )
+                },
+            )?;
+        }
+        Ok(result)
+    })();
+    let created =
+        crate::drive_posix::finish_savepoint(&conn, "drive_prepare_folder_upload", result)?;
+    drop(conn);
+    notify_native_drive_metadata_changed(&app_handle, None, None);
+    Ok(created)
+}
+
+fn drive_directory_is_inside_root(
+    conn: &sqlite::Connection,
+    directory_id: &str,
+    root_id: &str,
+) -> Result<bool, String> {
+    let mut current = directory_id.to_string();
+    let mut visited = HashSet::new();
+    for _ in 0..512 {
+        if current == root_id {
+            return Ok(true);
+        }
+        if !visited.insert(current.clone()) {
+            return Err("Drive directory hierarchy contains a cycle".to_string());
+        }
+        let mut stmt = conn
+            .prepare("SELECT parent_id FROM drive_directories WHERE id = ? AND trashed_at IS NULL LIMIT 1")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, current.as_str()))
+            .map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+            return Ok(false);
+        }
+        match stmt
+            .read::<Option<String>, _>("parent_id")
+            .map_err(|e| e.to_string())?
+        {
+            Some(parent) => current = parent,
+            None => return Ok(false),
+        }
+    }
+    Err("Drive folder hierarchy is too deep".to_string())
+}
+
+#[tauri::command]
+pub fn cmd_drive_move_uploaded_file_to_directory(
+    folder_id: i64,
+    logical_file_id: String,
+    directory_id: String,
+    app_handle: AppHandle,
+    db_pool: State<'_, DbConnection>,
+) -> Result<(), String> {
+    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    init_drive_schema(&conn)?;
+    crate::commands::logical_channels::ensure_channel_can_upload(&conn, Some(folder_id))?;
+    let logical_id =
+        crate::commands::logical_channels::logical_channel_id_for_backing(&conn, folder_id)?
+            .ok_or_else(|| "The selected channel has no TeraRelay Drive identity".to_string())?;
+    let mut complete = conn
+        .prepare("SELECT 1 FROM logical_files WHERE file_id = ? AND logical_channel_id = ? AND status = 'complete' LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    complete
+        .bind((1, logical_file_id.as_str()))
+        .map_err(|e| e.to_string())?;
+    complete
+        .bind((2, logical_id.as_str()))
+        .map_err(|e| e.to_string())?;
+    if complete.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+        return Err("Uploaded file is not complete in the selected channel".to_string());
+    }
+    drop(complete);
+
+    // QA uploads use the same Drive index path even though the synthetic
+    // transport does not have a real Telegram client or manifest document.
+    ensure_imported_layout_scoped(&conn, Some(&logical_file_id))?;
+    let root_id = imported_directory_id(&logical_id);
+    if !drive_directory_is_inside_root(&conn, &directory_id, &root_id)? {
+        return Err(
+            "The destination is not inside the selected channel's Drive folder".to_string(),
+        );
+    }
+    let mut entry = conn
+        .prepare(
+            "SELECT entry_id,directory_id,display_name FROM drive_file_entries
+             WHERE file_id = ? AND trashed_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+    entry
+        .bind((1, logical_file_id.as_str()))
+        .map_err(|e| e.to_string())?;
+    if entry.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+        return Err("The uploaded file has no active Drive entry to move".to_string());
+    }
+    let entry_id = entry
+        .read::<String, _>("entry_id")
+        .map_err(|e| e.to_string())?;
+    let old_parent = entry
+        .read::<Option<String>, _>("directory_id")
+        .map_err(|e| e.to_string())?;
+    let name = entry
+        .read::<String, _>("display_name")
+        .map_err(|e| e.to_string())?;
+    drop(entry);
+
+    if old_parent.as_deref() == Some(directory_id.as_str()) {
+        return Ok(());
+    }
+    if old_parent.as_deref() != Some(root_id.as_str()) {
+        return Err(
+            "The uploaded file was moved elsewhere in Drive; it was left in its current location"
+                .to_string(),
+        );
+    }
+    rename_drive_file(&conn, &entry_id, Some(&directory_id), &name)?;
+    drop(conn);
+    notify_native_drive_entry_changed(&app_handle, old_parent.as_deref(), &name, Some(&entry_id));
+    notify_native_drive_entry_changed(&app_handle, Some(&directory_id), &name, Some(&entry_id));
+    Ok(())
+}
+
 /// Native mkdir must commit the folder and its requested mode together.
 /// Nested helpers retain their own savepoints without committing this operation.
 pub(crate) fn create_drive_directory_with_mode(
@@ -3164,22 +3886,26 @@ pub fn drive_object_blocks(
 }
 
 #[cfg(test)]
-static DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    // Query-count assertions must be isolated per Rust test thread. A shared
+    // process-wide counter races with other parallel Drive tests.
+    static DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 fn reset_drive_object_block_location_query_steps() {
-    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.store(0, std::sync::atomic::Ordering::SeqCst);
+    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.with(|steps| steps.set(0));
 }
 
 #[cfg(test)]
 fn drive_object_block_location_query_steps() -> usize {
-    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.load(std::sync::atomic::Ordering::SeqCst)
+    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.with(std::cell::Cell::get)
 }
 
 fn record_drive_object_block_location_query_step() {
     #[cfg(test)]
-    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    DRIVE_OBJECT_BLOCK_LOCATION_QUERY_STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
 }
 
 fn drive_object_block_location_query(
@@ -4895,6 +5621,187 @@ pub fn trash_drive_directory(conn: &sqlite::Connection, id: &str) -> Result<(), 
     crate::drive_posix::finish_savepoint(conn, "drive_folder_trash", result)
 }
 
+/// Remove empty descendants of a channel's imported Drive root after a
+/// logical Telegram file is deleted. Process leaves before parents so nested
+/// empty directories disappear too. Non-empty folders are deliberately kept.
+pub fn prune_empty_imported_channel_directories(
+    conn: &sqlite::Connection,
+    logical_channel_id: &str,
+) -> Result<usize, String> {
+    init_drive_schema(conn)?;
+    let root_id = imported_directory_id(logical_channel_id);
+    let mut statement = conn
+        .prepare(
+            "WITH RECURSIVE folders(id, depth, seen) AS (
+                SELECT id, 1, '|' || id || '|'
+                FROM drive_directories
+                WHERE parent_id = ?1 AND trashed_at IS NULL
+                UNION ALL
+                SELECT child.id, folders.depth + 1,
+                       folders.seen || child.id || '|'
+                FROM drive_directories child
+                JOIN folders ON child.parent_id = folders.id
+                WHERE child.trashed_at IS NULL
+                  AND folders.depth < 64
+                  AND instr(folders.seen, '|' || child.id || '|') = 0
+            )
+            SELECT id FROM folders ORDER BY depth DESC, id",
+        )
+        .map_err(|error: sqlite::Error| error.to_string())?;
+    statement
+        .bind((1, root_id.as_str()))
+        .map_err(|error| error.to_string())?;
+    let mut ids = Vec::new();
+    while let sqlite::State::Row = statement.next().map_err(|error| error.to_string())? {
+        if ids.len() >= 10_000 {
+            return Err("Channel folder cleanup exceeded the 10,000-directory safety limit".into());
+        }
+        ids.push(
+            statement
+                .read::<String, _>("id")
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    drop(statement);
+
+    conn.execute("SAVEPOINT prune_empty_channel_folders")
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        let mut removed = 0;
+        for id in ids {
+            match trash_drive_directory(conn, &id) {
+                Ok(()) => removed += 1,
+                Err(error) if error == "Folder is not empty" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(removed)
+    })();
+    crate::drive_posix::finish_savepoint(conn, "prune_empty_channel_folders", result)
+}
+
+/// Explicit channel-folder deletion is intentionally limited to an empty
+/// imported subtree. The UI deletes Telegram files individually first; this
+/// command then trashes the remaining empty directory tree atomically.
+pub fn trash_empty_imported_channel_folder_tree(
+    conn: &sqlite::Connection,
+    logical_channel_id: &str,
+    directory_id: &str,
+) -> Result<usize, String> {
+    init_drive_schema(conn)?;
+    let channel_root = imported_directory_id(logical_channel_id);
+
+    let mut ancestor = conn
+        .prepare(
+            "WITH RECURSIVE ancestors(id, parent_id, depth, seen) AS (
+                SELECT id, parent_id, 0, '|' || id || '|'
+                FROM drive_directories
+                WHERE id = ?1 AND trashed_at IS NULL
+                UNION ALL
+                SELECT parent.id, parent.parent_id, ancestors.depth + 1,
+                       ancestors.seen || parent.id || '|'
+                FROM drive_directories parent
+                JOIN ancestors ON parent.id = ancestors.parent_id
+                WHERE parent.trashed_at IS NULL
+                  AND ancestors.depth < 64
+                  AND instr(ancestors.seen, '|' || parent.id || '|') = 0
+            )
+            SELECT 1 FROM ancestors WHERE id = ?2 LIMIT 1",
+        )
+        .map_err(|error: sqlite::Error| error.to_string())?;
+    ancestor
+        .bind((1, directory_id))
+        .map_err(|error| error.to_string())?;
+    ancestor
+        .bind((2, channel_root.as_str()))
+        .map_err(|error| error.to_string())?;
+    let belongs_to_channel =
+        ancestor.next().map_err(|error| error.to_string())? == sqlite::State::Row;
+    drop(ancestor);
+    if !belongs_to_channel {
+        // File deletion may already have pruned this exact folder. Treat that
+        // stale selection as complete, but never mutate an active foreign path.
+        let mut existing = conn
+            .prepare("SELECT trashed_at FROM drive_directories WHERE id = ? LIMIT 1")
+            .map_err(|error: sqlite::Error| error.to_string())?;
+        existing
+            .bind((1, directory_id))
+            .map_err(|error| error.to_string())?;
+        if existing.next().map_err(|error| error.to_string())? == sqlite::State::Row
+            && existing
+                .read::<Option<i64>, _>("trashed_at")
+                .map_err(|error| error.to_string())?
+                .is_some()
+        {
+            return Ok(0);
+        }
+        return Err(
+            "Selected folder is no longer inside this channel's imported Drive tree".into(),
+        );
+    }
+
+    let mut statement = conn
+        .prepare(
+            "WITH RECURSIVE folders(id, depth, seen) AS (
+                SELECT id, 0, '|' || id || '|'
+                FROM drive_directories
+                WHERE id = ?1 AND trashed_at IS NULL
+                UNION ALL
+                SELECT child.id, folders.depth + 1,
+                       folders.seen || child.id || '|'
+                FROM drive_directories child
+                JOIN folders ON child.parent_id = folders.id
+                WHERE child.trashed_at IS NULL
+                  AND folders.depth < 64
+                  AND instr(folders.seen, '|' || child.id || '|') = 0
+            )
+            SELECT id FROM folders ORDER BY depth DESC, id",
+        )
+        .map_err(|error: sqlite::Error| error.to_string())?;
+    statement
+        .bind((1, directory_id))
+        .map_err(|error| error.to_string())?;
+    let mut ids = Vec::new();
+    while let sqlite::State::Row = statement.next().map_err(|error| error.to_string())? {
+        if ids.len() >= 512 {
+            return Err("Selected folder exceeds the 512-directory deletion safety limit".into());
+        }
+        ids.push(
+            statement
+                .read::<String, _>("id")
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    drop(statement);
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    conn.execute("SAVEPOINT channel_folder_tree_delete")
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        for id in &ids {
+            trash_drive_directory(conn, id)?;
+        }
+        Ok(ids.len())
+    })();
+    crate::drive_posix::finish_savepoint(conn, "channel_folder_tree_delete", result)
+}
+
+#[tauri::command]
+pub fn cmd_drive_delete_empty_channel_folder_tree(
+    folder_id: i64,
+    directory_id: String,
+    db_pool: State<'_, DbConnection>,
+) -> Result<usize, String> {
+    let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
+    crate::commands::logical_channels::ensure_channel_can_upload(&conn, Some(folder_id))?;
+    let logical_id =
+        crate::commands::logical_channels::logical_channel_id_for_backing(&conn, folder_id)?
+            .ok_or_else(|| "Selected TeraRelay channel is unavailable".to_string())?;
+    trash_empty_imported_channel_folder_tree(&conn, &logical_id, &directory_id)
+}
+
 // Legacy and V2 Drive entries use the same logical ID namespace. A fresh
 // upload must not shadow an existing entry in the other table, including Trash.
 fn ensure_fresh_drive_entry_id_available(
@@ -5927,6 +6834,7 @@ fn validate_v2_inode_groups(entries: &[DriveEntryV2Record]) -> Result<(), String
 }
 
 fn validate_manifest(manifest: &DriveManifestV1) -> Result<(), String> {
+    crate::commands::shared_channels::validate_records(&manifest.shared_channels)?;
     if manifest.revision < 0 {
         return Err("Drive metadata revision must not be negative".to_string());
     }
@@ -6269,6 +7177,7 @@ fn build_manifest(conn: &sqlite::Connection) -> Result<DriveManifestV1, String> 
         directories: load_manifest_directories(conn)?,
         entries: load_manifest_entries(conn)?,
         storage_channels: load_manifest_storage_channels(conn)?,
+        shared_channels: crate::commands::shared_channels::records(conn)?,
         objects: load_manifest_objects(conn)?,
         parts: load_manifest_parts(conn)?,
         v2_entries: load_manifest_v2_entries(conn)?,
@@ -6469,6 +7378,28 @@ fn merge_drive_manifests(
         }
     }
 
+    let mut shared_channels: BTreeMap<i64, crate::commands::shared_channels::SharedChannelRecord> =
+        BTreeMap::new();
+    for channel in left
+        .shared_channels
+        .iter()
+        .cloned()
+        .chain(right.shared_channels.iter().cloned())
+    {
+        let id = channel.channel_id;
+        match shared_channels.remove(&id) {
+            Some(current) => {
+                shared_channels.insert(
+                    id,
+                    crate::commands::shared_channels::choose_newer(current, channel)?,
+                );
+            }
+            None => {
+                shared_channels.insert(id, channel);
+            }
+        }
+    }
+
     let mut objects: BTreeMap<String, DriveObjectRecord> = BTreeMap::new();
     for object in left
         .objects
@@ -6602,6 +7533,7 @@ fn merge_drive_manifests(
         directories: directories.into_values().collect(),
         entries: entries.into_values().collect(),
         storage_channels: storage_channels.into_values().collect(),
+        shared_channels: shared_channels.into_values().collect(),
         objects: objects.into_values().collect(),
         parts: parts.into_values().collect(),
         v2_entries: v2_entries.into_values().collect(),
@@ -6714,6 +7646,11 @@ fn apply_manifest_with_cursor(
              DELETE FROM drive_directories;",
         )
         .map_err(|e: sqlite::Error| e.to_string())?;
+
+        // Restore shared-channel identity before importing Drive directory links.
+        // This update is part of the same remote-manifest transaction and never
+        // deletes logical file rows or their Telegram storage.
+        crate::commands::shared_channels::apply_records(conn, &manifest.shared_channels)?;
 
         for directory in &manifest.directories {
             let mut stmt = conn
@@ -7029,29 +7966,58 @@ async fn download_remote_manifest(
     Ok(manifest)
 }
 
+fn remote_drive_scan_end(first_valid_position: usize) -> usize {
+    const RECENT_WINDOW: usize = 200;
+    if first_valid_position > RECENT_WINDOW {
+        first_valid_position.saturating_add(RECENT_WINDOW)
+    } else {
+        RECENT_WINDOW
+    }
+}
+
 async fn find_remote_manifests(
     client: &Client,
     peer: &Peer,
 ) -> Result<Vec<(i32, DriveManifestV1)>, String> {
+    // The metadata index can be older than 200 Saved Messages on a fresh
+    // laptop. Keep the previous 200-message fast path, but search deeper if it
+    // finds no valid index. A bounded failure is safer than publishing an
+    // empty replacement Drive over an existing, undiscovered cloud index.
+    const RECENT_WINDOW: usize = 200;
+    const MAX_RECOVERY_HISTORY: usize = 100_000;
     let mut found = Vec::new();
-    let mut messages = client.iter_messages(peer).limit(200);
+    let mut messages = client.iter_messages(peer).limit(MAX_RECOVERY_HISTORY + 1);
+    let mut scanned = 0usize;
+    let mut oldest_needed = RECENT_WINDOW;
     while let Some(message) = messages.next().await.map_err(|e| e.to_string())? {
-        let Some(media) = message.media() else {
-            continue;
-        };
-        let Media::Document(document) = &media else {
-            continue;
-        };
-        if !is_drive_manifest_document(document.name(), message.text()) {
-            continue;
+        scanned += 1;
+        if scanned > MAX_RECOVERY_HISTORY {
+            return Err(format!(
+                "Drive cloud index was not safely located in the newest {MAX_RECOVERY_HISTORY} Saved Messages. Local Drive data is unchanged; recovery requires a deeper history search."
+            ));
         }
-        match download_remote_manifest(client, &media).await {
-            Ok(manifest) => found.push((message.id(), manifest)),
-            Err(error) => log::warn!(
-                "Ignoring invalid TeraRelay Drive metadata message {}: {}",
-                message.id(),
-                error
-            ),
+        if let Some(Media::Document(document)) = message.media() {
+            if is_drive_manifest_document(document.name(), message.text()) {
+                let media = Media::Document(document);
+                match download_remote_manifest(client, &media).await {
+                    Ok(manifest) => {
+                        if found.is_empty() && scanned > RECENT_WINDOW {
+                            // Collect nearby competing indices as the existing
+                            // merge protocol expects, not just the first hit.
+                            oldest_needed = remote_drive_scan_end(scanned);
+                        }
+                        found.push((message.id(), manifest));
+                    }
+                    Err(error) => log::warn!(
+                        "Ignoring invalid TeraRelay Drive metadata message {}: {}",
+                        message.id(),
+                        error
+                    ),
+                }
+            }
+        }
+        if scanned >= oldest_needed {
+            break;
         }
     }
     Ok(found)
@@ -7569,6 +8535,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_device_drive_index_search_extends_beyond_two_hundred_messages() {
+        assert_eq!(remote_drive_scan_end(1), 200);
+        assert_eq!(remote_drive_scan_end(200), 200);
+        assert_eq!(remote_drive_scan_end(201), 401);
+        assert_eq!(remote_drive_scan_end(3_000), 3_200);
+        assert_eq!(remote_drive_scan_end(usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn failed_remote_cursor_write_rolls_back_imported_namespace_atomically() {
         let conn = memory_db();
         let original = build_manifest(&conn).unwrap();
@@ -7764,6 +8739,390 @@ mod tests {
         .unwrap();
         init_drive_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn channel_feed_paths_reflect_uploaded_folder_hierarchy_and_exclude_other_channels() {
+        let db = memory_db();
+        let channel_id = "a".repeat(32);
+        let other_channel_id = "b".repeat(32);
+        for (logical_id, backing_id, name) in [
+            (channel_id.as_str(), 123, "Movies"),
+            (other_channel_id.as_str(), 456, "Other"),
+        ] {
+            let mut insert = db.prepare(
+                "INSERT INTO logical_channels
+                 (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+                 VALUES (?, ?, ?, 'owner', 1, 1, 1)",
+            ).unwrap();
+            insert.bind((1, logical_id)).unwrap();
+            insert.bind((2, backing_id)).unwrap();
+            insert.bind((3, name)).unwrap();
+            insert.next().unwrap();
+        }
+
+        for (file_id, logical_id, name) in [
+            ("episode-one", channel_id.as_str(), "Episode 01.mp4"),
+            ("episode-two", channel_id.as_str(), "Episode 02.mp4"),
+            ("loose-file", channel_id.as_str(), "Outside.mp4"),
+            ("other-file", other_channel_id.as_str(), "Other.mp4"),
+        ] {
+            let mut insert = db
+                .prepare(
+                    "INSERT INTO logical_files
+                 (file_id, logical_channel_id, first_message_id, display_name, total_size,
+                  mime_type, chunk_count, whole_sha256, storage_version, created_at, status)
+                 VALUES (?, ?, 1, ?, 100, 'video/mp4', 1, NULL, 1, 1, 'complete')",
+                )
+                .unwrap();
+            insert.bind((1, file_id)).unwrap();
+            insert.bind((2, logical_id)).unwrap();
+            insert.bind((3, name)).unwrap();
+            insert.next().unwrap();
+        }
+
+        ensure_imported_layout(&db).unwrap();
+        let root_id = imported_directory_id(&channel_id);
+        let season = create_drive_directory(&db, Some(&root_id), "Season 01").unwrap();
+        let extras = create_drive_directory(&db, Some(&season.id), "Extras").unwrap();
+        rename_drive_file(
+            &db,
+            "import-episode-one",
+            Some(&season.id),
+            "Episode 01.mp4",
+        )
+        .unwrap();
+        rename_drive_file(
+            &db,
+            "import-episode-two",
+            Some(&extras.id),
+            "Episode 02.mp4",
+        )
+        .unwrap();
+
+        let paths = drive_channel_file_paths(&db, &channel_id).unwrap();
+        assert_eq!(
+            paths.directories,
+            vec!["Season 01".to_string(), "Season 01/Extras".to_string()]
+        );
+        assert_eq!(
+            paths.file_paths.get("episode-one").map(String::as_str),
+            Some("Season 01")
+        );
+        assert_eq!(
+            paths.file_paths.get("episode-two").map(String::as_str),
+            Some("Season 01/Extras")
+        );
+        assert_eq!(
+            paths.directory_ids.get("Season 01").map(String::as_str),
+            Some(season.id.as_str())
+        );
+        assert_eq!(
+            paths
+                .directory_ids
+                .get("Season 01/Extras")
+                .map(String::as_str),
+            Some(extras.id.as_str())
+        );
+        assert_eq!(
+            paths.directory_created_at.get("Season 01"),
+            Some(&season.created_at)
+        );
+        assert_eq!(
+            paths.directory_created_at.get("Season 01/Extras"),
+            Some(&extras.created_at)
+        );
+        assert!(!paths.file_paths.contains_key("loose-file"));
+        assert!(!paths.file_paths.contains_key("other-file"));
+    }
+
+    #[test]
+    fn deleting_last_logical_file_prunes_empty_nested_channel_folders_only() {
+        let db = memory_db();
+        let channel_id = "c".repeat(32);
+        db.execute(format!(
+            "INSERT INTO logical_channels
+             (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+             VALUES ('{channel_id}', 789, 'Cleanup QA', 'owner', 1, 1, 1);
+             CREATE TABLE logical_file_chunks (file_id TEXT NOT NULL);"
+        ))
+        .unwrap();
+        for (file_id, message_id, name) in [
+            ("nested-file", 101, "Episode 01.mp4"),
+            ("root-file", 102, "Episode 02.mp4"),
+        ] {
+            let mut file = db
+                .prepare(
+                    "INSERT INTO logical_files
+                 (file_id, logical_channel_id, first_message_id, display_name, total_size,
+                  mime_type, chunk_count, whole_sha256, storage_version, created_at, status)
+                 VALUES (?, ?, ?, ?, 100, 'video/mp4', 1, NULL, 1, 1, 'complete')",
+                )
+                .unwrap();
+            file.bind((1, file_id)).unwrap();
+            file.bind((2, channel_id.as_str())).unwrap();
+            file.bind((3, message_id)).unwrap();
+            file.bind((4, name)).unwrap();
+            file.next().unwrap();
+        }
+        ensure_imported_layout(&db).unwrap();
+        let channel_root = imported_directory_id(&channel_id);
+        let season = create_drive_directory(&db, Some(&channel_root), "Season 01").unwrap();
+        let extras = create_drive_directory(&db, Some(&season.id), "Extras").unwrap();
+        rename_drive_file(
+            &db,
+            "import-nested-file",
+            Some(&extras.id),
+            "Episode 01.mp4",
+        )
+        .unwrap();
+        rename_drive_file(&db, "import-root-file", Some(&season.id), "Episode 02.mp4").unwrap();
+
+        crate::commands::logical_files::delete_cached_file(&db, "nested-file").unwrap();
+        let after_nested_delete = drive_channel_file_paths(&db, &channel_id).unwrap();
+        assert_eq!(
+            after_nested_delete.directories,
+            vec!["Season 01".to_string()],
+            "the now-empty nested folder should disappear while its non-empty parent remains"
+        );
+        assert_eq!(
+            after_nested_delete
+                .file_paths
+                .get("root-file")
+                .map(String::as_str),
+            Some("Season 01")
+        );
+
+        crate::commands::logical_files::delete_cached_file(&db, "root-file").unwrap();
+        let after_last_delete = drive_channel_file_paths(&db, &channel_id).unwrap();
+        assert!(
+            after_last_delete.directories.is_empty(),
+            "the last logical file deletion should prune its now-empty folder tree"
+        );
+        assert!(after_last_delete.file_paths.is_empty());
+    }
+
+    #[test]
+    fn empty_channel_folder_pruning_rolls_back_as_one_tree_if_metadata_revision_fails() {
+        let db = memory_db();
+        let channel_id = "f".repeat(32);
+        db.execute(format!(
+            "INSERT INTO logical_channels
+             (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+             VALUES ('{channel_id}', 792, 'Cleanup Rollback QA', 'owner', 1, 1, 1);"
+        ))
+        .unwrap();
+        ensure_imported_layout(&db).unwrap();
+        let root = imported_directory_id(&channel_id);
+        let season = create_drive_directory(&db, Some(&root), "Season 03").unwrap();
+        let extras = create_drive_directory(&db, Some(&season.id), "Extras").unwrap();
+        let before = state_row(&db).unwrap();
+
+        db.execute(format!(
+            "CREATE TRIGGER qa_fail_second_empty_folder_prune
+             BEFORE UPDATE OF revision ON drive_state
+             WHEN OLD.revision >= {}
+             BEGIN SELECT RAISE(ABORT, 'qa folder prune revision failure'); END;",
+            before.0 + 1
+        ))
+        .unwrap();
+
+        let error = prune_empty_imported_channel_directories(&db, &channel_id)
+            .expect_err("a failed metadata revision must roll back the whole folder-prune pass");
+        assert!(
+            error.contains("qa folder prune revision failure"),
+            "{error}"
+        );
+        assert_eq!(
+            state_row(&db).unwrap(),
+            before,
+            "a failed multi-folder cleanup must not keep the first directory's revision"
+        );
+        let still_active = load_directories(&db).unwrap();
+        assert!(still_active
+            .iter()
+            .any(|folder| folder.id == season.id && folder.trashed_at.is_none()));
+        assert!(still_active
+            .iter()
+            .any(|folder| folder.id == extras.id && folder.trashed_at.is_none()));
+        let paths = drive_channel_file_paths(&db, &channel_id).unwrap();
+        assert_eq!(
+            paths.directories,
+            vec!["Season 03".to_string(), "Season 03/Extras".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_channel_folder_delete_prunes_only_the_selected_channel_subtree() {
+        let db = memory_db();
+        let channel_id = "d".repeat(32);
+        let other_channel_id = "e".repeat(32);
+        for (logical_id, backing_id, name) in [
+            (channel_id.as_str(), 790, "Cleanup QA"),
+            (other_channel_id.as_str(), 791, "Other QA"),
+        ] {
+            let mut channel = db.prepare(
+                "INSERT INTO logical_channels
+                 (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+                 VALUES (?, ?, ?, 'owner', 1, 1, 1)",
+            ).unwrap();
+            channel.bind((1, logical_id)).unwrap();
+            channel.bind((2, backing_id)).unwrap();
+            channel.bind((3, name)).unwrap();
+            channel.next().unwrap();
+        }
+        ensure_imported_layout(&db).unwrap();
+        let root = imported_directory_id(&channel_id);
+        let other_root = imported_directory_id(&other_channel_id);
+        let season = create_drive_directory(&db, Some(&root), "Season 02").unwrap();
+        let extras = create_drive_directory(&db, Some(&season.id), "Extras").unwrap();
+        let other_season = create_drive_directory(&db, Some(&other_root), "Season 02").unwrap();
+
+        let removed =
+            trash_empty_imported_channel_folder_tree(&db, &channel_id, &season.id).unwrap();
+        assert_eq!(removed, 2);
+        let after = drive_channel_file_paths(&db, &channel_id).unwrap();
+        assert!(after.directories.is_empty());
+        let other = drive_channel_file_paths(&db, &other_channel_id).unwrap();
+        assert_eq!(other.directories, vec!["Season 02".to_string()]);
+        assert_eq!(
+            other.directory_ids.get("Season 02").map(String::as_str),
+            Some(other_season.id.as_str())
+        );
+        // A second request against the already-trashed folder is harmless.
+        assert_eq!(
+            trash_empty_imported_channel_folder_tree(&db, &channel_id, &season.id).unwrap(),
+            0
+        );
+        let _ = extras;
+    }
+
+    #[test]
+    fn shared_file_move_updates_imported_drive_folder_but_preserves_custom_organization() {
+        let db = memory_db();
+        let source = "a".repeat(32);
+        let target = "b".repeat(32);
+        for (logical_id, channel_id, name) in [
+            (source.as_str(), 123, "Original"),
+            (target.as_str(), -432, "Shared"),
+        ] {
+            let mut stmt = db.prepare(
+                "INSERT INTO logical_channels
+                 (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+                 VALUES (?,?,?, 'owner', 1,1,1)"
+            ).unwrap();
+            stmt.bind((1, logical_id)).unwrap();
+            stmt.bind((2, channel_id)).unwrap();
+            stmt.bind((3, name)).unwrap();
+            stmt.next().unwrap();
+        }
+        db.execute(format!(
+            "INSERT INTO logical_files
+             (file_id,logical_channel_id,first_message_id,display_name,total_size,mime_type,
+              chunk_count,whole_sha256,storage_version,created_at,status)
+             VALUES('file-a','{}',10,'Movie.mkv',100,NULL,1,NULL,1,1,'complete')",
+            source
+        ))
+        .unwrap();
+        ensure_imported_layout(&db).unwrap();
+        let mut stmt = db
+            .prepare("SELECT directory_id FROM drive_file_entries WHERE entry_id='import-file-a'")
+            .unwrap();
+        assert_eq!(stmt.next().unwrap(), sqlite::State::Row);
+        assert_eq!(
+            stmt.read::<String, _>(0).unwrap(),
+            format!("channel-{source}")
+        );
+        drop(stmt);
+
+        let mut update = db
+            .prepare("UPDATE logical_files SET logical_channel_id=? WHERE file_id='file-a'")
+            .unwrap();
+        update.bind((1, target.as_str())).unwrap();
+        update.next().unwrap();
+        drop(update);
+        let changed = reflect_shared_channel_move_in_drive(&db, "file-a", &source, &target)
+            .unwrap()
+            .expect("The imported Drive file must move to the new channel");
+        assert_eq!(changed.0, format!("channel-{source}"));
+        assert_eq!(changed.2, format!("channel-{target}"));
+
+        // User relocated this file into a custom folder. Later logical moves
+        // must not overwrite the user's chosen Drive organization.
+        db.execute(
+            "INSERT INTO drive_directories
+             (id,parent_id,name,backing_logical_channel_id,created_at,updated_at,trashed_at)
+             VALUES('custom',NULL,'My Files',NULL,2,2,NULL);
+             UPDATE drive_file_entries SET directory_id='custom' WHERE entry_id='import-file-a';",
+        )
+        .unwrap();
+        let unchanged =
+            reflect_shared_channel_move_in_drive(&db, "file-a", &target, &source).unwrap();
+        assert!(unchanged.is_none());
+        let mut stmt = db
+            .prepare("SELECT directory_id FROM drive_file_entries WHERE entry_id='import-file-a'")
+            .unwrap();
+        assert_eq!(stmt.next().unwrap(), sqlite::State::Row);
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "custom");
+    }
+
+    #[test]
+    fn shared_channel_registry_restores_across_devices_and_keeps_tombstones() {
+        use crate::commands::shared_channels::{apply_record, record, SharedChannelRecord};
+        fn with_folder_table() -> sqlite::Connection {
+            let db = memory_db();
+            db.execute(
+                "CREATE TABLE folder_metadata (
+                    channel_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                    username TEXT, is_public INTEGER DEFAULT 0,
+                    display_order INTEGER DEFAULT 0, group_id INTEGER
+                );",
+            )
+            .unwrap();
+            db
+        }
+        let home = with_folder_table();
+        let other = with_folder_table();
+        let base = SharedChannelRecord {
+            channel_id: -432,
+            logical_id: "ab".repeat(16),
+            storage_channel_id: 123,
+            name: "Action Movies".into(),
+            created_at: 100,
+            updated_at: 100,
+            deleted_at: None,
+        };
+        apply_record(&home, &base).unwrap();
+        mark_drive_dirty(&home).unwrap();
+        let initial = build_manifest(&home).unwrap();
+        assert_eq!(initial.shared_channels, vec![base.clone()]);
+        apply_manifest(&other, &initial).unwrap();
+        assert_eq!(record(&other, -432).unwrap(), Some(base.clone()));
+        assert_eq!(
+            crate::commands::shared_channels::physical_id(&other, Some(-432)).unwrap(),
+            Some(123),
+        );
+
+        let mut updated = base.clone();
+        updated.name = "Family Movies".into();
+        updated.updated_at += 1;
+        apply_record(&home, &updated).unwrap();
+        let next = build_manifest(&home).unwrap();
+        let merged = merge_drive_manifests(&initial, &next).unwrap();
+        apply_manifest(&other, &merged).unwrap();
+        assert_eq!(record(&other, -432).unwrap().unwrap().name, "Family Movies");
+
+        let mut deleted = updated.clone();
+        deleted.updated_at += 1;
+        deleted.deleted_at = Some(deleted.updated_at);
+        apply_record(&home, &deleted).unwrap();
+        let removed = merge_drive_manifests(&merged, &build_manifest(&home).unwrap()).unwrap();
+        apply_manifest(&other, &removed).unwrap();
+        assert!(record(&other, -432).unwrap().unwrap().deleted_at.is_some());
+        assert!(crate::commands::shared_channels::physical_id(&other, Some(-432)).is_err());
+        // A second restore with an older metadata snapshot cannot resurrect it.
+        apply_manifest(&other, &initial).unwrap();
+        assert!(record(&other, -432).unwrap().unwrap().deleted_at.is_some());
     }
 
     #[test]
@@ -14888,6 +16247,54 @@ mod tests {
     }
 
     #[test]
+    fn imported_layout_keeps_portable_versions_of_telegram_names_and_repairs_old_fallbacks() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO logical_channels
+             (logical_id, backing_channel_id, name, role, storage_version, created_at, joined_at)
+             VALUES ('portable-channel', 402, 'Files', 'owner', 1, 1, 1);
+             INSERT INTO logical_files
+             (file_id, logical_channel_id, first_message_id, display_name, total_size,
+              mime_type, chunk_count, whole_sha256, storage_version, created_at, status)
+             VALUES ('one111', 'portable-channel', 81, 'Movie: Episode 1.mkv', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('4e6c80abcdef', 'portable-channel', 82, 'Season/Track?.mp3', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('custom', 'portable-channel', 83, 'CON.mp4', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('new', 'portable-channel', 84, 'AUX.mp4', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('moved', 'portable-channel', 85, 'Other:File.mp4', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('literal', 'portable-channel', 86, 'file', 5, NULL, 1, NULL, 1, 2, 'complete'),
+                    ('valid1234567890abcdef', 'portable-channel', 87, 'Episode 2.mp4', 5, NULL, 1, NULL, 1, 2, 'complete');
+             INSERT INTO drive_directories
+             (id,parent_id,name,backing_logical_channel_id,created_at,updated_at,trashed_at)
+             VALUES ('channel-portable-channel',NULL,'Files','portable-channel',1,1,NULL),
+                    ('other',NULL,'Other',NULL,1,1,NULL);
+             INSERT INTO drive_file_entries
+             (entry_id,file_id,directory_id,display_name,created_at,updated_at,trashed_at)
+             VALUES ('import-one111','one111','channel-portable-channel','file',2,3,NULL),
+                    ('import-4e6c80abcdef','4e6c80abcdef','channel-portable-channel','file (4e6c80)',2,3,NULL),
+                    ('import-custom','custom','channel-portable-channel','My rename.mp4',2,4,NULL),
+                    ('import-moved','moved','other','file',2,4,NULL),
+                    ('import-literal','literal','channel-portable-channel','file (litera)',2,4,NULL),
+                    ('import-valid1234567890abcdef','valid1234567890abcdef','channel-portable-channel','file (valid1)',2,3,NULL);",
+        ).unwrap();
+
+        assert!(ensure_imported_layout(&conn).unwrap());
+        let files: std::collections::HashMap<_, _> = drive_snapshot(&conn)
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|file| (file.entry_id, file.display_name))
+            .collect();
+        assert_eq!(files["import-one111"], "Movie_ Episode 1.mkv");
+        assert_eq!(files["import-4e6c80abcdef"], "Season_Track_.mp3");
+        assert_eq!(files["import-custom"], "My rename.mp4");
+        assert_eq!(files["import-new"], "_AUX.mp4");
+        assert_eq!(files["import-moved"], "file");
+        assert_eq!(files["import-literal"], "file (litera)");
+        assert_eq!(files["import-valid1234567890abcdef"], "Episode 2.mp4");
+        assert!(!ensure_imported_layout(&conn).unwrap());
+    }
+
+    #[test]
     fn imported_collision_suffix_never_breaks_utf8_or_name_length_limit() {
         let conn = memory_db();
         let requested = format!("{}🌠.txt", "a".repeat(247));
@@ -15964,6 +17371,7 @@ mod tests {
             directories: vec![],
             entries: vec![],
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],
@@ -16047,6 +17455,7 @@ mod tests {
             directories: vec![],
             entries: vec![],
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],
@@ -16960,6 +18369,7 @@ mod tests {
             ],
             entries: Vec::new(),
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],
@@ -17046,6 +18456,7 @@ mod tests {
             ],
             entries: Vec::new(),
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],
@@ -17080,6 +18491,7 @@ mod tests {
             directories,
             entries: Vec::new(),
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],
@@ -17148,6 +18560,7 @@ mod tests {
             }],
             entries: Vec::new(),
             storage_channels: vec![],
+            shared_channels: vec![],
             objects: vec![],
             parts: vec![],
             v2_entries: vec![],

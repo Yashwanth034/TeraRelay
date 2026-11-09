@@ -5,13 +5,14 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { QueueItem, TelegramFile, TransferEngine } from '../types';
-import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback } from '../utils';
-import { useSettings } from '../context/SettingsContext';
+import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback, formatBytes } from '../utils';
+
 import { useFastTransferAuth } from '../context/FastTransferAuthContext';
 import { useTransferMethod } from '../context/TransferMethodContext';
 import { useUploadSuggestion, type UploadPreflightResult } from '../context/UploadSuggestionContext';
 import type { Store } from '@tauri-apps/plugin-store';
 import { normalizeUploadQueue, useRecoverableTransferQueue } from '../transferQueue';
+import { nextSequentialTransfer } from '../sequentialTransferQueue';
 import { validateDriveSyncResult } from '../deviceContinuity';
 import { subscribeToVerifiedDriveSync } from '../driveSyncSignal';
 import {
@@ -79,7 +80,6 @@ export function useFileUpload(
     knownFiles: TelegramFile[] = [],
 ) {
     const queryClient = useQueryClient();
-    const { settings } = useSettings();
     // App.tsx sets this runtime flag only after Vite confirms an explicit
     // dev-only Feature A QA build. Undefined is always treated as production.
     const qaFeatureATest =
@@ -296,19 +296,14 @@ export function useFileUpload(
         };
     }, [initialized, setUploadQueue]);
 
-    // Only durable pending work can reserve the configured worker slots.
+    // One upload file at a time, in its original queue order. The reservation
+    // stays held until Telegram work, finalization and persistence all settle.
+    // Already saved "6 concurrent uploads" preferences cannot bypass this rule.
     useEffect(() => {
         if (!initialized || !durable) return;
-        const maxConcurrent = settings.maxConcurrentUploads || 1;
-        const available = maxConcurrent - activeIdsRef.current.size;
-        if (available <= 0) return;
-        const pendingItems = uploadQueue
-            .filter(i => i.status === 'pending' && !activeIdsRef.current.has(i.id))
-            .slice(0, available);
-        for (const item of pendingItems) {
-            void processItem(item);
-        }
-    }, [uploadQueue, settings.maxConcurrentUploads, initialized, durable]);
+        const next = nextSequentialTransfer(uploadQueue, activeIdsRef.current);
+        if (next) void processItem(next);
+    }, [uploadQueue, initialized, durable]);
 
     // Manage Android Foreground Service for persistent uploads
     useEffect(() => {
@@ -369,6 +364,7 @@ export function useFileUpload(
                 && workingItem.folderId !== null
                 && !isAndroidPlatform
                 && !isIOSPlatform
+                && !workingItem.driveFolderLogicalFileId
                 && (!workingItem.sourceSha256 || !workingItem.sourceIdentity)
             ) {
                 const preflight = await invoke<UploadPreflightResult>('cmd_preflight_upload_candidate', {
@@ -494,28 +490,54 @@ export function useFileUpload(
                     transferId: workingItem.id,
                 });
             } else {
-                const transferEngine = workingItem.transferEngine;
-                // New Boost transfers bypass TDLib entirely. Legacy queue items
-                // intentionally have no engine field: keep their historic
-                // readiness behavior and let Rust choose the old platform path.
-                if (transferEngine !== 'boost' && !qaFeatureATest) {
-                    const ready = await ensureFastTransferReady();
-                    if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
-                }
-                if (cancelledRef.current.has(workingItem.id) || pausedRef.current.has(workingItem.id)) {
-                    throw new Error('Transfer cancelled');
-                }
+                let uploadResult: UploadFileResult;
+                if (workingItem.driveFolderLogicalFileId) {
+                    // The Telegram upload already succeeded before a previous
+                    // folder-index move failed. Retry only that metadata step.
+                    uploadResult = {
+                        message: 'Telegram upload already completed',
+                        logical_file_id: workingItem.driveFolderLogicalFileId,
+                    };
+                    completed = true;
+                } else {
+                    const transferEngine = workingItem.transferEngine;
+                    // New Boost transfers bypass TDLib entirely. Legacy queue items
+                    // intentionally have no engine field: keep their historic
+                    // readiness behavior and let Rust choose the old platform path.
+                    if (transferEngine !== 'boost' && !qaFeatureATest) {
+                        const ready = await ensureFastTransferReady();
+                        if (!ready) throw new Error('TDLIB_SETUP_CANCELLED');
+                    }
+                    if (cancelledRef.current.has(workingItem.id) || pausedRef.current.has(workingItem.id)) {
+                        throw new Error('Transfer cancelled');
+                    }
 
-                const uploadResult = await invoke<UploadFileResult>('cmd_upload_file', {
-                    path: workingItem.path,
-                    folderId: workingItem.folderId,
-                    transferId: workingItem.id,
-                    transferEngine,
-                    sourceSha256: workingItem.sourceSha256,
-                    sourceIdentity: workingItem.sourceIdentity,
-                    uploadName: workingItem.uploadName,
-                });
-                completed = true;
+                    uploadResult = await invoke<UploadFileResult>('cmd_upload_file', {
+                        path: workingItem.path,
+                        folderId: workingItem.folderId,
+                        transferId: workingItem.id,
+                        transferEngine,
+                        sourceSha256: workingItem.sourceSha256,
+                        sourceIdentity: workingItem.sourceIdentity,
+                        uploadName: workingItem.uploadName,
+                        folderUploadRoot: workingItem.uploadGroupSourceRoot,
+                    });
+                    completed = true;
+
+                    if (workingItem.driveFolderDirectoryId && uploadResult.logical_file_id) {
+                        // Persist the stable logical file ID before changing its
+                        // Drive location. A retry then skips byte upload entirely.
+                        workingItem = {
+                            ...workingItem,
+                            driveFolderLogicalFileId: uploadResult.logical_file_id,
+                        };
+                        const durableUpload = queueRef.current.map(current =>
+                            current.id === workingItem.id ? workingItem : current
+                        );
+                        setUploadQueue(durableUpload);
+                        await persist(durableUpload);
+                    }
+                }
 
                 if (workingItem.remoteImportJobId && workingItem.remoteImportSelectionId) {
                     if (!uploadResult.logical_file_id) {
@@ -548,6 +570,44 @@ export function useFileUpload(
                     // metadata publication is retried by the background Drive
                     // sync loop if Telegram is temporarily unavailable.
                     requestDriveMetadataPublication();
+                }
+
+                if (workingItem.driveFolderDirectoryId) {
+                    if (!workingItem.driveFolderLogicalFileId || workingItem.folderId === null) {
+                        throw new Error('Upload completed, but the folder destination could not be verified');
+                    }
+                    await invoke('cmd_drive_move_uploaded_file_to_directory', {
+                        folderId: workingItem.folderId,
+                        logicalFileId: workingItem.driveFolderLogicalFileId,
+                        directoryId: workingItem.driveFolderDirectoryId,
+                    });
+                    if (workingItem.driveFolderLogicalFileId && workingItem.uploadGroupName) {
+                        const relativePath = workingItem.uploadGroupRelativePath || '';
+                        const separator = relativePath.lastIndexOf('/');
+                        const relativeDirectory = separator >= 0 ? relativePath.slice(0, separator) : '';
+                        const parts = [workingItem.uploadGroupName, ...relativeDirectory.split('/').filter(Boolean)];
+                        const fileDirectoryPath = parts.join('/');
+                        queryClient.setQueryData<{ directories: string[]; file_paths: Record<string, string> }>(
+                            ['drive-channel-file-paths', workingItem.folderId],
+                            current => {
+                                const paths = new Set(current?.directories ?? []);
+                                for (let index = 1; index <= parts.length; index++) {
+                                    paths.add(parts.slice(0, index).join('/'));
+                                }
+                                return {
+                                    directories: [...paths],
+                                    file_paths: {
+                                        ...(current?.file_paths ?? {}),
+                                        [workingItem.driveFolderLogicalFileId!]: fileDirectoryPath,
+                                    },
+                                };
+                            },
+                        );
+                    }
+                    void queryClient.invalidateQueries({
+                        queryKey: ['drive-channel-file-paths', workingItem.folderId],
+                    });
+                    if (!qaFeatureATest) requestDriveMetadataPublication();
                 }
 
                 // Version grouping is deliberately a post-upload metadata step.
@@ -597,9 +657,27 @@ export function useFileUpload(
                 // Keep the source until removing recoverable work has really committed.
                 await persist();
                 await cleanupTempZip(workingItem);
-                window.setTimeout(() => {
-                    setUploadQueue(q => q.filter(i => !(i.id === workingItem.id && i.status === 'success')));
-                }, 5000);
+                if (workingItem.uploadGroupId) {
+                    const groupId = workingItem.uploadGroupId;
+                    window.setTimeout(() => {
+                        const group = queueRef.current.filter(candidate => candidate.uploadGroupId === groupId);
+                        if (group.length > 0 && group.every(candidate => candidate.status === 'success')) {
+                            const next = queueRef.current.filter(candidate => candidate.uploadGroupId !== groupId);
+                            setUploadQueue(next);
+                            void persist(next).catch(error => {
+                                setUploadQueue(current => {
+                                    const missing = group.filter(item => !current.some(candidate => candidate.id === item.id));
+                                    return missing.length ? [...current, ...missing] : current;
+                                });
+                                toast.error(`Could not clear completed folder upload: ${error}`);
+                            });
+                        }
+                    }, 5000);
+                } else {
+                    window.setTimeout(() => {
+                        setUploadQueue(q => q.filter(i => !(i.id === workingItem.id && i.status === 'success')));
+                    }, 5000);
+                }
                 queryClient.invalidateQueries({ queryKey: ['files', workingItem.folderId] });
             }
         } catch (e) {
@@ -792,8 +870,12 @@ export function useFileUpload(
     };
 
     const performFolderUpload = async () => {
+        if (activeFolderId === null) {
+            toast.error('Open a TeraRelay channel before uploading a folder so its episodes can be placed in a real Drive folder.');
+            return;
+        }
         if (isIOSPlatform) {
-            toast.info('iOS does not provide a folder picker here. Select the folder files instead.');
+            toast.info('iOS does not provide a reliable folder picker here. Select individual files instead.');
             await performManualUpload();
             return;
         }
@@ -809,42 +891,141 @@ export function useFileUpload(
             {
                 errorTitle: 'Folder picker failed',
                 onBrowserPicker: async () => {
-                    const fallbackPaths = await showFileDialogFallback({ directory: true, multiple: true });
-                    if (fallbackPaths.length > 0) {
-                        // HTML folder picker returns individual file paths, not a folder path.
-                        // We can't zip without a folder path, so files upload individually.
-                        toast.info('Folder zipping unavailable with browser picker — uploading files individually.');
-                        await queueFiles(fallbackPaths);
-                    }
-                    return null; // Already handled via queueFiles — signal that the main flow should stop
+                    toast.info('The browser picker cannot provide a verified folder path here. Retry the native folder picker, or use Add files for a manual selection.');
+                    return null;
                 },
             },
         );
         if (!folderPath) return;
 
-        const transferEngine = await chooseTransferMethod('upload');
-        if (!transferEngine) return;
-
-        const folderName = folderPath.split('/').pop() || folderPath.split('\\').pop() || 'folder';
-
-        toast.info(`Zipping "${folderName}"...`);
         try {
-            const zipPath = await invoke<string>('cmd_zip_folder', { folderPath });
-            const item: QueueItem = {
-                id: Math.random().toString(36).substr(2, 9),
-                path: zipPath,
-                folderId: activeFolderId,
-                transferEngine,
-                status: 'pending',
-                tempZipPath: zipPath,
-            };
-            setUploadQueue(prev => [...prev, item]);
-            toast.success(`Queued "${folderName}.zip" for upload`);
-        } catch (e) {
-            console.error('[Upload] Zip error:', e);
-            toast.error(`Failed to zip folder: ${e}`);
+            const folder = await invoke<{
+                folder_name: string;
+                source_root: string;
+                files: Array<{ path: string; relative_path: string; name: string; size: number }>;
+                directories: string[];
+                total_size: number;
+            }>('cmd_list_folder_upload_files', { folderPath });
+
+            if (folder.files.length === 0) {
+                const created = await invoke<Array<{ relative_path: string; directory_id: string }>>(
+                    'cmd_drive_prepare_folder_upload',
+                    {
+                        folderId: activeFolderId,
+                        folderName: folder.folder_name,
+                        relativeDirectories: folder.directories,
+                        relativeFiles: folder.files.map(file => file.relative_path),
+                    },
+                );
+                queryClient.setQueryData<{ directories: string[]; file_paths: Record<string, string> }>(
+                    ['drive-channel-file-paths', activeFolderId],
+                    current => {
+                        const paths = new Set(current?.directories ?? []);
+                        paths.add(folder.folder_name);
+                        for (const directory of created) {
+                            const parts = [folder.folder_name, ...directory.relative_path.split('/').filter(Boolean)];
+                            for (let index = 1; index <= parts.length; index++) {
+                                paths.add(parts.slice(0, index).join('/'));
+                            }
+                        }
+                        return { directories: [...paths], file_paths: current?.file_paths ?? {} };
+                    },
+                );
+                void queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', activeFolderId] });
+                if (!qaFeatureATest) requestDriveMetadataPublication();
+                toast.success(`Created empty Drive folder "${folder.folder_name}" (${Math.max(0, created.length - 1)} subfolders)`);
+                return;
+            }
+            if (folder.files.length > 10_000 || !Number.isSafeInteger(folder.total_size) || folder.total_size < 0) {
+                throw new Error('Folder upload inventory exceeded safe limits');
+            }
+
+            const transferEngine = await chooseTransferMethod('upload');
+            if (!transferEngine) return;
+
+            const directories = await invoke<Array<{ relative_path: string; directory_id: string }>>(
+                'cmd_drive_prepare_folder_upload',
+                {
+                    folderId: activeFolderId,
+                    folderName: folder.folder_name,
+                    relativeDirectories: folder.directories,
+                    relativeFiles: folder.files.map(file => file.relative_path),
+                },
+            );
+            queryClient.setQueryData<{ directories: string[]; file_paths: Record<string, string> }>(
+                ['drive-channel-file-paths', activeFolderId],
+                current => {
+                    const paths = new Set(current?.directories ?? []);
+                    paths.add(folder.folder_name);
+                    for (const directory of directories) {
+                        const parts = [folder.folder_name, ...directory.relative_path.split('/').filter(Boolean)];
+                        for (let index = 1; index <= parts.length; index++) {
+                            paths.add(parts.slice(0, index).join('/'));
+                        }
+                    }
+                    return { directories: [...paths], file_paths: current?.file_paths ?? {} };
+                },
+            );
+            void queryClient.invalidateQueries({ queryKey: ['drive-channel-file-paths', activeFolderId] });
+            const directoryByPath = new Map(directories.map(directory => [
+                directory.relative_path,
+                directory.directory_id,
+            ] as const));
+            if (!directoryByPath.has('')) throw new Error('TeraRelay Drive did not return the collection folder identity');
+            if (!qaFeatureATest) requestDriveMetadataPublication();
+
+            const groupId = crypto.randomUUID();
+            const newItems: QueueItem[] = folder.files.map(file => {
+                const separator = file.relative_path.lastIndexOf('/');
+                const parentPath = separator < 0 ? '' : file.relative_path.slice(0, separator);
+                const directoryId = directoryByPath.get(parentPath);
+                if (!directoryId) {
+                    throw new Error(`TeraRelay Drive did not create the folder for "${file.relative_path}"`);
+                }
+                return {
+                    id: crypto.randomUUID(),
+                    path: file.path,
+                    uploadName: file.name,
+                    folderId: activeFolderId,
+                    transferEngine,
+                    status: 'pending',
+                    uploadGroupId: groupId,
+                    uploadGroupName: folder.folder_name,
+                    uploadGroupRelativePath: file.relative_path,
+                    uploadGroupFileCount: folder.files.length,
+                    uploadGroupTotalBytes: folder.total_size,
+                    uploadGroupSourceRoot: folder.source_root,
+                    driveFolderDirectoryId: directoryId,
+                    // Persist the known file size before the worker starts so
+                    // the collection can show truthful byte-weighted progress
+                    // immediately and after a queue recovery.
+                    totalBytes: file.size,
+                    uploadedBytes: 0,
+                    progress: 0,
+                };
+            });
+
+            const previous = queueRef.current;
+            const next = [...previous, ...newItems];
+            setUploadQueue(next);
+            try {
+                await persist(next);
+            } catch (error) {
+                setUploadQueue(previous);
+                await persist(previous).catch(() => {});
+                throw error;
+            }
+
+            toast.success(
+                `Queued "${folder.folder_name}" as ${newItems.length} individual files (${formatBytes(folder.total_size)}). Open its folder in TeraRelay Drive to browse and play episodes.`,
+            );
+        } catch (error) {
+            console.error('[Upload] Folder upload preparation failed:', error);
+            toast.error(`Could not prepare folder upload: ${String(error)}`);
         }
     };
+
+
 
     const handleFolderUpload = performFolderUpload;
 
@@ -892,8 +1073,9 @@ export function useFileUpload(
             }
         }
         setUploadQueue(q => q
-            .filter(i => i.status !== 'pending')
-            .map(i => (i.status === 'uploading' || i.status === 'downloading' || i.status === 'pausing' || i.status === 'paused')
+            .filter(i => i.status !== 'pending' || !!i.uploadGroupId)
+            .map(i => (i.status === 'uploading' || i.status === 'downloading' || i.status === 'pausing' || i.status === 'paused'
+                || (i.status === 'pending' && !!i.uploadGroupId))
                 ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 }
                 : i));
         void finishCancellation(items);
@@ -908,7 +1090,7 @@ export function useFileUpload(
             cancelledRef.current.add(id);
             invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
         }
-        setUploadQueue(q => item.status === 'pending'
+        setUploadQueue(q => item.status === 'pending' && !item.uploadGroupId
             ? q.filter(i => i.id !== id)
             : q.map(i => i.id === id ? { ...i, status: 'cancelled' as const, speedBytesPerSec: 0 } : i));
         void finishCancellation([item]);
@@ -932,6 +1114,69 @@ export function useFileUpload(
                 ? { ...i, status: 'pending' as const, error: undefined, speedBytesPerSec: 0 }
                 : i
         ));
+    };
+
+    const pauseGroup = (groupId: string) => {
+        const members = queueRef.current.filter(item => item.uploadGroupId === groupId);
+        const targets = members.filter(item =>
+            item.status === 'pending' || item.status === 'uploading' || item.status === 'downloading'
+        );
+        if (targets.length === 0) return;
+
+        // A folder may have one active file and many pending files. Stop the
+        // active transport, then park every pending sibling so the sequential
+        // queue cannot start the next episode while the collection is paused.
+        for (const item of targets) {
+            if (activeIdsRef.current.has(item.id)) {
+                pausedRef.current.add(item.id);
+                void invoke('cmd_cancel_transfer', { transferId: item.id }).catch(() => {});
+            }
+        }
+        const targetIds = new Set(targets.map(item => item.id));
+        setUploadQueue(q => q.map(item => {
+            if (!targetIds.has(item.id)) return item;
+            return {
+                ...item,
+                status: item.status === 'uploading' || item.status === 'downloading'
+                    ? 'pausing' as const
+                    : 'paused' as const,
+                speedBytesPerSec: 0,
+            };
+        }));
+    };
+
+    const resumeGroup = (groupId: string) => {
+        const pausedIds = new Set(queueRef.current
+            .filter(item => item.uploadGroupId === groupId && item.status === 'paused')
+            .map(item => item.id));
+        if (pausedIds.size === 0) return;
+        setUploadQueue(q => q.map(item => pausedIds.has(item.id)
+            ? { ...item, status: 'pending' as const, error: undefined, speedBytesPerSec: 0 }
+            : item
+        ));
+    };
+
+    const cancelGroup = (groupId: string) => {
+        const targets = queueRef.current.filter(item =>
+            item.uploadGroupId === groupId &&
+            ['pending', 'pausing', 'paused', 'uploading', 'downloading'].includes(item.status)
+        );
+        if (targets.length === 0) return;
+
+        for (const item of targets) {
+            pausedRef.current.delete(item.id);
+            if (activeIdsRef.current.has(item.id)) {
+                cancelledRef.current.add(item.id);
+                void invoke('cmd_cancel_transfer', { transferId: item.id }).catch(() => {});
+            }
+        }
+        const targetIds = new Set(targets.map(item => item.id));
+        setUploadQueue(q => q.map(item => targetIds.has(item.id)
+            ? { ...item, status: 'cancelled' as const, speedBytesPerSec: 0 }
+            : item
+        ));
+        void finishCancellation(targets);
+        toast.info(`Cancelled ${targets.length} files in the folder upload`);
     };
 
     const retryItem = (id: string) => {
@@ -962,6 +1207,22 @@ export function useFileUpload(
                 setUploadQueue(current => current.some(i => i.id === id) ? current : [...current, item]);
                 toast.error(`Could not dismiss upload: ${error}`);
             });
+    };
+
+    const dismissGroup = (groupId: string) => {
+        const group = queueRef.current.filter(item => item.uploadGroupId === groupId);
+        if (group.length === 0 || group.some(item =>
+            item.status !== 'success' && item.status !== 'error' && item.status !== 'cancelled'
+        )) return;
+        const next = queueRef.current.filter(item => item.uploadGroupId !== groupId);
+        setUploadQueue(next);
+        void persist(next).catch(error => {
+            setUploadQueue(current => {
+                const missing = group.filter(item => !current.some(candidate => candidate.id === item.id));
+                return missing.length ? [...current, ...missing] : current;
+            });
+            toast.error(`Could not dismiss folder upload: ${error}`);
+        });
     };
 
     const handleUrlUpload = (url: string, folderId: number | null) => {
@@ -999,7 +1260,11 @@ export function useFileUpload(
         cancelItem,
         pauseItem,
         resumeItem,
+        pauseGroup,
+        resumeGroup,
+        cancelGroup,
         retryItem,
         dismissItem,
+        dismissGroup,
     };
 }

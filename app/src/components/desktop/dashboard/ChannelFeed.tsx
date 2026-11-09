@@ -15,9 +15,20 @@ import { PremiumFileThumbnail } from '../../shared/PremiumFileThumbnail';
 import { RichFileMetaText } from '../../shared/RichFileMetaText';
 import { PremiumButton } from '../../ui/PremiumPrimitives';
 import { StackedFileRow } from './StackedFileRow';
+import {
+    buildChannelFolderTree,
+    buildChannelTimeline,
+    type ChannelFolderNode,
+} from '../../../channelFolderTree';
+import { ChannelFolderGroups } from './ChannelFolderGroups';
 
 interface ChannelFeedProps {
     files: TelegramFile[];
+    driveDirectoryPaths?: string[];
+    driveDirectoryIdsByPath?: Record<string, string>;
+    driveDirectoryCreatedAtByPath?: Record<string, number>;
+    driveDirectoryLoadError?: boolean;
+    onDeleteFolder?: (folder: ChannelFolderNode) => void;
     loading: boolean;
     error: Error | null;
     selectedIds: number[];
@@ -80,6 +91,11 @@ function formatChannelDay(value?: string) {
 
 export function ChannelFeed({
     files,
+    driveDirectoryPaths = [],
+    driveDirectoryIdsByPath = {},
+    driveDirectoryCreatedAtByPath = {},
+    driveDirectoryLoadError = false,
+    onDeleteFolder,
     loading,
     error,
     selectedIds,
@@ -107,6 +123,7 @@ export function ChannelFeed({
 }: ChannelFeedProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [collapsedStackIds, setCollapsedStackIds] = useState<Set<string>>(() => new Set());
+    const [expandedDriveFolderPaths, setExpandedDriveFolderPaths] = useState<Set<string>>(() => new Set());
     const scrollRef = useRef<HTMLDivElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const scrollState = useRef({ folderId: activeFolderId, initialized: false, followNewest: true });
@@ -122,23 +139,40 @@ export function ChannelFeed({
             .map(entry => entry.file),
         [files],
     );
-    // Compute day separators once per file-list change, not every scroll frame.
-    const dayLabels = useMemo(() => orderedFiles.map((file, index) => {
-        const dayKey = channelDayKey(file.created_at);
-        const previousDayKey = index > 0 ? channelDayKey(orderedFiles[index - 1].created_at) : '';
-        return dayKey && dayKey !== previousDayKey ? formatChannelDay(file.created_at) : '';
-    }), [orderedFiles]);
+    const { folders: driveFolders, looseFiles } = useMemo(
+        () => buildChannelFolderTree(
+            orderedFiles,
+            driveDirectoryPaths,
+            driveDirectoryIdsByPath,
+            driveDirectoryCreatedAtByPath,
+        ),
+        [orderedFiles, driveDirectoryPaths, driveDirectoryIdsByPath, driveDirectoryCreatedAtByPath],
+    );
+    // Folder collections share the exact same oldest-to-newest feed timeline
+    // as ordinary files; their anchor is the earliest episode inside the folder.
+    const timelineEntries = useMemo(
+        () => buildChannelTimeline(driveFolders, looseFiles),
+        [driveFolders, looseFiles],
+    );
+    // Compute day separators once per mixed timeline change, not every scroll frame.
+    const dayLabels = useMemo(() => timelineEntries.map((entry, index) => {
+        const dayKey = channelDayKey(entry.dateValue);
+        const previousDayKey = index > 0 ? channelDayKey(timelineEntries[index - 1].dateValue) : '';
+        return dayKey && dayKey !== previousDayKey ? formatChannelDay(entry.dateValue) : '';
+    }), [timelineEntries]);
 
     // Render only visible rows. Stacked version rows can expand to arbitrary
     // heights, so measure the actual DOM nodes rather than assuming fixed size.
     const getRowKey = useCallback((index: number) => {
-        const file = orderedFiles[index];
-        if (!file) return index;
+        const entry = timelineEntries[index];
+        if (!entry) return index;
+        if (entry.kind === 'folder') return `channel-${activeFolderId}-${entry.key}`;
+        const file = entry.file;
         const isExpandedStack = !!file.stack_id && (file.stack_version_count ?? 0) > 1;
-        return `channel-${activeFolderId}-${isExpandedStack ? `stack-${file.stack_id}` : `file-${file.id}`}`;
-    }, [activeFolderId, orderedFiles]);
+        return `channel-${activeFolderId}-${isExpandedStack ? `stack-${file.stack_id}` : entry.key}`;
+    }, [activeFolderId, timelineEntries]);
     const rowVirtualizer = useVirtualizer({
-        count: loading || error ? 0 : orderedFiles.length,
+        count: loading || error ? 0 : timelineEntries.length,
         getScrollElement: () => scrollRef.current,
         estimateSize: () => 76,
         getItemKey: getRowKey,
@@ -157,7 +191,7 @@ export function ChannelFeed({
             scroller.scrollTop = scroller.scrollHeight;
             scrollState.current.initialized = true;
         }
-    }, [activeFolderId, loading, error, orderedFiles, hasTransferPanel]);
+    }, [activeFolderId, loading, error, timelineEntries, hasTransferPanel]);
 
     // Expanded version stacks and loaded thumbnails can change height after
     // the initial render. Keep the newest row visible without moving a reader
@@ -223,10 +257,14 @@ export function ChannelFeed({
             >
                 <div
                     ref={contentRef}
-                    className="relative mx-auto w-full max-w-[820px]"
-                    style={orderedFiles.length > 0 ? { height: rowVirtualizer.getTotalSize() } : undefined}
+                    className="mx-auto w-full max-w-[820px]"
                 >
-                    {orderedFiles.length === 0 ? (
+                    {driveDirectoryLoadError && (
+                        <p role="alert" className="mb-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-telegram-subtext">
+                            Drive folder layout couldn’t be loaded. Files are shown individually until the folder index is available.
+                        </p>
+                    )}
+                    {orderedFiles.length === 0 && driveFolders.length === 0 ? (
                         <div className="flex min-h-[420px] flex-col items-center justify-center px-6 text-center">
                             <div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl border border-telegram-primary/15 bg-telegram-primary/10">
                                 <Paperclip className="h-6 w-6 text-telegram-primary" />
@@ -242,12 +280,11 @@ export function ChannelFeed({
                                       : 'Add files below or drag and drop them into this channel.'}
                             </p>
                         </div>
-                    ) : (
-                        rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                    ) : timelineEntries.length > 0 ? (
+                        <div className="relative w-full" style={{ height: rowVirtualizer.getTotalSize() }}>
+                        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
                             const index = virtualRow.index;
-                            const file = orderedFiles[index];
-                            const selected = selectedIdSet.has(file.id);
-                            const title = getPremiumFileTitle(file);
+                            const entry = timelineEntries[index];
                             const dayLabel = dayLabels[index];
                             const dayDivider = dayLabel ? (
                                 <div
@@ -262,6 +299,48 @@ export function ChannelFeed({
                                 </div>
                             ) : null;
 
+                            if (entry.kind === 'folder') {
+                                return (
+                                    <div
+                                        key={virtualRow.key}
+                                        data-index={virtualRow.index}
+                                        ref={rowVirtualizer.measureElement}
+                                        className="absolute left-0 top-0 w-full pb-1.5"
+                                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                                    >
+                                        {dayDivider}
+                                        <ChannelFolderGroups
+                                            folders={[entry.folder]}
+                                            allFiles={orderedFiles}
+                                            activeFolderId={activeFolderId}
+                                            selectedIds={selectedIds}
+                                            onFileClick={onFileClick}
+                                            onToggleSelection={onToggleSelection}
+                                            onDownload={onDownload}
+                                            onDownloadAll={onDownloadAll}
+                                            onPreview={onPreview}
+                                            onDetails={onDetails}
+                                            onDeleteFolder={onDeleteFolder}
+                                            expandedFolders={expandedDriveFolderPaths}
+                                            onExpandedFoldersChange={setExpandedDriveFolderPaths}
+                                            readOnly={readOnly}
+                                            onMore={(event, targetFile) => {
+                                                event.stopPropagation();
+                                                const rect = event.currentTarget.getBoundingClientRect();
+                                                setContextMenu({
+                                                    x: Math.min(rect.right, window.innerWidth - 8),
+                                                    y: rect.bottom + 4,
+                                                    file: targetFile,
+                                                });
+                                            }}
+                                        />
+                                    </div>
+                                );
+                            }
+
+                            const file = entry.file;
+                            const selected = selectedIdSet.has(file.id);
+                            const title = getPremiumFileTitle(file);
                             if (file.stack_id && (file.stack_version_count ?? 0) > 1) {
                                 return (
                                     <div
@@ -424,8 +503,9 @@ export function ChannelFeed({
                                     </article>
                                 </div>
                             );
-                        })
-                    )}
+                        })}
+                        </div>
+                    ) : null}
                 </div>
             </div>
 

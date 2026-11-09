@@ -44,10 +44,17 @@ function callback(name, context) {
   visit(ast);
   if (!body) return null;
   const js = ts.transpileModule('(() => { const fn = ' + body + '; return fn; })()', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const fileKey = `${context.activeFolderId ?? 0}_${context.file?.id ?? 0}`;
+  // The native player creates and awaits its short-lived streaming lease.
+  // Isolated callback tests supply a realistic registered session rather
+  // than failing before they reach the behavior under test.
+  const session = { id: 'a'.repeat(32), key: fileKey, ready: Promise.resolve() };
   return vm.runInNewContext(js, {
     setTimeout, clearTimeout,
     buildAuthenticatedHlsUrl: loader()(helpersPath).buildAuthenticatedHlsUrl,
     buildAuthenticatedSubtitleUrl: loader()(helpersPath).buildAuthenticatedSubtitleUrl,
+    liveHlsRef: { current: false },
+    streamSessionRef: { current: session },
     ...context,
   });
 }
@@ -369,6 +376,14 @@ test('fMP4 remux URL securely binds the session token to a same-origin output', 
     'fMP4 preparation must use the validated token-bearing URL');
 });
 
+test('mounting a selected subtitle immediately enables its text track', () => {
+  const element = { track: { mode: 'disabled' } };
+  const showSubtitleTrack = callback('showSubtitleTrack', {});
+  showSubtitleTrack(element);
+  assert.equal(element.track.mode, 'showing');
+  assert.doesNotThrow(() => showSubtitleTrack(null));
+});
+
 test('stale subtitle requests never override the later track or re-enable cleared subtitles', async () => {
   let finishOld, finishNew;
   const old = new Promise(resolve => { finishOld = resolve; });
@@ -425,6 +440,7 @@ test('switching source never carries an earlier local bearer token into new HLS 
     setNativeAutoPlay:stub, setNativeDecoderRevision:stub, setMovieTime:stub,
     setNativePaused:stub, fmp4RemuxingRef:{current:false}, remuxGenerationRef:{current:0},
     hlsGenerationRef:{current:0}, hlsDesiredJobRef:{current:null},
+    liveHlsRef:{current:false},
     pollTimerRef:{current:null}, currentJobIdRef:{current:null},
     remuxWindowRef:{current:{}}, pendingSeekRef:{current:null},
     savedTimeRef:{current:0}, savedPlaybackRef:{current:true},
@@ -515,6 +531,21 @@ test('native and hls.js compatibility initialization preserve seek and explicit 
     'Both native HLS and hls.js must respect the shared play/pause restoration');
 });
 
+test('seeking ahead of a growing HLS playlist opens a seekable compatibility window', () => {
+  const actions = [];
+  const seekTo = callback('seekTo', {
+    playbackMode: 'hls',
+    liveHlsRef: { current: true },
+    getActiveVideo: () => ({ seekable: { length: 1, end: () => 12 } }),
+    transcodeCapsRef: { current: { available: true } },
+    requestRemuxAt: time => actions.push(['seek', time]),
+    leaveHls: () => actions.push(['leave']),
+    toast: { info() {} },
+  });
+  seekTo(42);
+  assert.deepEqual(actions, [['seek', 42], ['leave']]);
+});
+
 test('forward seek uses the movie duration beyond the first remux frontier', () => {
   const requested = [];
   const video = { currentTime: 585, duration: 586, paused: false, seekable: ranges([0,586]), buffered: ranges([0,586]) };
@@ -550,7 +581,8 @@ test('a remux timeline displays the complete source duration', () => {
     file: { id: 7, name: 'movie.mkv', size: 2400000000, type: 'video', is_split: true },
     activeFolderId: 1, streamUrl: 'http://localhost/stream/1/7?token=qa', onClose() {},
   }));
-  assert.ok(/aria-label="Movie timeline"[^>]*max="7200"|max="7200"[^>]*aria-label="Movie timeline"/.test(html), 'Full-duration timeline is absent');
+  assert.ok(html.includes('aria-label="Video position"') && html.includes('max="7200"'),
+    'Unified custom timeline does not expose the full source duration');
   assert.ok(html.includes('2:00:00'), 'The displayed duration comes from the partial stream');
 });
 test('dragging the movie timeline prepares one window when released', () => {
@@ -576,14 +608,11 @@ test('pausing while a seek prepares prevents the new window from autoplaying', (
   context.togglePlayback = callback('togglePlayback', context);
   const source = fs.readFileSync(playerPath, 'utf8');
   const ast = ts.createSourceFile('Player.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  let handler;
-  function visit(node) {
-    if (ts.isJsxAttribute(node) && node.name.getText(ast) === 'onTogglePlay') handler = node.initializer.expression.getText(ast);
-    ts.forEachChild(node, visit);
-  }
-  visit(ast);
-  const js = ts.transpileModule('(' + handler + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  vm.runInNewContext(js, context)();
+  // The new single transport bar calls togglePlayback directly instead
+  // of delegating to a second duplicate PlaybackTimeline component.
+  const code = fs.readFileSync(playerPath, 'utf8');
+  assert.ok(code.includes('onClick={togglePlayback}'), 'Custom transport play button is unwired');
+  context.togglePlayback();
   assert.equal(context.pendingSeekRef.current.play, false, 'The pending window ignored the pause action');
   assert.equal(plays, 0, 'A loading window resumed its abandoned native source');
   assert.equal(paused, true);
@@ -760,6 +789,8 @@ test('explicit remux preference invokes FFmpeg after exhausted native decoder re
     'An ordinary failed MP4 silently spent FFmpeg conversion resources');
   assert.equal(invoke(false,'fixture.mp4',0),1,
     'Initial native MP4 decoder errors lost their existing fallback');
+  assert.equal(invoke(false,'fixture.wmv',0),1,
+    'A browser-unsupported video container never gets a compatibility attempt');
   assert.equal(invoke(false,'fixture.mp4',0,true),0,
     'An opted-in local MP4 memory recovery was unexpectedly converted with FFmpeg');
   assert.equal(invoke(false,'fixture.mp4',0,false,true),0,
@@ -915,7 +946,7 @@ test('completed remux handoff remounts native player and applies play intent bef
     if (ts.isJsxOpeningElement(node) && node.tagName.getText(ast) === 'video') {
       const src = node.attributes.properties.find(p => ts.isJsxAttribute(p) && p.name.getText(ast) === 'src');
       const key = node.attributes.properties.find(p => ts.isJsxAttribute(p) && p.name.getText(ast) === 'key');
-      if (src?.initializer?.expression?.getText(ast) === 'nativeMediaUrl') {
+      if (src?.initializer?.expression?.getText(ast) === 'fmp4Remuxing ? undefined : nativeMediaUrl') {
         keyedNativeVideo = key?.initializer?.expression?.getText(ast)
           === '`${nativeDecoderRevision}:${nativeMediaUrl}`';
       }
@@ -1316,6 +1347,8 @@ test('obsolete HLS preparation never publishes its playlist and only cancels its
   });
   const promise = callback('startTranscode', context)('480p');
   assert.equal(context.hlsGenerationRef.current, 3);
+  await new Promise(resolve => setImmediate(resolve)); // Flush cross-context async lease gate.
+  assert.equal(typeof resolvePrepare, 'function', 'No prepared IPC request after active session');
   context.hlsGenerationRef.current += 1; // File change or user cancellation
   resolvePrepare({ status: 'pending', job_id: 'owned-obsolete', playlist_url: null });
   await promise;
@@ -1360,10 +1393,13 @@ test('obsolete HLS request does not cancel a newer request for the SAME determin
   const second = start('480p');
   const job = '5_7_480p';
   assert.equal(context.hlsDesiredJobRef.current, job);
-  pending[0]({ status: 'pending', job_id: job, playlist_url: null });
+  await new Promise(resolve => setImmediate(resolve)); // Flush cross-context async lease gate.
+  // The new session gate prevents the obsolete request from even entering
+  // native IPC when the next quality intent supersedes it during registration.
+  assert.equal(pending.length, 1, 'Only the latest intent should reach native IPC');
   await first;
   assert.deepEqual(cancelled, [], 'A stale request cancelled its replacement\'s shared job');
-  pending[1]({ status: 'ready', job_id: job, playlist_url: '/hls/5_7/480p/index.m3u8' });
+  pending[0]({ status: 'ready', job_id: job, playlist_url: '/hls/5_7/480p/index.m3u8' });
   await second;
   assert.ok(urls.at(-1)?.startsWith('http://localhost/hls/5_7/480p/index.m3u8?'),
     'Newer preparation failed to publish its own playlist');
@@ -1400,6 +1436,8 @@ test('stale HLS ready reply does not invalidate already cached shared output', a
       'HlsProgress','HlsError','HlsVariantStates'].map(k => ['set' + k, () => {}])),
   });
   const prepare = callback('startTranscode', context)('480p');
+  await new Promise(resolve => setImmediate(resolve)); // Flush cross-context async lease gate.
+  assert.equal(typeof resolvePrepare, 'function', 'Mock did not receive the expected request');
   context.hlsGenerationRef.current += 1;
   context.hlsDesiredJobRef.current = null;
   resolvePrepare({ status: 'ready', job_id: '5_7_480p', playlist_url: '/hls/old/index.m3u8' });
@@ -1464,7 +1502,7 @@ test('audio selection in HLS does not reuse a stale remux offset', () => {
     hlsRef: { current: null }, pollTimerRef: { current: null },
     hlsGenerationRef: { current: 0 }, hlsDesiredJobRef: { current: null },
     currentJobIdRef: { current: null },
-    setSelectedAudioStream() {}, setPlaybackMode() {}, setQuality() {}, requestRemuxAt: time => requested.push(time),
+    setSelectedAudioStream() {}, leaveHls() {}, requestRemuxAt: time => requested.push(time),
   });
   callback('handleAudioTrackChange', context)(2);
   assert.deepEqual(requested, [5410], 'An HLS timestamp received the stale native window offset');

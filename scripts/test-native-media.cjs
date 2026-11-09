@@ -100,11 +100,14 @@ const wait = async (predicate, label) => {
     const preparesBeforeAudioSwitch = ipc.filter(x => x === 'cmd_prepare_fmp4_stream').length;
     const originalDecoderFailedBeforeAudioSwitch = events.some(e =>
       e.type === 'error' && e.src.includes('/source.mkv'));
-    const select = await wait(() => document.querySelector('select'), 'audio selector');
+    const select = await wait(() => {
+      const audio = document.querySelector('select[aria-label="Audio track"]');
+      return audio && !audio.disabled && audio.querySelector('option[value="2"]') ? audio : null;
+    }, 'audio selector');
     select.value = '2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
-    await wait(() => ipc.filter(x => x === 'cmd_prepare_fmp4_stream').length > preparesBeforeAudioSwitch,
-      'audio switch starts its remux');
+    await wait(() => window.__qaAudioSelections.length > preparesBeforeAudioSwitch
+      && window.__qaAudioSelections.at(-1) === 2, 'audio switch requests the selected stream');
     video = await wait(() => [...document.querySelectorAll('video')].find(v => v.src.includes('/fmp4/') && v.videoWidth > 0 && v.currentTime > 0.3 && !v.paused), 'growing remux playback');
     const preparesAfterAudioSwitch = ipc.filter(x => x === 'cmd_prepare_fmp4_stream').length;
     if (preparesAfterAudioSwitch !== preparesBeforeAudioSwitch + 1)
@@ -215,8 +218,9 @@ async function runBrowser(url) {
     plugins: [{ name: 'qa-ipc', setup(build) {
       build.onResolve({ filter: /^@tauri-apps\// }, args => ({ path: args.path, namespace: 'qa-ipc' }));
       build.onLoad({ filter: /.*/, namespace: 'qa-ipc' }, () => ({ contents: `
-        export async function invoke(name) {
+        export async function invoke(name, args) {
           window.__qaIpc.push(name);
+          if (name === 'cmd_prepare_fmp4_stream') window.__qaAudioSelections.push(args?.audioStreamIndex);
           if (name === 'cmd_get_transcode_capabilities') return { available: new URLSearchParams(location.search).get('case') !== 'memory', variants: [], mode: 'original' };
           if (name === 'cmd_probe_media_tracks') return { audio_tracks: [{ index: 1, language: 'eng', codec: 'aac' }, { index: 2, language: 'tel', codec: 'aac' }], subtitle_tracks: [], duration_secs: 16 };
           if (name === 'cmd_prepare_fmp4_stream') {
@@ -254,7 +258,7 @@ async function runBrowser(url) {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname === '/qa') {
       res.setHeader('Content-Type','text/html');
-      res.end('<!doctype html><html><head><style>'+css+'</style></head><body><div id="root"></div><script>window.__qaIpc=[];window.__qaMediaSize='+mp4.length+'</script><script src="/player.js"></script></body></html>');
+      res.end('<!doctype html><html><head><style>'+css+'</style></head><body><div id="root"></div><script>window.__qaIpc=[];window.__qaAudioSelections=[];window.__qaMediaSize='+mp4.length+'</script><script src="/player.js"></script></body></html>');
       return;
     }
     if (url.pathname === '/qa-status') {

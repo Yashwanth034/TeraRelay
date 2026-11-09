@@ -42,6 +42,14 @@ function makeBackend(saved = {}) {
     db, saves: [], jobs: [], deleted: [], listeners: new Map(), saveHolds: [], failures: 0, authReady: true,
     authCalls: 0, transferChoice: 'tdlib',
     driveSnapshot: { pending: [] }, driveFinalized: [], driveSyncs: 0, driveSyncResults: [], preflightResult: null,
+    folderMoves: [], folderMoveFailures: 0, folderPrepCalls: [], activeFolderId: null,
+    folderManifest: {
+      folder_name: 'folder',
+      source_root: '/fixture',
+      files: [{ path: '/fixture/episode.mkv', relative_path: 'episode.mkv', name: 'episode.mkv', size: 14 }],
+      directories: [], total_size: 14,
+    },
+    folderDirectories: [{ relative_path: '', directory_id: 'c'.repeat(32) }],
     saveInFlight: 0, maxSaveInFlight: 0, dialogs: [], filename: path.join(fixtures, 'folder-' + serial + '.zip'),
     read: kind => database(db, 'load', kind),
     holdSave(predicate = () => true) { const gate = deferred(); backend.saveHolds.push({ predicate, gate }); return gate; },
@@ -67,6 +75,19 @@ function makeBackend(saved = {}) {
       if (command === 'cmd_drive_finalize_upload') {
         backend.driveFinalized.push(structuredClone(args));
         backend.driveSnapshot.pending = backend.driveSnapshot.pending.filter(item => item.id !== args.pendingId);
+        return null;
+      }
+      if (command === 'cmd_list_folder_upload_files') return structuredClone(backend.folderManifest);
+      if (command === 'cmd_drive_prepare_folder_upload') {
+        backend.folderPrepCalls.push(structuredClone(args));
+        return structuredClone(backend.folderDirectories);
+      }
+      if (command === 'cmd_drive_move_uploaded_file_to_directory') {
+        backend.folderMoves.push(structuredClone(args));
+        if (backend.folderMoveFailures > 0) {
+          backend.folderMoveFailures--;
+          throw new Error('synthetic Drive move failure');
+        }
         return null;
       }
       if (command === 'cmd_preflight_upload_candidate') {
@@ -132,6 +153,7 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
   const cells = [];
   const effects = [];
   const timers = new Map();
+  const queryCache = new Map();
   const toasts = [];
   let cursor = 0, dirty = true, result, mounted = true, now = 0, timerId = 0;
   const oldWindow = global.window;
@@ -175,12 +197,21 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
     } },
     '@tauri-apps/plugin-dialog': {
       save: async () => backend.dialogs.length ? backend.dialogs.shift() : path.join(fixtures, 'selected-' + serial + '.bin'),
-      open: async options => options.title === 'Select Folder to Upload' ? '/fixture/folder' : null,
+      open: async options => options.title === 'Select Folder to Upload' ? '/fixture/folder' : backend.downloadDirectory ?? null,
     },
-    '@tanstack/react-query': { useQueryClient: () => ({ invalidateQueries() {} }) },
+    '@tanstack/react-query': { useQueryClient: () => ({
+      setQueryData(key, updater) {
+        const cacheKey = JSON.stringify(key);
+        const current = queryCache.get(cacheKey);
+        const next = typeof updater === 'function' ? updater(current) : updater;
+        queryCache.set(cacheKey, next);
+        return next;
+      },
+      invalidateQueries() {},
+    }) },
     sonner: { toast: Object.fromEntries(['info', 'success', 'error', 'warning'].map(level => [level, text => toasts.push({ level, text })])) },
     '../utils': {
-      isAndroidPlatform: false, isIOSPlatform: false, sanitizeFilename: value => value,
+      isAndroidPlatform: false, isIOSPlatform: false, sanitizeFilename: value => value, formatBytes: value => `${value} bytes`,
       pickWithFallback: async fn => fn(), showFileDialogFallback: async () => [],
     },
     '../context/SettingsContext': { useSettings: () => ({ settings: { maxConcurrentUploads: concurrency, maxConcurrentDownloads: concurrency } }) },
@@ -225,7 +256,7 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
       for (let turn = 0; turn < 80; turn++) {
         if (dirty && mounted) {
           dirty = false; cursor = 0;
-          result = kind === 'upload' ? hook(null, store) : hook(store);
+          result = kind === 'upload' ? hook(backend.activeFolderId ?? null, store) : hook(store);
           while (effects.length) effects.shift()();
           quiet = 0;
         }
@@ -251,8 +282,9 @@ function makeHarness(kind, backend, store = legacyStore(), concurrency = 1) {
   };
   return harness;
 }
-async function withHarness(kind, saved, fn, concurrency = 1, legacy = {}) {
+async function withHarness(kind, saved, fn, concurrency = 1, legacy = {}, configure = null) {
   const backend = makeBackend(saved);
+  configure?.(backend);
   const harness = makeHarness(kind, backend, legacyStore(legacy), concurrency);
   try { await harness.flush(); await fn(harness, backend); } finally { harness.close(); }
 }
@@ -277,6 +309,14 @@ const corruptedQueues = [
   ['download', 'invalid transfer engine', [down('bad', 'pending', { transferEngine: 'automatic' })]],
   ['upload', 'incomplete mounted-drive identity', [up('bad', 'pending', { drivePendingId: '0'.repeat(32) })]],
   ['upload', 'invalid mounted-drive identity', [up('bad', 'pending', { drivePendingId: 'not-an-id', driveFileName: 'file.txt' })]],
+  ['upload', 'incomplete folder upload identity', [up('bad', 'pending', {
+    folderId: 9100001, uploadGroupId: 'folder-group',
+  })]],
+  ['upload', 'unsafe folder-relative path', [up('bad', 'pending', {
+    folderId: 9100001, uploadGroupId: 'folder-group', uploadGroupName: 'Season',
+    uploadGroupRelativePath: '../escape.mkv', uploadGroupFileCount: 1,
+    uploadGroupTotalBytes: 10, driveFolderDirectoryId: 'c'.repeat(32),
+  })]],
 ];
 for (const [kind, reason, items] of corruptedQueues) test(kind + ' preserves corrupted saved records: ' + reason, () => withHarness(kind, { [kind]: items }, async (h, backend) => {
   const helper = h.load(path.join(root, 'app/src/transferQueue.ts'));
@@ -387,6 +427,36 @@ test('mounted-drive close enters the durable Boost upload queue and finalizes th
     assert.ok(backend.driveSyncs >= 1, 'Drive metadata publication was not requested after finalization');
   })
 );
+
+test('folder upload move retry reuses its completed logical file instead of uploading bytes twice', async () => {
+  const backend = makeBackend({ upload: [{
+    id: 'folder-episode', path: '/fixture/episode.mkv', folderId: 9100001, status: 'pending',
+    transferEngine: 'boost',
+    uploadGroupId: 'folder-group-1', uploadGroupName: 'Season 01',
+    uploadGroupRelativePath: 'Season 01/Episode 01.mkv',
+    uploadGroupFileCount: 1, uploadGroupTotalBytes: 1024,
+    uploadGroupSourceRoot: '/fixture',
+    driveFolderDirectoryId: 'c'.repeat(32), driveFolderLogicalFileId: 'd'.repeat(32),
+  }] });
+  backend.folderMoveFailures = 1;
+  const h = makeHarness('upload', backend);
+  try {
+    await h.flush();
+    assert.equal(backend.jobs.length, 0, 'A recovered folder file must not start a second byte upload');
+    assert.equal(backend.folderMoves.length, 1, 'The first attempt should retry only the Drive move');
+    assert.equal(backend.folderMoves[0].logicalFileId, 'd'.repeat(32));
+    assert.equal(h.queue[0].status, 'error', 'A failed Drive move must remain actionable in the queue');
+    const saved = backend.read('upload')[0];
+    assert.equal(saved.driveFolderLogicalFileId, 'd'.repeat(32));
+    assert.equal(saved.uploadGroupRelativePath, 'Season 01/Episode 01.mkv');
+
+    h.state.retryItem('folder-episode');
+    await h.flush();
+    assert.equal(backend.folderMoves.length, 2, 'Retry should attempt the metadata move again');
+    assert.equal(backend.jobs.length, 0, 'Retry must not transfer the episode bytes again');
+    assert.equal(h.queue[0].status, 'success');
+  } finally { h.close(); }
+});
 
 test('mounted-drive byte-identical copy reuses existing logical content without another upload', () =>
   withHarness('upload', { upload: [] }, async (h, backend) => {
@@ -649,8 +719,10 @@ test('Drive upload warning panel remains usable with no queue rows and handles b
     exports: exported,
     require(name) {
       if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx, Fragment: 'fragment' };
+      if (name === 'react') return { useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}] };
       if (name === 'lucide-react') return icons;
       if (name === '../../../utils') return { formatBytes: n => `${n} bytes` };
+      if (name === './FolderUploadEpisodeRow') return { FolderUploadEpisodeRow: () => null };
       throw new Error('unexpected UI import: ' + name);
     },
   });
@@ -748,8 +820,10 @@ for (const kind of ['upload', 'download']) test(kind + ' preserves setup-cancell
   assert.equal(saved[0].status, 'paused');
   assert.match(saved[0].error, /setup.*cancel|cancel.*setup/i);
   if (kind === 'upload') {
-    assert.ok(fs.existsSync(backend.filename));
-    assert.equal(saved[0].tempZipPath, backend.filename);
+    assert.equal(saved[0].uploadGroupName, 'folder');
+    assert.equal(saved[0].uploadGroupRelativePath, 'episode.mkv');
+    assert.equal(saved[0].driveFolderDirectoryId, 'c'.repeat(32));
+    assert.equal(saved[0].tempZipPath, undefined);
   } else assert.ok(saved[0].savePath);
   const id = saved[0].id;
   h.close();
@@ -763,7 +837,7 @@ for (const kind of ['upload', 'download']) test(kind + ' preserves setup-cancell
     assert.equal(backend.jobs.length, 1);
     if (kind === 'download') assert.equal(backend.jobs[0].args.req.save_path, saved[0].savePath);
   } finally { reopened.close(); }
-}));
+}, 1, {}, backend => { if (kind === 'upload') backend.activeFolderId = 9100001; }));
 
 // Removing the durable scheduling barrier would start a transfer before this gate commits.
 for (const kind of ['upload', 'download']) test(kind + ' waits for its complete queue snapshot before starting work', () => withHarness(kind, { [kind]: [] }, async (h, backend) => {
@@ -830,25 +904,53 @@ test('failed saves remain undurable and retry before transfer start', () => with
   assert.equal(backend.jobs.length, 1);
 }));
 
-// Reserving an active ID before await protects configured concurrency across progress/renders.
-for (const kind of ['upload', 'download']) test(kind + ' reserves unique worker slots across delayed persistence and rerenders', () => withHarness(kind, { [kind]: [] }, async (h, backend) => {
+// Persisted legacy concurrency settings must never start the second file
+// before the first has fully completed, even during rerenders/progress updates.
+for (const kind of ['upload', 'download']) test(kind + ' transfers selected files one by one in enqueue order even with old parallel settings', () => withHarness(kind, { [kind]: [] }, async (h, backend) => {
   const gate = backend.holdSave(record => record.items.length > 0);
   if (kind === 'upload') h.state.handleDropUpload(['/fixture/one.bin', '/fixture/two.bin', '/fixture/three.bin']);
-  else await h.state.queueBulkDownload([]);
-  if (kind === 'download') {
+  else {
     h.state.queueDownload(1, 'one.bin', null);
     h.state.queueDownload(2, 'two.bin', null);
     h.state.queueDownload(3, 'three.bin', null);
   }
-  await h.flush(); gate.resolve(); await h.flush();
-  assert.equal(backend.jobs.length, 2, 'Configured worker slots were duplicated or underfilled');
-  assert.equal(new Set(backend.jobs.map(j => j.id)).size, 2, 'Same transfer was started twice');
+  await h.flush();
+  assert.equal(backend.jobs.length, 0, 'Upload/download started before queue persistence');
+  gate.resolve(); await h.flush();
+  assert.equal(backend.jobs.length, 1, 'A second file started before the first completed');
+  assert.equal(h.queue.filter(i => i.status === 'pending').length, 2);
+  const names = kind === 'upload'
+    ? () => backend.jobs.map(j => j.args.path.split('/').pop())
+    : () => backend.jobs.map(j => h.queue.find(item => item.id === j.id)?.filename);
+  assert.deepEqual(names(), ['one.bin']);
   backend.emit(kind + '-progress', { id: backend.jobs[0].id, percent: 1, uploaded_bytes: 3, total_bytes: 300, speed_bytes_per_sec: 27 });
   await h.flush();
-  assert.equal(backend.jobs.length, 2);
+  assert.equal(backend.jobs.length, 1, 'Progress update started another file');
   backend.complete(backend.jobs[0].id); await h.flush();
-  assert.equal(backend.jobs.length, 3, 'Released worker slot did not schedule remaining work');
-}, 2));
+  assert.equal(backend.jobs.length, 2, 'Second file did not start after first finished');
+  assert.ok(backend.jobs[0].finished, 'Second file overlapped the first');
+  assert.deepEqual(names(), ['one.bin', 'two.bin']);
+  backend.complete(backend.jobs[1].id); await h.flush();
+  assert.equal(backend.jobs.length, 3, 'Third file did not start after second finished');
+  assert.ok(backend.jobs[1].finished, 'Third file overlapped the second');
+  assert.deepEqual(names(), ['one.bin', 'two.bin', 'three.bin']);
+}, 6));
+
+test('bulk downloads reserve distinct durable paths and request no-overwrite publication', () => withHarness('download', { download: [] }, async (h, backend) => {
+  backend.downloadDirectory = path.join(fixtures, 'bulk');
+  await h.state.queueBulkDownload([
+    { id: 101, name: 'report.pdf' },
+    { id: 202, name: 'report.pdf' },
+  ], 4);
+  await h.flush();
+
+  assert.deepEqual(backend.read('download').map(item => item.savePath), [
+    path.join(backend.downloadDirectory, 'report.pdf'),
+    path.join(backend.downloadDirectory, 'report (2).pdf'),
+  ]);
+  assert.ok(backend.read('download').every(item => item.noOverwrite === true));
+  assert.equal(backend.jobs[0].args.req.no_overwrite, true);
+}));
 
 test('newly selected download destination commits before download invoke', () => withHarness('download', { download: [] }, async (h, backend) => {
   const destination = path.join(fixtures, 'selected-movie.mkv');
@@ -902,47 +1004,202 @@ test('save-dialog cancellation releases exactly one slot', () => withHarness('do
   assert.equal(h.queue.filter(i => i.status === 'pending').length, 1);
 }));
 
-test('folder ZIP survives upload failure and error metadata survives reopening', () => withHarness('upload', { upload: [] }, async (h, backend) => {
-  await h.state.handleFolderUpload(); await h.flush();
-  const id = backend.jobs[0].id;
-  backend.complete(id, 'fixture permanent upload failure'); await h.flush();
-  assert.ok(fs.existsSync(backend.filename), 'Failed upload destroyed the only retryable ZIP source');
-  const saved = backend.read('upload');
-  assert.equal(saved[0].tempZipPath, backend.filename);
-  assert.equal(saved[0].status, 'error');
-  assert.ok(saved[0].error.includes('fixture permanent upload failure'));
-  h.close();
-  const reopened = makeHarness('upload', backend);
-  try {
-    await reopened.flush();
-    assert.equal(reopened.queue[0].status, 'error');
-    reopened.state.retryItem(id); await reopened.flush();
-    assert.equal(backend.jobs.length, 2, 'Recovered error was not retryable');
-    assert.ok(fs.existsSync(backend.filename));
-  } finally { reopened.close(); }
-}));
+test('folder picker queues nested episodes as normal files in one grouped upload', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/episode-01.mkv', relative_path: 'Season 01/Episode 01.mkv', name: 'Episode 01.mkv', size: 10 },
+        { path: '/fixture/poster.jpg', relative_path: 'poster.jpg', name: 'poster.jpg', size: 20 },
+      ],
+      directories: ['Season 01'],
+      total_size: 30,
+    };
+    backend.folderDirectories = [
+      { relative_path: '', directory_id: 'a'.repeat(32) },
+      { relative_path: 'Season 01', directory_id: 'b'.repeat(32) },
+    ];
+    await h.state.handleFolderUpload();
+    await h.flush();
 
-test('successful folder upload waits for durable completion before ZIP cleanup', () => withHarness('upload', { upload: [] }, async (h, backend) => {
-  await h.state.handleFolderUpload(); await h.flush();
-  const gate = backend.holdSave(record => record.items.length === 0);
-  backend.complete(backend.jobs[0].id); await h.flush();
-  assert.ok(fs.existsSync(backend.filename), 'ZIP was deleted before completion snapshot committed');
-  gate.resolve(); await h.flush();
-  assert.deepEqual(backend.read('upload'), []);
-  assert.ok(!fs.existsSync(backend.filename));
-}));
+    const saved = backend.read('upload');
+    assert.equal(saved.length, 2, 'Each selected file should have its own recoverable upload item');
+    assert.deepEqual(saved.map(item => item.totalBytes), [10, 20],
+      'Expected per-file sizes must persist so collection progress stays byte-weighted after restart');
+    assert.ok(saved.every(item => item.uploadedBytes === undefined),
+      'Rolling transfer progress must not be persisted as stale byte counts');
+    assert.equal(new Set(saved.map(item => item.uploadGroupId)).size, 1, 'Files from one source folder must share a group');
+    assert.ok(saved.every(item => item.uploadGroupName === 'Season Pack'));
+    assert.deepEqual(saved.map(item => item.uploadGroupRelativePath), [
+      'Season 01/Episode 01.mkv', 'poster.jpg',
+    ]);
+    assert.equal(saved.find(item => item.uploadGroupRelativePath.startsWith('Season 01')).driveFolderDirectoryId, 'b'.repeat(32));
+    assert.equal(saved.find(item => item.uploadGroupRelativePath === 'poster.jpg').driveFolderDirectoryId, 'a'.repeat(32));
+    assert.equal(saved.every(item => !item.tempZipPath), true, 'Folder bytes must not be packed into a single ZIP');
+    assert.equal(backend.folderPrepCalls.length, 1);
+    assert.deepEqual(backend.folderPrepCalls[0].relativeFiles, [
+      'Season 01/Episode 01.mkv', 'poster.jpg',
+    ]);
+    assert.equal(backend.folderPrepCalls[0].folderId, 9100001);
+    assert.equal(backend.jobs.length, 1, 'The existing sequential transfer worker should upload one file at a time');
+    assert.equal(backend.jobs[0].args.path, '/fixture/episode-01.mkv');
+    assert.equal(backend.jobs[0].args.uploadName, 'Episode 01.mkv');
+    assert.equal(backend.jobs[0].args.folderUploadRoot, '/fixture',
+      'The native upload command must receive the original selected root for revalidation');
+    assert.ok(!fs.existsSync(backend.filename), 'Folder selection must not create a temporary archive');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
 
-test('explicit cancellation cleans a queued folder ZIP after cancellation is durable', () => withHarness('upload', { upload: [] }, async (h, backend) => {
-  await h.state.handleFolderUpload(); await h.flush();
-  const id = backend.jobs[0].id;
-  h.state.pauseItem(id); await h.flush();
-  const gate = backend.holdSave(record => record.items.length === 0);
-  h.state.cancelItem(id); await h.flush();
-  assert.ok(fs.existsSync(backend.filename));
-  gate.resolve(); await h.flush();
-  assert.ok(!fs.existsSync(backend.filename), 'Explicit canceled ZIP remained orphaned');
-  assert.deepEqual(backend.read('upload'), []);
-}));
+test('folder upload failure preserves per-file retry metadata across reopening', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    await h.state.handleFolderUpload(); await h.flush();
+    assert.equal(backend.jobs.length, 1);
+    const id = backend.jobs[0].id;
+    backend.complete(id, 'fixture permanent upload failure'); await h.flush();
+    const saved = backend.read('upload');
+    assert.equal(saved[0].uploadGroupName, 'folder');
+    assert.equal(saved[0].uploadGroupRelativePath, 'episode.mkv');
+    assert.equal(saved[0].status, 'error');
+    assert.ok(saved[0].error.includes('fixture permanent upload failure'));
+    assert.equal(saved[0].tempZipPath, undefined);
+    h.close();
+    const reopened = makeHarness('upload', backend);
+    try {
+      await reopened.flush();
+      assert.equal(reopened.queue[0].status, 'error');
+      reopened.state.retryItem(id); await reopened.flush();
+      assert.equal(backend.jobs.length, 2, 'Recovered folder file was not retryable');
+    } finally { reopened.close(); }
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('successful folder episode is indexed in Drive before its queue row drains', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    await h.state.handleFolderUpload(); await h.flush();
+    const gate = backend.holdSave(record => record.items.length === 0);
+    backend.complete(backend.jobs[0].id, null, {
+      message: 'fixture episode uploaded', logical_file_id: 'a'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.folderMoves.length, 1, 'Successful episode was not attached to its prepared Drive folder');
+    assert.equal(backend.folderMoves[0].logicalFileId, 'a'.repeat(32));
+    gate.resolve(); await h.flush();
+    assert.deepEqual(backend.read('upload'), [],
+      'A completely successful folder upload must clear its durable group summary');
+    assert.ok(!fs.existsSync(backend.filename), 'No temporary ZIP should exist or need cleanup');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('folder group success and cancellation states survive restart and can be dismissed together', () => {
+  const group = {
+    folderId: 9100001,
+    uploadGroupId: 'terminal-folder-group',
+    uploadGroupName: 'Season 01',
+    uploadGroupFileCount: 3,
+    uploadGroupTotalBytes: 300,
+    uploadGroupSourceRoot: '/fixture',
+    driveFolderDirectoryId: 'c'.repeat(32),
+  };
+  const items = [
+    up('folder-done', 'success', {
+      ...group, path: '/fixture/done.mkv', uploadGroupRelativePath: 'done.mkv',
+    }),
+    up('folder-cancelled', 'cancelled', {
+      ...group, path: '/fixture/cancelled.mkv', uploadGroupRelativePath: 'cancelled.mkv',
+    }),
+    up('folder-failed', 'error', {
+      ...group, path: '/fixture/failed.mkv', uploadGroupRelativePath: 'failed.mkv',
+      error: 'fixture disk full',
+    }),
+  ];
+  return withHarness('upload', { upload: items }, async (h, backend) => {
+    assert.deepEqual(h.queue.map(item => item.status), ['success', 'cancelled', 'error'],
+      'Terminal group rows must survive queue recovery without becoming fake successes');
+    assert.equal(backend.jobs.length, 0, 'Terminal group rows must not restart on their own');
+    h.state.dismissGroup('terminal-folder-group');
+    await h.flush();
+    assert.deepEqual(backend.read('upload'), [], 'Dismissing the group should clear all terminal rows durably');
+  });
+});
+
+test('cancelling a folder upload removes only its queue entry, never the original files', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    await h.state.handleFolderUpload(); await h.flush();
+    const id = backend.jobs[0].id;
+    const sourcePath = backend.jobs[0].args.path;
+    h.state.pauseItem(id); await h.flush();
+    const gate = backend.holdSave(record => record.items.length === 0);
+    h.state.cancelItem(id); await h.flush();
+    assert.equal(backend.folderMoves.length, 0);
+    gate.resolve(); await h.flush();
+    assert.equal(backend.read('upload')[0].status, 'cancelled',
+      'Cancelled folder files must remain visible in the durable group summary');
+    assert.equal(h.queue[0].status, 'cancelled');
+    assert.equal(backend.jobs[0].args.path, sourcePath);
+    assert.ok(!fs.existsSync(backend.filename), 'Cancellation must not create or clean up a ZIP archive');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('folder group pause parks pending episodes and resume restarts one file at a time', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/episode-01.mkv', relative_path: 'episode-01.mkv', name: 'episode-01.mkv', size: 10 },
+        { path: '/fixture/episode-02.mkv', relative_path: 'episode-02.mkv', name: 'episode-02.mkv', size: 20 },
+        { path: '/fixture/episode-03.mkv', relative_path: 'episode-03.mkv', name: 'episode-03.mkv', size: 30 },
+      ],
+      directories: [], total_size: 60,
+    };
+    await h.state.handleFolderUpload();
+    await h.flush();
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 1,
+      'Folder uploads must continue to use the single-file transfer worker');
+    const groupId = h.queue[0].uploadGroupId;
+    h.state.pauseGroup(groupId);
+    await h.flush();
+    assert.ok(h.queue.every(item => item.status === 'paused'),
+      'Pausing a collection must park the active episode and every queued sibling');
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 0,
+      'A sibling episode started while the folder was paused');
+
+    h.state.resumeGroup(groupId);
+    await h.flush();
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 1,
+      'Resuming a collection must restart only one episode at a time');
+    assert.equal(h.queue.filter(item => item.status === 'pending' || item.status === 'uploading').length, 3,
+      'Resuming the collection did not restore every paused episode');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('folder group cancel stops the active episode and durably cancels every queued sibling', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/episode-01.mkv', relative_path: 'episode-01.mkv', name: 'episode-01.mkv', size: 10 },
+        { path: '/fixture/episode-02.mkv', relative_path: 'episode-02.mkv', name: 'episode-02.mkv', size: 20 },
+      ],
+      directories: [], total_size: 30,
+    };
+    await h.state.handleFolderUpload();
+    await h.flush();
+    const groupId = h.queue[0].uploadGroupId;
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 1);
+    h.state.cancelGroup(groupId);
+    await h.flush();
+    assert.ok(h.queue.every(item => item.status === 'cancelled'),
+      'Cancel folder upload must cancel all current and queued episodes');
+    assert.ok(backend.read('upload').every(item => item.status === 'cancelled'),
+      'Group cancellation was not persisted as a complete batch');
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 0,
+      'The current episode kept transferring after group cancellation');
+    assert.deepEqual(backend.deleted, [], 'Cancelling a folder upload must not remove original source files');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
 
 // A late URL phase event must not turn a durable pause back into resumable work.
 test('late remote progress cannot unpause or resurrect a cancelled upload', () => withHarness('upload', { upload: [] }, async (h, backend) => {
@@ -961,18 +1218,22 @@ test('late remote progress cannot unpause or resurrect a cancelled upload', () =
 }));
 
 // Completing an older cancellation must not delete the source of a newer manual Retry.
-test('retry during delayed cancellation keeps the folder ZIP and starts one replacement worker', () => withHarness('upload', { upload: [] }, async (h, backend) => {
-  await h.state.handleFolderUpload(); await h.flush();
-  const id = backend.jobs[0].id;
-  h.state.pauseItem(id); await h.flush();
-  const gate = backend.holdSave(record => record.items.length === 0);
-  h.state.cancelItem(id); await h.flush();
-  h.state.retryItem(id); await h.flush();
-  gate.resolve(); await h.flush();
-  assert.ok(fs.existsSync(backend.filename), 'Stale cancellation destroyed the Retry source');
-  assert.equal(backend.jobs.length, 2);
-  assert.equal(backend.jobs.filter(job => !job.finished).length, 1);
-}));
+test('retry during delayed cancellation keeps original folder files and starts one replacement worker', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    await h.state.handleFolderUpload(); await h.flush();
+    const id = backend.jobs[0].id;
+    const sourcePath = backend.jobs[0].args.path;
+    h.state.pauseItem(id); await h.flush();
+    const gate = backend.holdSave(record => record.items.some(item => item.id === id && item.status === 'cancelled'));
+    h.state.cancelItem(id); await h.flush();
+    h.state.retryItem(id); await h.flush();
+    gate.resolve(); await h.flush();
+    assert.equal(backend.jobs.length, 2);
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 1);
+    assert.equal(backend.jobs[1].args.path, sourcePath, 'Retry must keep the original file source');
+    assert.equal(backend.folderMoves.length, 0, 'Cancelled work must not be moved into Drive');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
 
 test('selected destination save failure retains a retryable download without starting transport', () => withHarness('download', { download: [] }, async (h, backend) => {
   const destination = path.join(fixtures, 'retry-destination.mkv');

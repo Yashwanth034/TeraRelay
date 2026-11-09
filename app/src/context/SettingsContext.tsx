@@ -56,8 +56,8 @@ export interface Settings {
 const defaultSettings: Settings = {
     viewMode: 'grid',
     autoUpdate: true,
-    maxConcurrentUploads: 6,
-    maxConcurrentDownloads: 6,
+    maxConcurrentUploads: 1,
+    maxConcurrentDownloads: 1,
     zipFolders: true,
     language: 'en',
 

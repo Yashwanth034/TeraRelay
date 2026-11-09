@@ -57,9 +57,11 @@ export function formatCompactTimestamp(value?: string) {
 
 // ── File type classification ────────────────────────────────────────────
 
-const VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi'] as const;
+const VIDEO_EXTENSIONS = [
+    'mp4', 'm4v', 'mov', 'mkv', 'webm', 'ogv', 'ogg', 'avi', 'wmv', 'asf', 'flv',
+    'ts', 'mts', 'm2ts', 'mpeg', 'mpg', 'mpe', 'vob', '3gp', '3g2', 'mxf', 'rm', 'rmvb', 'f4v',
+] as const;
 const AUDIO_EXTENSIONS = ['mp3', 'wav', 'aac', 'flac', 'm4a', 'opus'] as const;
-const MEDIA_EXTENSIONS: readonly string[] = [...VIDEO_EXTENSIONS, ...AUDIO_EXTENSIONS];
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif'] as const;
 const DOCUMENT_EXTENSIONS = [
     'pdf', 'doc', 'docx', 'txt', 'rtf', 'md',
@@ -74,9 +76,12 @@ const endsWithAny = (name: string, exts: readonly string[]) => {
     return exts.some(ext => lower.endsWith(ext));
 };
 
-export const isMediaFile   = (name: string) => endsWithAny(name, MEDIA_EXTENSIONS);
-export const isVideoFile   = (name: string) => endsWithAny(name, VIDEO_EXTENSIONS);
-export const isAudioFile   = (name: string) => endsWithAny(name, AUDIO_EXTENSIONS);
+export const isVideoFile = (name: string) => {
+    const lower = name.toLowerCase();
+    return VIDEO_EXTENSIONS.some(ext => lower.endsWith(`.${ext}`));
+};
+export const isAudioFile = (name: string) => endsWithAny(name, AUDIO_EXTENSIONS);
+export const isMediaFile = (name: string) => isVideoFile(name) || isAudioFile(name);
 export const isImageFile   = (name: string) => endsWithAny(name, IMAGE_EXTENSIONS);
 export const isDocumentFile = (name: string) => endsWithAny(name, DOCUMENT_EXTENSIONS);
 export const isPdfFile     = (name: string) => name.toLowerCase().endsWith('.pdf');

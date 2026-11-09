@@ -7,6 +7,7 @@ pub async fn cmd_get_enriched_folders(
     db_pool: State<'_, DbConnection>,
 ) -> Result<Vec<FolderMetadata>, String> {
     let conn = db_pool.lock().map_err(|e| e.to_string())?;
+    crate::commands::shared_channels::refresh_aliases(&conn)?;
 
     let query = "
         SELECT fm.channel_id, COALESCE(lc.name, fm.name) AS name,
@@ -15,6 +16,11 @@ pub async fn cmd_get_enriched_folders(
         FROM folder_metadata fm
         LEFT JOIN logical_channels lc ON lc.backing_channel_id = fm.channel_id
         LEFT JOIN groups g ON fm.group_id = g.id
+        LEFT JOIN shared_channel_views sv ON sv.channel_id = fm.channel_id
+        WHERE sv.channel_id IS NULL OR
+              (sv.deleted_at IS NULL AND EXISTS(
+                  SELECT 1 FROM folder_metadata parent WHERE parent.channel_id = sv.storage_channel_id
+              ))
         ORDER BY
             CASE WHEN fm.group_id IS NULL THEN 1 ELSE 0 END,
             g.display_order ASC,

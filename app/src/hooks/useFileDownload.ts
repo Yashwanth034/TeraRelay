@@ -5,11 +5,12 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { DownloadItem, TelegramFile } from '../types';
 import { isAndroidPlatform, isIOSPlatform, showFileDialogFallback, pickWithFallback, sanitizeFilename } from '../utils';
-import { useSettings } from '../context/SettingsContext';
+
 import { useFastTransferAuth } from '../context/FastTransferAuthContext';
 import { useTransferMethod } from '../context/TransferMethodContext';
 import type { Store } from '@tauri-apps/plugin-store';
-import { normalizeDownloadQueue, useRecoverableTransferQueue } from '../transferQueue';
+import { normalizeDownloadQueue, reserveBulkDownloadPath, useRecoverableTransferQueue } from '../transferQueue';
+import { nextSequentialTransfer } from '../sequentialTransferQueue';
 
 interface ProgressPayload {
     id: string;
@@ -30,7 +31,6 @@ export function useFileDownload(store: Store | null) {
     const cancelledRef = useRef<Set<string>>(new Set());
     const pausedRef = useRef<Set<string>>(new Set());
     const activeIdsRef = useRef<Set<string>>(new Set());
-    const { settings } = useSettings();
     const { ensureFastTransferReady } = useFastTransferAuth();
     const { chooseTransferMethod } = useTransferMethod();
 
@@ -51,18 +51,13 @@ export function useFileDownload(store: Store | null) {
         return () => { unlisten?.(); };
     }, []);
 
+    // Download files sequentially, with the same saved-queue and in-flight
+    // guards as uploads. Never open overlapping save dialogs or native transfers.
     useEffect(() => {
         if (!initialized || !durable) return;
-        const maxConcurrent = settings.maxConcurrentDownloads || 1;
-        const available = maxConcurrent - activeIdsRef.current.size;
-        if (available <= 0) return;
-        const pendingItems = downloadQueue
-            .filter(i => i.status === 'pending' && !activeIdsRef.current.has(i.id))
-            .slice(0, available);
-        for (const item of pendingItems) {
-            void processItem(item);
-        }
-    }, [downloadQueue, settings.maxConcurrentDownloads, initialized, durable]);
+        const next = nextSequentialTransfer(downloadQueue, activeIdsRef.current);
+        if (next) void processItem(next);
+    }, [downloadQueue, initialized, durable]);
 
     const processItem = async (item: DownloadItem) => {
         if (activeIdsRef.current.has(item.id)) return;
@@ -94,7 +89,7 @@ export function useFileDownload(store: Store | null) {
 
             if (savePath !== item.savePath) {
                 const destination = savePath;
-                setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, savePath: destination } : i));
+                setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, savePath: destination, noOverwrite: i.noOverwrite ?? false } : i));
                 // Destination must survive reopening before TDLib receives any work.
                 await persist();
             }
@@ -115,7 +110,8 @@ export function useFileDownload(store: Store | null) {
                     save_path: savePath,
                     folder_id: item.folderId,
                     transfer_id: item.id,
-                    transfer_engine: transferEngine
+                    transfer_engine: transferEngine,
+                    no_overwrite: item.noOverwrite,
                 }
             });
             completed = true;
@@ -201,6 +197,7 @@ export function useFileDownload(store: Store | null) {
                     filename,
                     folderId,
                     savePath,
+                    noOverwrite: false,
                     transferEngine,
                     status: 'pending' as const,
                 });
@@ -213,20 +210,23 @@ export function useFileDownload(store: Store | null) {
         }
 
         const enqueueFiles = (dir: string) => {
-            const separator = dir.includes('\\') ? '\\' : '/';
-            const newItems: DownloadItem[] = files.map(file => {
-                const sanitizedName = sanitizeFilename(file.name);
-                return {
-                    id: Math.random().toString(36).substr(2, 9),
-                    messageId: file.id,
-                    filename: sanitizedName,
-                    folderId,
-                    transferEngine,
-                    status: 'pending' as const,
-                    savePath: dir.endsWith(separator) ? `${dir}${sanitizedName}` : `${dir}${separator}${sanitizedName}`
-                };
+            setDownloadQueue(prev => {
+                const usedPaths = new Set(prev.flatMap(item => item.savePath ? [item.savePath.toLowerCase()] : []));
+                const newItems: DownloadItem[] = files.map(file => {
+                    const filename = sanitizeFilename(file.name);
+                    return {
+                        id: Math.random().toString(36).substr(2, 9),
+                        messageId: file.id,
+                        filename,
+                        folderId,
+                        transferEngine,
+                        status: 'pending',
+                        savePath: reserveBulkDownloadPath(dir, filename, usedPaths),
+                        noOverwrite: true,
+                    };
+                });
+                return [...prev, ...newItems];
             });
-            setDownloadQueue(prev => [...prev, ...newItems]);
             toast.info(`Queued ${files.length} files for download`);
         };
 

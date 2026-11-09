@@ -19,6 +19,9 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use walkdir::WalkDir;
 
+#[path = "tdlib_fast_diagnostics.rs"]
+mod diagnostics;
+
 const SQLCIPHER_URL: &str =
     "https://archive.ubuntu.com/ubuntu/pool/universe/s/sqlcipher/libsqlcipher1_4.5.6-1build2_amd64.deb";
 const SQLCIPHER_SHA256: &str = "30ffc3589facffbd72fc8720fb5ab7448b4dfb6e99929f0f41b4b3321f45a611";
@@ -96,10 +99,15 @@ struct NativeWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    diagnostics: diagnostics::WorkerDiagnostics,
     next_id: u64,
     auth_state: String,
     ready: bool,
     is_premium: Option<bool>,
+    account_id: Option<i64>,
+    // An IPC failure permanently invalidates this worker's stdin/stdout.
+    // Never reuse the same pipes after a native crash or broken pipe.
+    broken: bool,
 }
 
 impl Drop for NativeWorker {
@@ -143,7 +151,9 @@ impl NativeWorker {
             .arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Always drain stderr: an unread pipe can deadlock TDLib and
+            // discarding it hides the exact reason for worker termination.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to start TDLib worker: {e}"))?;
 
@@ -156,6 +166,18 @@ impl NativeWorker {
             .take()
             .ok_or_else(|| "TDLib worker stdout was unavailable".to_string())?;
         let mut stdout = BufReader::new(stdout);
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "TDLib worker stderr was unavailable".to_string())?;
+        let mut diagnostics = match diagnostics::WorkerDiagnostics::start(stderr, app_data) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
 
         let config = json!({
             "tdjson": tdjson,
@@ -166,23 +188,42 @@ impl NativeWorker {
             "api_id": api_id,
             "api_hash": api_hash,
         });
-        writeln!(stdin, "{config}")
-            .map_err(|e| format!("Failed to configure TDLib worker: {e}"))?;
-        stdin
-            .flush()
-            .map_err(|e| format!("Failed to start TDLib worker: {e}"))?;
+        if let Err(error) = writeln!(stdin, "{config}") {
+            return Err(diagnostics.failure(
+                &mut child,
+                "start",
+                "configure-stdin",
+                &error.to_string(),
+            ));
+        }
+        if let Err(error) = stdin.flush() {
+            return Err(diagnostics.failure(
+                &mut child,
+                "start",
+                "configure-flush",
+                &error.to_string(),
+            ));
+        }
 
-        let started = read_worker_line(&mut stdout)?;
+        let started = match read_worker_line(&mut stdout) {
+            Ok(started) => started,
+            Err(error) => {
+                return Err(diagnostics.failure(&mut child, "start", "started-event", &error))
+            }
+        };
         if started.get("event").and_then(Value::as_str) == Some("fatal") {
-            return Err(started
+            let reason = started
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("TDLib worker failed to start")
-                .to_string());
+                .unwrap_or("TDLib worker failed to start");
+            return Err(diagnostics.failure(&mut child, "start", "fatal-event", reason));
         }
         if started.get("event").and_then(Value::as_str) != Some("started") {
-            return Err(format!(
-                "Unexpected TDLib worker startup response: {started}"
+            return Err(diagnostics.failure(
+                &mut child,
+                "start",
+                "unexpected-event",
+                "Worker did not produce the expected startup event",
             ));
         }
 
@@ -190,11 +231,20 @@ impl NativeWorker {
             child,
             stdin,
             stdout,
+            diagnostics,
             next_id: 0,
             auth_state: "starting".into(),
             ready: false,
             is_premium: None,
+            account_id: None,
+            broken: false,
         })
+    }
+
+    /// Read the native child status while holding the single-worker mutex.
+    /// A failed worker must be retired before any subsequent preparation.
+    fn needs_restart(&mut self) -> bool {
+        self.broken || !matches!(self.child.try_wait(), Ok(None))
     }
 
     fn request<F, N>(
@@ -210,13 +260,53 @@ impl NativeWorker {
     {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
+        // Record only a fixed operation name, never JSON arguments. Auth,
+        // credentials, paths and captions must not enter diagnostic logs.
+        let action = request
+            .get("action")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "upload"
+                        | "download"
+                        | "status"
+                        | "prepare"
+                        | "clean_file_cache"
+                        | "close"
+                        | "shutdown"
+                        | "logout"
+                        | "qr_start"
+                        | "qr_wait"
+                        | "phone"
+                        | "code"
+                        | "password"
+                )
+            })
+            .unwrap_or("other")
+            .to_owned();
         request["id"] = Value::from(id);
 
-        writeln!(self.stdin, "{request}")
-            .map_err(|e| format!("TDLib worker request failed: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("TDLib worker request failed: {e}"))?;
+        if let Err(error) = writeln!(self.stdin, "{request}") {
+            self.broken = true;
+            let message = format!("TDLib worker request failed: {error}");
+            return Err(self.diagnostics.failure(
+                &mut self.child,
+                &action,
+                "stdin-write",
+                &message,
+            ));
+        }
+        if let Err(error) = self.stdin.flush() {
+            self.broken = true;
+            let message = format!("TDLib worker request failed: {error}");
+            return Err(self.diagnostics.failure(
+                &mut self.child,
+                &action,
+                "stdin-flush",
+                &message,
+            ));
+        }
 
         loop {
             if cancel_rx.map(|rx| *rx.borrow()).unwrap_or(false) {
@@ -226,15 +316,15 @@ impl NativeWorker {
 
             let response = match read_worker_line(&mut self.stdout) {
                 Ok(response) => response,
-                Err(error) if error == "TDLib worker stopped unexpectedly" => {
-                    let status = match self.child.try_wait() {
-                        Ok(Some(status)) => format!(" ({status})"),
-                        Ok(None) => " (process still running after stdout closed)".to_string(),
-                        Err(status_error) => format!(" (exit status unavailable: {status_error})"),
-                    };
-                    return Err(format!("{error}{status}"));
+                Err(error) => {
+                    self.broken = true;
+                    return Err(self.diagnostics.failure(
+                        &mut self.child,
+                        &action,
+                        "stdout-read",
+                        &error,
+                    ));
                 }
-                Err(error) => return Err(error),
             };
             let event = response.get("event").and_then(Value::as_str);
 
@@ -277,11 +367,16 @@ impl NativeWorker {
             }
 
             if response.get("ok").and_then(Value::as_bool) != Some(true) {
-                return Err(response
+                let reason = response
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("TDLib worker request failed")
-                    .to_string());
+                    .unwrap_or("TDLib worker request failed");
+                return Err(self.diagnostics.failure(
+                    &mut self.child,
+                    &action,
+                    "tdlib-result",
+                    reason,
+                ));
             }
 
             return Ok(response.get("result").cloned().unwrap_or(Value::Null));
@@ -298,6 +393,13 @@ impl NativeWorker {
             .unwrap_or(self.auth_state == "ready");
         if let Some(value) = result.get("is_premium") {
             self.is_premium = value.as_bool();
+        }
+        if let Some(value) = result.get("account_id") {
+            self.account_id = value.as_i64();
+        }
+        if !self.ready {
+            self.is_premium = None;
+            self.account_id = None;
         }
     }
 
@@ -331,6 +433,20 @@ impl NativeWorker {
                 format!("TDLib authorization state: {}", self.auth_state)
             },
         }
+    }
+}
+
+/// A confirmed dead child or broken IPC is never reused. Drops/reaps only
+/// the helper, leaving TDLib authorization, database, and transfer data intact.
+fn retire_unusable_worker(guard: &mut Option<NativeWorker>) -> bool {
+    if guard.as_mut().is_some_and(NativeWorker::needs_restart) {
+        log::warn!(
+            "TDLib helper stopped or its IPC failed; releasing worker for safe re-preparation"
+        );
+        guard.take();
+        true
+    } else {
+        false
     }
 }
 
@@ -744,17 +860,24 @@ async fn prepare_worker(
         let mut guard = worker_arc
             .lock()
             .map_err(|_| "TDLib worker lock poisoned".to_string())?;
+        // The Telegram session database stays intact. Only the crashed
+        // helper process and its dead IPC pipes are retired.
+        retire_unusable_worker(&mut guard);
         if guard.is_none() {
             *guard = Some(NativeWorker::spawn(&runtime, api_id, api_hash, &app_data)?);
         }
 
-        let worker = guard.as_mut().expect("worker initialized");
-        let result = worker.request(
+        let result = guard.as_mut().expect("worker initialized").request(
             json!({"action": "prepare", "timeout": 15}),
             |_| {},
             |_| {},
             None,
-        )?;
+        );
+        if result.is_err() {
+            retire_unusable_worker(&mut guard);
+        }
+        let result = result?;
+        let worker = guard.as_mut().expect("worker available after prepare");
         worker.update_auth_from_result(&result);
         Ok::<FastTransferStatus, String>(worker.status(true))
     })
@@ -775,21 +898,37 @@ pub async fn cmd_fast_transfer_status(
         let mut guard = worker_arc
             .lock()
             .map_err(|_| "TDLib worker lock poisoned".to_string())?;
+        retire_unusable_worker(&mut guard);
         if let Some(worker) = guard.as_mut() {
-            match worker.request(
+            let reply = worker.request(
                 json!({"action": "status", "timeout": 5}),
                 |_| {},
                 |_| {},
                 None,
-            ) {
+            );
+            // Retire only if IPC/child actually failed, not when Telegram
+            // returned an ordinary permission or rate-limit error.
+            let dead = reply.is_err() && retire_unusable_worker(&mut guard);
+            if dead {
+                return Ok(FastTransferStatus {
+                    supported: platform_supported(),
+                    runtime_installed: runtime.installed,
+                    ready: false,
+                    auth_state: "stopped".to_string(),
+                    version: None,
+                    is_premium: None,
+                    backend: "TDLib/C++".to_string(),
+                    detail: "TDLib helper stopped unexpectedly. Retry TDLib setup to safely restart the helper using your saved session.".to_string(),
+                });
+            }
+            let worker = guard.as_mut().expect("healthy TDLib worker");
+            match reply {
                 Ok(result) => {
                     worker.update_auth_from_result(&result);
                     return Ok(worker.status(runtime.installed));
                 }
                 Err(error) if is_tdlib_unauthorized(&error) => {
-                    log::warn!(
-                        "TDLib saved authorization is no longer valid; it will be relinked automatically."
-                    );
+                    log::warn!("TDLib saved authorization is no longer valid; it will be relinked automatically.");
                     worker.ready = false;
                     worker.auth_state = "unauthorized".to_string();
                     return Ok(worker.status(runtime.installed));
@@ -1243,6 +1382,9 @@ pub async fn upload_document(
             guard.take();
             return Err("Transfer cancelled".to_string());
         }
+        if result.is_err() {
+            retire_unusable_worker(&mut guard);
+        }
 
         let result = result?;
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
@@ -1347,6 +1489,9 @@ pub async fn download_documents(
         if result.as_ref().err().map(String::as_str) == Some("Transfer cancelled") {
             guard.take();
             return Err("Transfer cancelled".to_string());
+        }
+        if result.is_err() {
+            retire_unusable_worker(&mut guard);
         }
 
         let result = result?;
@@ -1525,8 +1670,40 @@ pub fn tdlib_is_ready(state: &TdlibFastState) -> bool {
         .worker
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref().map(|worker| worker.ready))
+        .and_then(|mut guard| {
+            guard
+                .as_mut()
+                .map(|worker| worker.ready && !worker.needs_restart())
+        })
         .unwrap_or(false)
+}
+
+/// Refresh the independently authenticated TDLib account immediately before
+/// choosing a Premium upload layout. This detects subscription changes without
+/// relying on a potentially stale startup capability or a different account.
+pub async fn tdlib_account_capability(state: &TdlibFastState) -> Option<(i64, bool)> {
+    let worker = state.worker.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = worker.lock().ok()?;
+        retire_unusable_worker(&mut guard);
+        let session = guard.as_mut()?;
+        if !session.ready {
+            return None;
+        }
+        let result = session
+            .request(
+                json!({"action": "status", "timeout": 4}),
+                |_| {},
+                |_| {},
+                None,
+            )
+            .ok()?;
+        session.update_auth_from_result(&result);
+        Some((session.account_id?, session.is_premium?))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub async fn create_split_temp(
@@ -1667,10 +1844,13 @@ for event in events:
             child,
             stdin,
             stdout,
+            diagnostics: diagnostics::WorkerDiagnostics::test_stub(),
             next_id: 0,
             auth_state: "ready".to_string(),
             ready: true,
             is_premium: Some(false),
+            account_id: Some(123),
+            broken: false,
         };
         let mut progress = 0;
         let mut network = 0;
@@ -1688,6 +1868,143 @@ for event in events:
         assert!(worker.ready);
         assert_eq!(worker.is_premium, Some(false));
         worker.child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aborted_native_worker_is_retired_but_saved_session_is_preserved() {
+        let dir = std::env::temp_dir().join(format!(
+            "terarelay-tdlib-recovery-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let session = dir.join("saved-tdlib-session");
+        std::fs::write(&session, b"existing session must stay intact").unwrap();
+
+        let mut child = StdCommand::new("python3")
+            .args(["-u", "-c", "import sys; sys.exit(42)"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(42));
+
+        let mut guard = Some(NativeWorker {
+            child,
+            stdin,
+            stdout,
+            diagnostics: diagnostics::WorkerDiagnostics::test_stub(),
+            next_id: 0,
+            auth_state: "ready".into(),
+            ready: true,
+            is_premium: None,
+            account_id: None,
+            broken: false,
+        });
+        assert!(retire_unusable_worker(&mut guard));
+        assert!(guard.is_none(), "crashed worker must not be reused");
+        assert_eq!(
+            std::fs::read(&session).unwrap(),
+            b"existing session must stay intact"
+        );
+
+        let mut second = StdCommand::new("python3")
+            .args(["-u", "-c", "import time; time.sleep(60)"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = second.stdin.take().unwrap();
+        let stdout = BufReader::new(second.stdout.take().unwrap());
+        let mut guard = Some(NativeWorker {
+            child: second,
+            stdin,
+            stdout,
+            diagnostics: diagnostics::WorkerDiagnostics::test_stub(),
+            next_id: 0,
+            auth_state: "ready".into(),
+            ready: true,
+            is_premium: None,
+            account_id: None,
+            broken: false,
+        });
+        assert!(
+            !retire_unusable_worker(&mut guard),
+            "live worker must not restart"
+        );
+        assert!(guard.is_some());
+        guard.as_mut().unwrap().broken = true;
+        assert!(
+            retire_unusable_worker(&mut guard),
+            "broken IPC is invalid even before process exit"
+        );
+        assert!(guard.is_none());
+        assert_eq!(
+            std::fs::read(&session).unwrap(),
+            b"existing session must stay intact"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dead_tdlib_worker_records_exit_and_stderr_without_request_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "terarelay-dead-tdlib-fixture-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let script = "import sys\nprint('TDLIB_SIMULATED_FATAL', file=sys.stderr, flush=True)\nsys.exit(77)\n";
+        let mut child = StdCommand::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let diagnostics =
+            diagnostics::WorkerDiagnostics::start(child.stderr.take().unwrap(), &dir).unwrap();
+        // Verify a dead child rather than relying on scheduler timing.
+        assert_eq!(child.wait().unwrap().code(), Some(77));
+        let mut worker = NativeWorker {
+            child,
+            stdin,
+            stdout,
+            diagnostics,
+            next_id: 0,
+            auth_state: "ready".into(),
+            ready: true,
+            is_premium: Some(true),
+            account_id: None,
+            broken: false,
+        };
+        let error = worker
+            .request(
+                json!({"action": "upload", "api_hash": "NEVER_LOG_SECRET",
+                "caption": "NEVER_LOG_CAPTION"}),
+                |_| {},
+                |_| {},
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("diagnostic saved to"), "{error}");
+        let diagnostic = std::fs::read_to_string(dir.join("tdlib-worker-diagnostics.log")).unwrap();
+        assert!(diagnostic.contains("action: upload"));
+        assert!(
+            diagnostic.contains("exit status: 77")
+                || diagnostic.contains("exited with exit status: 77")
+        );
+        assert!(diagnostic.contains("TDLIB_SIMULATED_FATAL"));
+        assert!(!diagnostic.contains("NEVER_LOG_SECRET"));
+        assert!(!diagnostic.contains("NEVER_LOG_CAPTION"));
+        drop(worker);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1773,10 +2090,13 @@ time.sleep(60)
             child,
             stdin,
             stdout,
+            diagnostics: diagnostics::WorkerDiagnostics::test_stub(),
             next_id: 0,
             auth_state: "ready".into(),
             ready: true,
             is_premium: None,
+            account_id: None,
+            broken: false,
         };
         let mut guard = Some(worker);
         assert!(request_cache_cleanup(&mut guard).is_err());

@@ -226,6 +226,9 @@ pub struct UploadCheckpoint {
     pub source: SourceIdentity,
     pub part_size: u64,
     pub logical_file_id: Option<String>,
+    /// Telegram account that first created this checkpoint. Legacy saves omit it.
+    #[serde(default)]
+    pub account_id: Option<i64>,
     /// Bound to the transfer ID on first upload. Older checkpoints omit this;
     /// their verified chunks can still resume with the name chosen at reopen.
     #[serde(default)]
@@ -287,6 +290,57 @@ fn save_chunk(conn: &sqlite::Connection, key: &str, chunk: &ManifestChunkV1) -> 
 }
 
 impl UploadJournal {
+    /// Read the original transfer layout before planning new parts. A Premium
+    /// upgrade/downgrade must never reinterpret an already saved upload.
+    pub fn saved_part_size(
+        db: &DbConnection,
+        path: &str,
+        transfer_id: &str,
+        folder_id: Option<i64>,
+    ) -> Result<Option<u64>, String> {
+        if transfer_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let identity =
+            serde_json::to_vec(&(transfer_id, path, folder_id)).map_err(|e| e.to_string())?;
+        let key = format!("{:x}", Sha256::digest(&identity));
+        let conn = db.lock().map_err(|_| "DB poisoned".to_string())?;
+        journal_tables(&conn)?;
+        let mut query = conn
+            .prepare("SELECT state FROM upload_checkpoints WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        query.bind((1, key.as_str())).map_err(|e| e.to_string())?;
+        if query.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+            return Ok(None);
+        }
+        let serialized = query.read::<String, _>(0).map_err(|e| e.to_string())?;
+        let checkpoint: UploadCheckpoint = serde_json::from_str(&serialized)
+            .map_err(|e| format!("Invalid saved upload checkpoint: {e}"))?;
+        if checkpoint.schema_version != 1 || checkpoint.part_size == 0 {
+            return Err("Saved upload has an invalid part layout".to_string());
+        }
+        Ok(Some(checkpoint.part_size))
+    }
+
+    /// Bind new uploads to the authenticated Telegram account. Keep legacy
+    /// checkpoints readable, but never reuse a newly recorded checkpoint
+    /// with a different account.
+    pub fn bind_account(&mut self, account_id: i64) -> Result<(), String> {
+        if self
+            .snapshot
+            .account_id
+            .is_some_and(|saved| saved != account_id)
+        {
+            return Err("This upload belongs to another Telegram account. Sign in to the original account or start a new upload.".to_string());
+        }
+        if self.snapshot.account_id.is_none() {
+            self.snapshot.account_id = Some(account_id);
+            let conn = self.db.lock().map_err(|_| "DB poisoned".to_string())?;
+            save_checkpoint(&conn, &self.key, &self.snapshot)?;
+        }
+        Ok(())
+    }
+
     pub async fn open(
         db: DbConnection,
         path: &str,
@@ -316,6 +370,7 @@ impl UploadJournal {
             source: source.clone(),
             part_size,
             logical_file_id: file_id,
+            account_id: None,
             display_name: Some(display_name.to_owned()),
             created_at: Some(chrono::Utc::now().timestamp()),
             chunks: BTreeMap::new(),
@@ -564,6 +619,69 @@ mod tests {
             .unwrap_err()
             .contains("Upload source changed"));
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn premium_checkpoint_preserves_part_size_and_account_identity() {
+        let dir = scratch();
+        let path = dir.join("premium.bin");
+        std::fs::write(&path, b"test source").unwrap();
+        let path_str = path.to_str().unwrap();
+        let db = Arc::new(Mutex::new(sqlite::open(":memory:").unwrap()));
+        assert!(
+            UploadJournal::saved_part_size(&db, path_str, "t1", Some(42))
+                .unwrap()
+                .is_none()
+        );
+        {
+            let mut journal = UploadJournal::open(
+                db.clone(),
+                path_str,
+                "t1",
+                Some(42),
+                4_000_000_000,
+                None,
+                "premium.bin",
+            )
+            .await
+            .unwrap();
+            journal.bind_account(123).unwrap();
+            assert!(journal
+                .bind_account(456)
+                .unwrap_err()
+                .contains("another Telegram account"));
+        }
+        assert_eq!(
+            UploadJournal::saved_part_size(&db, path_str, "t1", Some(42)).unwrap(),
+            Some(4_000_000_000),
+        );
+        let mut reopened = UploadJournal::open(
+            db.clone(),
+            path_str,
+            "t1",
+            Some(42),
+            4_000_000_000,
+            None,
+            "premium.bin",
+        )
+        .await
+        .unwrap();
+        assert!(reopened.bind_account(456).is_err());
+        reopened.bind_account(123).unwrap();
+        assert!(UploadJournal::open(
+            db,
+            path_str,
+            "t1",
+            Some(42),
+            2_000_000_000,
+            None,
+            "premium.bin",
+        )
+        .await
+        .err()
+        .unwrap()
+        .contains("part layout changed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

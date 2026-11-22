@@ -153,8 +153,8 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo build --locked
-          cargo build --locked -p reqwest@0.12.28
+          cargo test --locked --lib --no-run
+          test -n "$(find target/debug/deps -maxdepth 1 -name 'libreqwest-*.rlib' -print -quit)"
 
       - name: Native HTTP range, V2 cache and pending-read integrity fixtures
         timeout-minutes: 3

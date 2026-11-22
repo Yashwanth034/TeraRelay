@@ -4,6 +4,22 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-22
+
+### Drive, uploads, and transfer reliability
+- Stabilize Drive metadata synchronization across uploads, retries, and delayed results so older snapshots cannot overwrite verified newer state.
+- Improve folder upload presentation with compact grouped collections, per-file progress and controls, and scrollable expanded contents.
+- Keep transfer queue progress truthful and responsive when throughput updates are temporarily unavailable.
+- Harden Device Continuity cancellation, startup reconciliation, and recovery so stale asynchronous results cannot alter a newer login or mount.
+
+### Linux-only release
+- Publish Linux x86_64 desktop packages only. Windows, macOS, Android, and iOS builds and installers remain withheld.
+- Upgrade the locked `actix-http`, `quinn-proto`, `quinn-udp`, and `rustix` dependencies to patched releases; retain strict RustSec and npm security gates.
+
+### Validation
+- Extend focused UI and transfer-recovery regressions for folder uploads, Drive metadata races, queue recovery, and Device Continuity cancellation.
+- Run the Linux frontend, native Rust, package, and security checks before publishing.
+
 ## [0.2.4] - 2026-11-09
 
 ### Folder uploads and channel organization

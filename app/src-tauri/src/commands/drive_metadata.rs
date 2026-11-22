@@ -2751,14 +2751,7 @@ fn find_or_create_folder_upload_directory(
 ) -> Result<DriveDirectoryRecord, String> {
     match find_active_child_directory(conn, parent_id, name)? {
         Some(existing) => {
-            ensure_name_available(
-                conn,
-                Some(parent_id),
-                name,
-                Some(&existing.id),
-                None,
-                None,
-            )?;
+            ensure_name_available(conn, Some(parent_id), name, Some(&existing.id), None, None)?;
             Ok(existing)
         }
         None => {
@@ -2837,8 +2830,7 @@ pub fn cmd_drive_prepare_folder_upload(
                     parent_id = existing_id.clone();
                     continue;
                 }
-                let child =
-                    find_or_create_folder_upload_directory(&conn, &parent_id, &component)?;
+                let child = find_or_create_folder_upload_directory(&conn, &parent_id, &component)?;
                 parent_id = child.id.clone();
                 resolved.insert(prefix.clone(), parent_id.clone());
                 result.push(DriveUploadDirectory {

@@ -1190,7 +1190,9 @@ test('Feature A version upload remains independent from Feature B chooser', () =
 if (process.argv.includes('--fixture')) {
   const layoutFile = process.env.TERA_QA_LAYOUT_SOURCE || 'app/src/components/desktop/DesktopDashboard.tsx';
   const source = fs.readFileSync(path.join(root, layoutFile), 'utf8');
-  const dockClass = source.slice(source.indexOf('{(uploadQueue.length > 0')).match(/className="([^"]+)"/)[1];
+  const dockClassMatch = source.match(/<div ref={transferDockRef} className="([^"]+)"/);
+  assert.ok(dockClassMatch, 'Transfer dock layout was not found');
+  const dockClass = dockClassMatch[1];
   const { ChannelFeed } = load(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'));
   const { UploadQueue } = load(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'));
   const noop = () => {};

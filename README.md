@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/Yashwanth034/TeraRelay/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Yashwanth034/TeraRelay?display_name=tag"></a>
-  <a href="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml"><img alt="Cross-platform CI" src="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml"><img alt="Linux CI" src="https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: proprietary" src="https://img.shields.io/badge/license-proprietary-red"></a>
 </p>
 
@@ -97,15 +97,17 @@ Beyond basic folders, the desktop app includes tools for organizing and checking
 
 Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/latest) for distribution limits.
 
-## What's improved in v0.2.4
+## What's improved in v0.2.5
 
-- **Folder uploads:** clearer per-file episode rows, ordered queue processing, and folder grouping in the channel timeline.
-- **Folder management:** nested Drive folder inventory and a whole-folder delete action, including empty folders.
-- **Drive reliability:** stronger channel-scoped identity, shared-channel handling, metadata/read-lifetime recovery, and transfer-queue regression coverage.
-- **Video playback:** improved progressive HLS/fMP4 cleanup and seeking, plus an in-player **Open with** option for installed VLC or mpv.
-- **Linux-only distribution:** this public release provides Linux x86_64 desktop packages. Windows, macOS, Android, and iOS installers are not part of this release.
+- **Drive sync reliability:** prevent stale metadata responses from overwriting newer verified upload state; improve retry and recovery behavior.
+- **Folder uploads:** clearer grouped upload collections, per-file progress and controls, and scrollable expanded folder contents.
+- **Transfer queues:** show accurate progress and keep queue actions usable during slow or missing throughput updates.
+- **Device Continuity:** harden cancellation and reconciliation so delayed work cannot mutate a newer account session.
+- **Linux-only distribution:** v0.2.5 provides Linux x86_64 desktop packages. Windows, macOS, Android, and iOS builds and installers are withheld.
 
-Older release notes belong in the [full changelog](CHANGELOG.md) rather than repeating entire past versions in this README.
+Earlier release notes are in the [full changelog](CHANGELOG.md).
+
+
 
 
 ## Practical limits and security
@@ -151,7 +153,7 @@ cd ../..
 bash scripts/check-source.sh
 ```
 
-The cross-platform CI workflow builds and tests Linux, Windows, macOS, Android ARM64, and the iOS simulator. Production release builds also enforce dependency audits and updater signing; automated validation is not a substitute for testing every device. [See CI](https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml).
+The CI and public release workflows build and test Linux x86_64 only. Windows, macOS, Android, and iOS jobs are disabled; no installers for those platforms are produced. Release builds enforce dependency audits and updater signing. Automated validation is not a substitute for testing every physical device. [See CI](https://github.com/Yashwanth034/TeraRelay/actions/workflows/ci.yml).
 
 ## Documentation and support
 

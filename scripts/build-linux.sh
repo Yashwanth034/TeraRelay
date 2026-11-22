@@ -20,4 +20,4 @@ fi
 
 cd "$ROOT/app"
 npm ci
-npm run tauri build
+npm run tauri -- build --config src-tauri/tauri.linux.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles deb

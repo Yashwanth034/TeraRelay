@@ -5,6 +5,16 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('../app/node_modules/typescript');
 
+const channelFolderTreeModule = { exports: {} };
+const channelFolderTreeSource = fs.readFileSync(path.join(__dirname, '../app/src/channelFolderTree.ts'), 'utf8');
+vm.runInNewContext(ts.transpileModule(channelFolderTreeSource, {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, {
+  module: channelFolderTreeModule,
+  exports: channelFolderTreeModule.exports,
+});
+const channelFolderTree = channelFolderTreeModule.exports;
+
 // No DOM test runner is installed. Run the real components and handlers against
 // a small lifecycle/geometry adapter; UI integration is verified separately.
 function mount(name, imports = {}) {
@@ -77,6 +87,7 @@ function mount(name, imports = {}) {
     '../../../context/SettingsContext': { useSettings: () => ({ settings: { language: 'en' } }) },
     '../../../utils': { displayFileName: value => value, formatBytes: String, isMediaFile: () => false, isPdfFile: () => false },
     '../../../filePresentation': { getPremiumFileTitle: file => file.name, getPremiumFileMeta: () => 'File' },
+    '../../../channelFolderTree': channelFolderTree,
     '../../../hooks/useVideoMetadata': { useVideoMetadata: () => ({ data: null, isLoading: false }) },
     '../../../hooks/useCachedVariants': { useCachedVariants: () => ({ data: [] }) },
     sonner: { toast: { success() {}, error() {} } }, ...imports,

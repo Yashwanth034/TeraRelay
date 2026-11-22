@@ -1849,9 +1849,11 @@ mod desktop {
     /// immutable cache window. Different windows can still fetch in parallel.
     /// A weak registry avoids retaining one mutex for every block of a 40 GiB
     /// movie after the players close.
+    type DriveRemoteBlockGateRegistry = HashMap<(String, u64), std::sync::Weak<Mutex<()>>>;
+
     #[derive(Default)]
     struct DriveRemoteBlockGates {
-        gates: Mutex<HashMap<(String, u64), std::sync::Weak<Mutex<()>>>>,
+        gates: Mutex<DriveRemoteBlockGateRegistry>,
     }
 
     impl DriveRemoteBlockGates {

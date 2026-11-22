@@ -291,6 +291,10 @@ pub async fn run_fmp4_remux(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "FFmpeg input, seek, cancellation, and progress controls remain explicit per run"
+)]
 async fn run_fmp4_remux_at(
     ffmpeg_path: &Path,
     input_path: &Path,
@@ -775,6 +779,10 @@ fn cached_window_key(root: &Path, stem: &str) -> Option<String> {
 }
 
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes each stream request input and managed state as a separate IPC parameter"
+)]
 pub async fn cmd_prepare_fmp4_stream(
     message_id: i32,
     folder_id: Option<i64>,

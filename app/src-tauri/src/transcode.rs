@@ -856,6 +856,10 @@ async fn transfer_transcode_source(
 }
 
 /// Run FFmpeg to generate a single HLS variant.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The transcoder receives source, quality, cancellation, and progress controls independently"
+)]
 pub async fn run_transcode(
     ffmpeg_path: &Path,
     input_path: &Path,
@@ -1372,6 +1376,10 @@ pub async fn cmd_end_stream_session(
 }
 
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri exposes each stream request input and managed state as a separate IPC parameter"
+)]
 pub async fn cmd_prepare_transcoded_stream(
     message_id: i32,
     folder_id: Option<i64>,
@@ -2687,11 +2695,11 @@ mod playback_manager_tests {
         std::fs::write(external.join("720p/precious"), b"do not touch").unwrap();
         symlink(&external, root.join("hls/12_34")).unwrap();
         std::fs::create_dir_all(root.join("hls/55_66")).unwrap();
-        symlink(&external.join("720p"), root.join("hls/55_66/720p")).unwrap();
+        symlink(external.join("720p"), root.join("hls/55_66/720p")).unwrap();
         std::fs::write(root.join("originals/12_34.mp4.part"), b"temporary").unwrap();
         std::fs::write(root.join("originals/unknown-file.mp4.part"), b"user data").unwrap();
         symlink(
-            &external.join("720p/precious"),
+            external.join("720p/precious"),
             root.join("originals/55_66.mp4.part"),
         )
         .unwrap();

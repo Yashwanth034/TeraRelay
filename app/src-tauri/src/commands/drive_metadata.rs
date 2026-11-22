@@ -1544,6 +1544,9 @@ pub(crate) fn publish_completed_upload_to_drive(
     crate::drive_posix::finish_savepoint(conn, "drive_completed_upload_publish", result)
 }
 
+/// Snapshot returned after moving an imported file between shared channels.
+pub(crate) type SharedChannelMoveSnapshot = (String, String, String, String, String);
+
 /// Keep the default imported Drive folder aligned when a TeraRelay file
 /// changes its owning logical channel without moving Telegram chunks.
 /// User-organized files in custom Drive folders are intentionally left alone.
@@ -1552,7 +1555,7 @@ pub(crate) fn reflect_shared_channel_move_in_drive(
     file_id: &str,
     old_logical_id: &str,
     new_logical_id: &str,
-) -> Result<Option<(String, String, String, String, String)>, String> {
+) -> Result<Option<SharedChannelMoveSnapshot>, String> {
     ensure_imported_layout_scoped(conn, Some(file_id))?;
     let old_dir = imported_directory_id(old_logical_id);
     let new_dir = imported_directory_id(new_logical_id);

@@ -9932,9 +9932,8 @@ mod split_tests {
             SPLIT_PART_SIZE
         );
         assert_eq!(PREMIUM_SPLIT_PART_SIZE.div_ceil(512 * 1024), 7630);
-        assert_eq!(
-            PREMIUM_SPLIT_PART_SIZE.div_ceil(512 * 1024) * 512 * 1024 >= PREMIUM_SPLIT_PART_SIZE,
-            true
+        assert!(
+            PREMIUM_SPLIT_PART_SIZE.div_ceil(512 * 1024) * 512 * 1024 >= PREMIUM_SPLIT_PART_SIZE
         );
         assert_eq!(4_000_000_001u64.div_ceil(PREMIUM_SPLIT_PART_SIZE), 2);
         assert_eq!(8_000_000_001u64.div_ceil(PREMIUM_SPLIT_PART_SIZE), 3);

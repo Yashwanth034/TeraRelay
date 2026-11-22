@@ -24,8 +24,8 @@ function missingContracts(markup, header) {
     ['proxy port', /aria-label=\{t\('common\.port'\)\}\s+value=\{settings\.proxyPort\}/],
     ['proxy username', /aria-label=\{t\('common\.username'\)\}\s+value=\{settings\.proxyUsername\}/],
     ['proxy password', /aria-label=\{t\('common\.password'\)\}\s+value=\{settings\.proxyPassword\}/],
-    ['upload decrement', /updateSetting\('maxConcurrentUploads',[^\n]+\n\s+aria-label=/],
-    ['download increment', /updateSetting\('maxConcurrentDownloads',[^\n]+\n\s+aria-label=/],
+    ['sequential uploads', /Files upload in the order queued, one after another\./],
+    ['sequential downloads', /Files download in the order queued, one after another\./],
   ]);
   const missing = [...checks].filter(([, re]) => !re.test(markup)).map(([key]) => key);
   if (!header.includes('channelMode && onChannelInfo ? (') ||

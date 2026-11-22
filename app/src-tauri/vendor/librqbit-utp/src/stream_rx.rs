@@ -320,7 +320,7 @@ impl UserRx {
             shared: shared.clone(),
             is_eof: false,
         };
-        let ooq_capacity = max_rx_bytes.get() / max_incoming_payload.get();
+        let ooq_capacity = max_rx_bytes.get() / max_incoming_payload;
         let out_of_order_queue = OutOfOrderQueue::new(
             NonZeroUsize::new(ooq_capacity).unwrap_or_else(|| NonZeroUsize::new(64).unwrap()),
         );

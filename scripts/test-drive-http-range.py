@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the production Drive HTTP range reader against a real loopback HTTP fixture."""
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 root = Path(__file__).resolve().parent.parent
@@ -14,12 +15,24 @@ helper = source[
     source.index("    fn fetch_verified_loopback_range("):
     source.index("    #[cfg(all(test, target_os = \"linux\"))]\n    mod drive_large_range_retry_tests")
 ]
-deps = root / "app/src-tauri/target/debug/deps"
+cargo_root = root / "app/src-tauri"
+metadata = subprocess.run(
+    ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+    cwd=cargo_root,
+    capture_output=True,
+    check=True,
+    text=True,
+)
+target = Path(json.loads(metadata.stdout)["target_directory"])
 externs = []
+dependency_dirs = set()
 for name in ["reqwest", "urlencoding", "log"]:
-    found = sorted(deps.glob("lib" + name + "-*.rlib"), key=lambda p: p.stat().st_mtime, reverse=True)
-    assert found, f"Compile development Rust tests before this check (missing {name} artifact in {deps})"
+    found = sorted(target.rglob("lib" + name + "-*.rlib"), key=lambda p: p.stat().st_mtime, reverse=True)
+    assert found, f"Compile Linux Rust test dependencies before this check (missing {name} rlib below {target})"
+    dependency_dirs.add(found[0].parent)
     externs += ["--extern", name + "=" + str(found[0])]
+for directory in sorted(dependency_dirs):
+    externs += ["-L", "dependency=" + str(directory)]
 rust = r"""
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -108,5 +121,5 @@ with tempfile.TemporaryDirectory(prefix="tr-drive-http-") as directory:
     test = Path(directory) / "range.rs"
     binary = Path(directory) / "range-test"
     test.write_text(rust)
-    subprocess.run(["rustc", "--edition=2021", "--test", str(test), "-L", "dependency=" + str(deps), *externs, "-o", str(binary)], check=True)
+    subprocess.run(["rustc", "--edition=2021", "--test", str(test), *externs, "-o", str(binary)], check=True)
     subprocess.run([str(binary), "--test-threads=1"], check=True)

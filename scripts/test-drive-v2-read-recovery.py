@@ -4,6 +4,7 @@ Metadata and app/key access are fixture boundaries; no live Telegram, UI or
 encrypted-read claims are made by this test.
 """
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 root=Path(__file__).resolve().parent.parent
@@ -24,12 +25,20 @@ helpers = "\n".join(source[source.index(start):source.index(end, source.index(st
 a=source.index("        fn fetch_v2_plain_crypto_chunk(")
 b=source.index("        fn fetch_remote_block(",a)
 method=source[a:b]
-deps=root/"app/src-tauri/target/debug/deps"
+cargo_root=root/"app/src-tauri"
+metadata=subprocess.run(["cargo","metadata","--locked","--format-version","1","--no-deps"],cwd=cargo_root,capture_output=True,check=True,text=True)
+target=Path(json.loads(metadata.stdout)["target_directory"])
+deps=target
 externs=[]
+dependency_dirs=set()
 for name in ["reqwest","urlencoding","sha2","libc","rand","log"]:
-    paths=sorted(deps.glob("lib"+name+"-*.rlib"),key=lambda p:p.stat().st_mtime,reverse=True)
-    assert paths,"Compile development Rust tests first"
+    paths=sorted(target.rglob("lib"+name+"-*.rlib"),key=lambda p:p.stat().st_mtime,reverse=True)
+    assert paths,f"Compile Linux Rust test dependencies first (missing {name} rlib below {target})"
+    dependency_dirs.add(paths[0].parent)
     externs+=["--extern",name+"="+str(paths[0])]
+dependency_dirs.update(path.parent for pattern in ("lib*.rlib","lib*.so") for path in target.rglob(pattern))
+for directory in sorted(dependency_dirs):
+    externs+=["-L","dependency="+str(directory)]
 rust = ('#[path = "' + str(root / 'app/src-tauri/src/cache_directory.rs')
         + '"] mod cache_directory;\n') + r'''
 use std::path::{Path,PathBuf};

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs only inside the test-only GitHub Actions xvfb-run + dbus-run-session
+# Runs only inside the test-only GitHub Actions dbus-run-session + xvfb-run
 # environment. No installed TeraRelay app, login session, or user profile.
 set -euo pipefail
 
@@ -13,8 +13,12 @@ command -v wmctrl
 command -v xdotool
 command -v fusermount3
 
+display="${DISPLAY:?BLOCKED: no isolated X11 display}"
+xdpyinfo -display "$display" >/dev/null || { echo "BLOCKED: isolated X11 display is not accepting connections ($display)"; exit 2; }
+echo "PASS isolated X11 display ready: $display"
+
 mkdir -p terarelay-ci-fixtures
-openbox > terarelay-ci-fixtures/ci-native-window-manager.log 2>&1 &
+DISPLAY="$display" openbox --sm-disable > terarelay-ci-fixtures/ci-native-window-manager.log 2>&1 &
 wm_pid=$!
 cleanup() {
   local original=$?

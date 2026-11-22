@@ -31,7 +31,7 @@ for name in ["reqwest", "urlencoding", "log"]:
     assert found, f"Compile Linux Rust test dependencies before this check (missing {name} rlib below {target})"
     dependency_dirs.add(found[0].parent)
     externs += ["--extern", name + "=" + str(found[0])]
-dependency_dirs.update(path.parent for path in target.rglob("lib*.rlib"))
+dependency_dirs.update(path.parent for pattern in ("lib*.rlib", "lib*.so") for path in target.rglob(pattern))
 for directory in sorted(dependency_dirs):
     externs += ["-L", "dependency=" + str(directory)]
 rust = r"""

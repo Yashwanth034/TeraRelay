@@ -75,6 +75,7 @@ function harness(pauseCommand = '', pauseIndex = 1, isMobile = true, overrides =
       if (name === 'react') return fakeReact;
       if (name === '@tauri-apps/api/core') return { invoke };
       if (name === '../driveMountStatus') return mountStatusExports;
+      if (name === '../driveSyncSignal') return { publishVerifiedDriveSync: () => true };
       if (name === '../deviceContinuity') return {
         ...helperExports,
         classifyDeviceContinuity: () => ({

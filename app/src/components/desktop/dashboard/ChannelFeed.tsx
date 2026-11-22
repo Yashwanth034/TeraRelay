@@ -53,6 +53,7 @@ interface ChannelFeedProps {
     activeFolderId: number;
     readOnly?: boolean;
     hasTransferPanel?: boolean;
+    transferPanelHeight?: number;
 }
 
 function parseTelegramDate(value?: string) {
@@ -120,6 +121,7 @@ export function ChannelFeed({
     activeFolderId,
     readOnly = false,
     hasTransferPanel = false,
+    transferPanelHeight = 0,
 }: ChannelFeedProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [collapsedStackIds, setCollapsedStackIds] = useState<Set<string>>(() => new Set());
@@ -249,7 +251,7 @@ export function ChannelFeed({
                 className="tr-channel-scroll tr-native-scroll custom-scrollbar flex-1 overflow-y-auto px-4 py-3"
                 tabIndex={0}
                 aria-label="Channel files"
-                style={{ paddingBottom: hasTransferPanel ? 88 : undefined }}
+                style={{ paddingBottom: hasTransferPanel ? Math.max(88, transferPanelHeight + 96 + 16) : undefined }}
                 onScroll={(event) => {
                     const scroller = event.currentTarget;
                     scrollState.current.followNewest = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;

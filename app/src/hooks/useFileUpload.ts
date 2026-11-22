@@ -92,14 +92,14 @@ export function useFileUpload(
     const activeIdsRef = useRef<Set<string>>(new Set());
     const driveSyncNoticeRef = useRef({ latestRequest: 0, warningShown: false, mounted: true });
     const driveSyncRetryInFlightRef = useRef(false);
+    const driveSyncRequestsRef = useRef({ pending: false, running: false, manualRetry: false });
+    const syncedFolderGroupsRef = useRef(new Set<string>());
     const [driveSyncWarning, setDriveSyncWarning] = useState<string | null>(null);
     const [driveSyncRetryBusy, setDriveSyncRetryBusy] = useState(false);
     useEffect(() => {
         driveSyncNoticeRef.current.mounted = true;
         const unsubscribe = subscribeToVerifiedDriveSync(() => {
             if (!driveSyncNoticeRef.current.mounted) return;
-            // A clean status verified by the toolbar supersedes delayed
-            // older upload sync responses, even if they fail afterward.
             ++driveSyncNoticeRef.current.latestRequest;
             driveSyncNoticeRef.current.warningShown = false;
             setDriveSyncWarning(null);
@@ -109,52 +109,156 @@ export function useFileUpload(
             unsubscribe();
         };
     }, []);
-    // A local Drive finalize is durable before metadata publication reaches
-    // Telegram. Only the latest verified sync result can clear a warning;
-    // failed, dirty and QA-local responses must never appear cloud-synced.
+
+    // Folder uploads move files into the Drive index one episode at a time.
+    // Publishing metadata while those moves are still running can only be
+    // invalidated by the next episode, so every caller is parked until the
+    // whole group is terminal.
+    const hasUnsettledFolderUpload = () => queueRef.current.some(item =>
+        item.uploadGroupId && !['success', 'error', 'cancelled'].includes(item.status)
+    );
+    const hideDriveSyncWarning = () => {
+        driveSyncNoticeRef.current.warningShown = false;
+        setDriveSyncWarning(null);
+    };
+
+    // Coalesce repeated callers into one serial sync worker. A stale-snapshot
+    // rejection is retried with backoff; concurrent requests never race one
+    // another or overwrite newer local Drive metadata.
     const requestDriveMetadataPublication = (manualRetry = false) => {
-        // The toolbar notification survives completed upload-queue removal,
-        // but an explicit Retry must never dispatch overlapping native syncs.
         if (manualRetry) {
             if (driveSyncRetryInFlightRef.current) return;
             driveSyncRetryInFlightRef.current = true;
             setDriveSyncRetryBusy(true);
         }
-        const request = ++driveSyncNoticeRef.current.latestRequest;
-        void invoke<unknown>('cmd_drive_sync_metadata').then(raw => {
-            const result = validateDriveSyncResult(raw);
-            const notice = driveSyncNoticeRef.current;
-            if (!notice.mounted || request !== notice.latestRequest) return;
-            if (!result.dirty && result.source !== 'qa-local') {
-                notice.warningShown = false;
-                setDriveSyncWarning(null);
-                if (manualRetry) toast.success('Drive metadata synchronization verified.');
-                return;
+        const requests = driveSyncRequestsRef.current;
+        requests.pending = true;
+        requests.manualRetry ||= manualRetry;
+        if (requests.running) return;
+        if (hasUnsettledFolderUpload()) {
+            // An expected dirty index is not a warning while uploads are
+            // still moving files; the settle effect below publishes once.
+            hideDriveSyncWarning();
+            return;
+        }
+        requests.running = true;
+
+        void (async () => {
+            let staleSnapshotRetries = 0;
+            try {
+                while (requests.pending) {
+                    requests.pending = false;
+                    const isManualRetry = requests.manualRetry;
+                    requests.manualRetry = false;
+                    const request = ++driveSyncNoticeRef.current.latestRequest;
+                    try {
+                        const raw = await invoke<unknown>('cmd_drive_sync_metadata');
+                        const result = validateDriveSyncResult(raw);
+                        if (requests.pending) continue;
+                        const notice = driveSyncNoticeRef.current;
+                        if (!notice.mounted || request !== notice.latestRequest) continue;
+                        if (!result.dirty && result.source !== 'qa-local') {
+                            notice.warningShown = false;
+                            setDriveSyncWarning(null);
+                            if (isManualRetry) toast.success('Drive metadata synchronization verified.');
+                            continue;
+                        }
+                        if (hasUnsettledFolderUpload()) {
+                            requests.pending = true;
+                            requests.manualRetry ||= isManualRetry;
+                            break;
+                        }
+                        const warning = result.source === 'qa-local'
+                            ? 'Drive files are saved locally in QA mode; Telegram metadata is not synchronized.'
+                            : 'Drive files are saved locally, but metadata is still waiting for Telegram sync.';
+                        setDriveSyncWarning(warning);
+                        if (!notice.warningShown) {
+                            notice.warningShown = true;
+                            toast.warning(warning + ' Use Sync on the Drive toolbar.');
+                        }
+                    } catch (error) {
+                        if (requests.pending) continue;
+                        const notice = driveSyncNoticeRef.current;
+                        if (!notice.mounted || request !== notice.latestRequest) continue;
+                        const message = (error instanceof Error ? error.message : String(error))
+                            .replace(/\s+/g, ' ').trim();
+                        const staleSnapshot = message.includes('Drive metadata changed during sync');
+                        if (hasUnsettledFolderUpload()) {
+                            // The folder changed the manifest while Telegram
+                            // I/O was running. Park the request; the settle
+                            // effect republishes the final snapshot.
+                            requests.pending = true;
+                            requests.manualRetry ||= isManualRetry;
+                            break;
+                        }
+                        if (staleSnapshot && staleSnapshotRetries < 4) {
+                            staleSnapshotRetries += 1;
+                            requests.pending = true;
+                            requests.manualRetry ||= isManualRetry;
+                            await new Promise<void>(resolve => window.setTimeout(
+                                resolve,
+                                Math.min(3200, 400 * 2 ** (staleSnapshotRetries - 1)),
+                            ));
+                            continue;
+                        }
+                        const detail = message.length > 240 ? `${message.slice(0, 237)}…` : (message || 'unknown error');
+                        console.warn('[Drive] Metadata synchronization failed:', error);
+                        const warning = 'Drive files are saved locally, but Telegram metadata synchronization is unverified: ' + detail;
+                        setDriveSyncWarning(warning);
+                        if (!notice.warningShown) {
+                            notice.warningShown = true;
+                            toast.warning(warning + ' Retry Sync on the Drive toolbar.');
+                        }
+                    }
+                }
+            } finally {
+                requests.running = false;
+                if (driveSyncRetryInFlightRef.current) {
+                    driveSyncRetryInFlightRef.current = false;
+                    if (driveSyncNoticeRef.current.mounted) setDriveSyncRetryBusy(false);
+                }
+                if (requests.pending && !hasUnsettledFolderUpload()) requestDriveMetadataPublication();
             }
-            const warning = result.source === 'qa-local'
-                ? 'Drive files are saved locally in QA mode; Telegram metadata is not synchronized.'
-                : 'Drive files are saved locally, but metadata is still waiting for Telegram sync.';
-            setDriveSyncWarning(warning);
-            if (!notice.warningShown) {
-                notice.warningShown = true;
-                toast.warning(warning + ' Use Sync on the Drive toolbar.');
-            }
-        }).catch(() => {
-            const notice = driveSyncNoticeRef.current;
-            if (!notice.mounted || request !== notice.latestRequest) return;
-            const warning = 'Drive files are saved locally, but Telegram metadata synchronization is unverified.';
-            setDriveSyncWarning(warning);
-            if (!notice.warningShown) {
-                notice.warningShown = true;
-                toast.warning(warning + ' Retry Sync on the Drive toolbar.');
-            }
-        }).finally(() => {
-            if (manualRetry) {
-                driveSyncRetryInFlightRef.current = false;
-                if (driveSyncNoticeRef.current.mounted) setDriveSyncRetryBusy(false);
-            }
-        });
+        })();
     };
+
+    // A folder changes the Drive manifest many times while its files are
+    // attached. Publish once when every episode reaches a terminal state, so
+    // the sync snapshot cannot be invalidated by the next episode's move.
+    useEffect(() => {
+        const groups = new Map<string, QueueItem[]>();
+        for (const item of uploadQueue) {
+            if (!item.uploadGroupId) continue;
+            const members = groups.get(item.uploadGroupId) ?? [];
+            members.push(item);
+            groups.set(item.uploadGroupId, members);
+        }
+        let needsPublication = false;
+        let hasUnsettledFolder = false;
+        for (const [groupId, members] of groups) {
+            const settled = members.every(item =>
+                item.status === 'success' || item.status === 'error' || item.status === 'cancelled'
+            );
+            if (!settled) {
+                hasUnsettledFolder = true;
+                syncedFolderGroupsRef.current.delete(groupId);
+                continue;
+            }
+            if (!syncedFolderGroupsRef.current.has(groupId)) {
+                syncedFolderGroupsRef.current.add(groupId);
+                needsPublication = true;
+            }
+        }
+        if (hasUnsettledFolder) {
+            // Metadata is expected to be dirty while a folder's episodes are
+            // still being indexed. Hiding the warning avoids flashing a stale
+            // failure that the settle publication is about to resolve.
+            hideDriveSyncWarning();
+        }
+        if (needsPublication && !hasUnsettledFolder && !qaFeatureATest) {
+            requestDriveMetadataPublication();
+        }
+    }, [uploadQueue]);
     const { ensureFastTransferReady } = useFastTransferAuth();
     const { chooseTransferMethod } = useTransferMethod();
     const { reviewUploadSuggestion } = useUploadSuggestion();
@@ -607,7 +711,8 @@ export function useFileUpload(
                     void queryClient.invalidateQueries({
                         queryKey: ['drive-channel-file-paths', workingItem.folderId],
                     });
-                    if (!qaFeatureATest) requestDriveMetadataPublication();
+                    // Folder groups publish one final manifest after all of
+                    // their files have completed, failed, or been cancelled.
                 }
 
                 // Version grouping is deliberately a post-upload metadata step.
@@ -972,7 +1077,6 @@ export function useFileUpload(
                 directory.directory_id,
             ] as const));
             if (!directoryByPath.has('')) throw new Error('TeraRelay Drive did not return the collection folder identity');
-            if (!qaFeatureATest) requestDriveMetadataPublication();
 
             const groupId = crypto.randomUUID();
             const newItems: QueueItem[] = folder.files.map(file => {

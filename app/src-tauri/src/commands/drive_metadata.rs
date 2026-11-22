@@ -52,6 +52,10 @@ const DRIVE_MANIFEST_CAPTION: &str = "TRD1:index";
 const MAX_DRIVE_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DRIVE_DIRECTORY_DEPTH: usize = 512;
 
+// Only one metadata snapshot may be reconciled or published at a time.
+// Local edits remain protected by the revision fence while Telegram I/O runs.
+static DRIVE_METADATA_SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(debug_assertions)]
 #[path = "drive_project_qa.rs"]
 mod project_qa;
@@ -2736,6 +2740,34 @@ fn find_active_child_directory(
     Ok(None)
 }
 
+/// Resolve one folder-upload path component without allowing it to coexist
+/// with a file, symlink, pending upload, or another node of the same portable
+/// name. Reusing an existing directory is safe only after every other node
+/// kind in that sibling namespace has been checked.
+fn find_or_create_folder_upload_directory(
+    conn: &sqlite::Connection,
+    parent_id: &str,
+    name: &str,
+) -> Result<DriveDirectoryRecord, String> {
+    match find_active_child_directory(conn, parent_id, name)? {
+        Some(existing) => {
+            ensure_name_available(
+                conn,
+                Some(parent_id),
+                name,
+                Some(&existing.id),
+                None,
+                None,
+            )?;
+            Ok(existing)
+        }
+        None => {
+            ensure_name_available(conn, Some(parent_id), name, None, None, None)?;
+            create_drive_directory(conn, Some(parent_id), name)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn cmd_drive_prepare_folder_upload(
     folder_id: i64,
@@ -2762,25 +2794,7 @@ pub fn cmd_drive_prepare_folder_upload(
     conn.execute("SAVEPOINT drive_prepare_folder_upload")
         .map_err(|e| e.to_string())?;
     let result = (|| {
-        ensure_name_available(&conn, Some(&root.id), &folder_name, None, None, None).or_else(
-            |error| {
-                // An existing same-name collection is a safe idempotent retry target
-                // only when the node is a directory, not a file or another node type.
-                if find_active_child_directory(&conn, &root.id, &folder_name)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            },
-        )?;
-        let collection = match find_active_child_directory(&conn, &root.id, &folder_name)? {
-            Some(existing) => existing,
-            None => create_drive_directory(&conn, Some(&root.id), &folder_name)?,
-        };
+        let collection = find_or_create_folder_upload_directory(&conn, &root.id, &folder_name)?;
 
         let mut requested = relative_directories;
         requested.sort_by_key(|path| (path.split('/').count(), path.to_lowercase()));
@@ -2823,10 +2837,8 @@ pub fn cmd_drive_prepare_folder_upload(
                     parent_id = existing_id.clone();
                     continue;
                 }
-                let child = match find_active_child_directory(&conn, &parent_id, &component)? {
-                    Some(existing) => existing,
-                    None => create_drive_directory(&conn, Some(&parent_id), &component)?,
-                };
+                let child =
+                    find_or_create_folder_upload_directory(&conn, &parent_id, &component)?;
                 parent_id = child.id.clone();
                 resolved.insert(prefix.clone(), parent_id.clone());
                 result.push(DriveUploadDirectory {
@@ -8378,6 +8390,7 @@ pub async fn cmd_drive_sync_metadata(
     state: State<'_, TelegramState>,
     db_pool: State<'_, DbConnection>,
 ) -> Result<DriveSyncResult, String> {
+    let _sync_guard = DRIVE_METADATA_SYNC_LOCK.lock().await;
     {
         let conn = db_pool.lock().map_err(|_| "DB poisoned".to_string())?;
         init_drive_schema(&conn)?;
@@ -8541,6 +8554,46 @@ mod tests {
         assert_eq!(remote_drive_scan_end(201), 401);
         assert_eq!(remote_drive_scan_end(3_000), 3_200);
         assert_eq!(remote_drive_scan_end(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn folder_upload_directory_preflight_rejects_colliding_file_names() {
+        let conn = memory_db();
+        let root = create_drive_directory(&conn, None, "Collection").unwrap();
+        conn.execute(format!(
+            "INSERT INTO drive_pending_files
+             (id,directory_id,display_name,staging_path,backing_channel_id,created_at,updated_at)
+             VALUES ('qa-pending-collision','{}','Season 01','/qa/pending',1,1,1)",
+            root.id
+        ))
+        .unwrap();
+        let error = find_or_create_folder_upload_directory(&conn, &root.id, "season 01")
+            .expect_err("a folder must not be created beside a colliding pending file");
+        assert!(error.contains("already exists"), "{error}");
+        assert!(find_active_child_directory(&conn, &root.id, "Season 01")
+            .unwrap()
+            .is_none());
+
+        conn.execute("DELETE FROM drive_pending_files WHERE id='qa-pending-collision'")
+            .unwrap();
+        let existing = create_drive_directory(&conn, Some(&root.id), "Season 01").unwrap();
+        conn.execute(format!(
+            "INSERT INTO drive_pending_files
+             (id,directory_id,display_name,staging_path,backing_channel_id,created_at,updated_at)
+             VALUES ('qa-pending-collision','{}','Season 01','/qa/pending',1,1,1)",
+            root.id
+        ))
+        .unwrap();
+        let error = find_or_create_folder_upload_directory(&conn, &root.id, "SEASON 01")
+            .expect_err("retrying an existing folder must still detect another colliding node");
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(
+            find_active_child_directory(&conn, &root.id, "Season 01")
+                .unwrap()
+                .unwrap()
+                .id,
+            existing.id
+        );
     }
 
     #[test]

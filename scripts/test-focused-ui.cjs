@@ -174,10 +174,260 @@ test('folder upload UI keeps a collection compact with weighted progress and gro
     'Collection disclosure is not linked to its details list');
   assert.ok(html.includes('Folder upload'), 'Collection card is missing its explicit upload context');
   assert.ok(html.includes('View files'), 'Collection card does not invite expansion');
+  assert.ok(html.includes('hidden=""'), 'The folder upload dock should start minimized to avoid covering the file list');
+  assert.ok(html.includes('aria-controls="upload-queue-details"'), 'The dock disclosure does not control its details region');
   assert.ok(html.includes('border-telegram-primary/20'), 'Collection card is missing its distinct collection styling');
 });
 
+test('folder upload disclosure header is immune to compact action-button sizing', () => {
+  const css = fs.readFileSync(path.join(root, 'app/src/App.css'), 'utf8');
+  assert.ok(!/\.tr-transfer-item button\s*\{/.test(css),
+    'An unscoped transfer-item button rule also crushes the folder upload header');
+  assert.ok(!/\.tr-transfer-item button:hover\s*\{/.test(css),
+    'An unscoped transfer-item hover rule also moves the folder upload header');
+  assert.ok(css.includes('.tr-transfer-item button:not([aria-expanded])'),
+    'Compact transfer controls must explicitly exclude expandable folder headers');
+  const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'), 'utf8');
+  assert.match(source,
+    /<button type="button"\s+className="flex min-w-0 flex-1 items-start gap-3 text-left"\s+aria-expanded=\{expanded\}/,
+    'Folder card header must remain a wide flex disclosure button');
+});
+
+test('folder contents offer an on-demand scroll toggle', () => {
+  const { FolderUploadContents } = load(path.join(root, 'app/src/components/desktop/dashboard/FolderUploadContents.tsx'));
+  const shared = {
+    uploadGroupId: 'season-group',
+    uploadGroupName: 'Season 01',
+    uploadGroupFileCount: 12,
+  };
+  const items = Array.from({ length: 12 }, (_, index) => ({
+    ...shared,
+    id: `episode-${index}`,
+    path: `/fixture/Episode ${index + 1}.mkv`,
+    uploadGroupRelativePath: `Episode ${index + 1}.mkv`,
+    status: 'success',
+    totalBytes: 100,
+    uploadedBytes: 100,
+    progress: 100,
+  }));
+  const noop = () => {};
+  const props = {
+    detailsId: 'folder-upload-files-season-group',
+    groupName: 'Season 01',
+    items,
+    totalFiles: 12,
+    onPause: noop,
+    onResume: noop,
+    onCancel: noop,
+    onRetry: noop,
+  };
+  const html = renderToStaticMarkup(React.createElement(FolderUploadContents, props));
+  assert.ok(html.includes('tr-folder-contents-scroll'),
+    'Long folder contents do not start in a bounded scroll region');
+  assert.ok(html.includes('Show all'),
+    'Scrollable folder contents do not offer a Show all toggle');
+  assert.ok(html.includes('aria-expanded="false"'),
+    'Show all toggle does not report the constrained list state');
+  assert.ok(html.includes('aria-controls="folder-upload-files-season-group-list"'),
+    'Scroll toggle is not linked to the list it constrains');
+  assert.ok(html.includes('tabindex="0"'),
+    'Scrollable folder contents are not reachable from the keyboard');
+  assert.ok(html.includes('Episode 12.mkv'),
+    'The twelfth folder file is missing from the rendered scroll list');
+  const short = renderToStaticMarkup(React.createElement(FolderUploadContents, {
+    ...props,
+    items: items.slice(0, 2),
+    totalFiles: 2,
+  }));
+  assert.ok(!short.includes('tr-folder-contents-scroll') && !short.includes('Show all'),
+    'Short folder contents should not grow a dead scrollbar or toggle');
+  const css = fs.readFileSync(path.join(root, 'app/src/App.css'), 'utf8');
+  assert.match(css, /\.tr-folder-contents-scroll\s*\{[^}]*max-height:/,
+    'Folder contents scroll region has no height bound');
+  assert.match(css, /\.tr-folder-contents-scroll\s*\{[^}]*overflow-y:\s*scroll/,
+    'Folder contents scroll region must keep a visible, independently usable scrollbar');
+  assert.match(css, /\.tr-folder-contents-scroll::-webkit-scrollbar\s*\{[^}]*width:/,
+    'Folder contents scrollbar has no visible WebKit width');
+  const dashboard = fs.readFileSync(path.join(root, 'app/src/components/desktop/DesktopDashboard.tsx'), 'utf8');
+  const explorer = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/FileExplorer.tsx'), 'utf8');
+  assert.match(dashboard, /tr-main-panel flex-1 min-h-0 flex flex-col/,
+    'Main panel must constrain its flex child so the file list can scroll');
+  assert.match(explorer, /tr-file-explorer tr-native-scroll min-h-0 flex-1/,
+    'Main file explorer must be a bounded scroll container');
+  assert.match(css, /\.tr-file-explorer\.tr-native-scroll::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--color-telegram-subtext\)/,
+    'Main file explorer scrollbar thumb must remain visibly distinguishable');
+});
+
+test('folder contents scroll toggle expands and re-constrains the list', () => {
+  const hookStates = [];
+  let hookIndex = 0;
+  const hookReact = {
+    useState(initial) {
+      const index = hookIndex++;
+      if (!(index in hookStates)) {
+        hookStates[index] = typeof initial === 'function' ? initial() : initial;
+      }
+      return [hookStates[index], next => {
+        hookStates[index] = typeof next === 'function' ? next(hookStates[index]) : next;
+      }];
+    },
+  };
+  const loadWithHooks = loader({ react: hookReact });
+  const { FolderUploadContents } = loadWithHooks(
+    path.join(root, 'app/src/components/desktop/dashboard/FolderUploadContents.tsx')
+  );
+  const items = Array.from({ length: 5 }, (_, index) => ({
+    id: `episode-${index}`,
+    uploadGroupId: 'season-group',
+    path: `/fixture/Episode ${index}.mkv`,
+    status: 'success',
+    totalBytes: 100,
+    uploadedBytes: 100,
+    progress: 100,
+  }));
+  const noop = () => {};
+  const props = {
+    detailsId: 'folder-upload-files-season-group',
+    groupName: 'Season 01',
+    items,
+    totalFiles: 5,
+    onPause: noop,
+    onResume: noop,
+    onCancel: noop,
+    onRetry: noop,
+  };
+  const render = () => {
+    hookIndex = 0;
+    return FolderUploadContents(props);
+  };
+  const findToggle = node => {
+    if (!node || typeof node !== 'object') return null;
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = findToggle(child);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (node.props) {
+      if (node.type === 'button' && node.props['aria-expanded'] === false) return node;
+      for (const value of Object.values(node.props)) {
+        const found = findToggle(value);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  let html = renderToStaticMarkup(render());
+  assert.ok(html.includes('tr-folder-contents-scroll'),
+    'Long folder contents must start constrained');
+  const showAll = findToggle(render());
+  assert.ok(showAll, 'Show all toggle is missing from the constrained list');
+  showAll.props.onClick();
+  html = renderToStaticMarkup(render());
+  assert.ok(!html.includes('tr-folder-contents-scroll'),
+    'Show all did not release the folder contents height constraint');
+  assert.ok(html.includes('aria-expanded="true"'),
+    'Show all toggle does not report the expanded list state');
+  let restored = null;
+  (function walk(node) {
+    if (!node || typeof node !== 'object' || restored) return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (node.props) {
+      if (node.type === 'button' && node.props['aria-expanded'] === true) restored = node;
+      Object.values(node.props).forEach(walk);
+    }
+  })(render());
+  assert.ok(restored, 'Collapse-back-to-scroll toggle is missing');
+  restored.props.onClick();
+  html = renderToStaticMarkup(render());
+  assert.ok(html.includes('tr-folder-contents-scroll') && html.includes('Show all'),
+    'Scroll toggle did not re-constrain the folder contents');
+});
+
+test('individual uploads and expanded folder contents each own an inner scroll region', () => {
+  const upload = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'), 'utf8');
+  const folder = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/FolderUploadContents.tsx'), 'utf8');
+  const css = fs.readFileSync(path.join(root, 'app/src/App.css'), 'utf8');
+  assert.ok(upload.includes('className="tr-transfer-list tr-upload-transfer-list p-2 space-y-2"'),
+    'Individual upload rows are missing their dedicated list container');
+  assert.ok(upload.includes('tabIndex={uploadRows.length > 4 ? 0 : undefined}'),
+    'Long individual upload lists must be keyboard-scrollable');
+  const { UploadQueue } = load(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'));
+  const individualItems = Array.from({ length: 11 }, (_, index) => ({
+    id: 'upload-' + index,
+    path: '/fixture/Upload ' + (index + 1) + '.mkv',
+    folderId: null,
+    status: 'success',
+    totalBytes: 100,
+    uploadedBytes: 100,
+    progress: 100,
+  }));
+  const uploadHtml = renderToStaticMarkup(React.createElement(UploadQueue, {
+    ...queueProps,
+    items: individualItems,
+  }));
+  assert.match(uploadHtml, /class="tr-transfer-list tr-upload-transfer-list[^"]*"[^>]*tabindex="0"/,
+    'An 11-file queue must render its own keyboard-accessible inner scroll region');
+  assert.ok(uploadHtml.includes('Upload 11.mkv'),
+    'The eleventh individual upload is missing from the rendered scroll list');
+  assert.match(css, /\.tr-upload-transfer-list\s*\{[^}]*max-height:[^}]*overflow-y:\s*scroll/,
+    'Individual upload list must have its own bounded vertical scroller');
+  assert.match(css, /\.tr-upload-transfer-list::-webkit-scrollbar\s*\{[^}]*width:\s*10px/,
+    'Individual upload scrollbar must have a visible track width');
+  assert.ok(folder.includes("className={scrollActive ? 'tr-folder-contents-scroll' : undefined}"),
+    'Expanded folder files must keep their independent scroll container');
+  assert.match(css, /\.tr-folder-contents-scroll\s*\{[^}]*max-height:[^}]*overflow-y:\s*scroll/,
+    'Folder contents must have a separately bounded vertical scroller');
+  assert.match(css, /\.tr-folder-contents-scroll::-webkit-scrollbar\s*\{[^}]*width:\s*10px/,
+    'Folder contents scrollbar must have a visible track width');
+  assert.match(css, /\.tr-folder-contents-scroll::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--color-telegram-subtext\)/,
+    'Folder contents scrollbar thumb must be visibly distinguishable');
+});
+
+test('channel feed padding follows the measured transfer dock height', () => {
+  const { ChannelFeed } = load(path.join(root, 'app/src/components/desktop/dashboard/ChannelFeed.tsx'));
+  const noop = () => {};
+  const base = {
+    files: [], loading: false, error: null, selectedIds: [], activeFolderId: 1,
+    showFolderUpload: true, onFileClick: noop, onToggleSelection: noop,
+    onDownload: noop, onPreview: noop, onDelete: noop, onRename: noop,
+    onFileMove: noop, onManualUpload: noop, onFolderUpload: noop, onDownloadAll: noop,
+  };
+  const render = extra => renderToStaticMarkup(React.createElement(ChannelFeed, { ...base, ...extra }));
+  const tall = render({ hasTransferPanel: true, transferPanelHeight: 420 });
+  assert.ok(tall.includes('padding-bottom:532px'),
+    'A tall transfer dock must reserve its full height plus the dock offset above the feed bottom');
+  const compact = render({ hasTransferPanel: true, transferPanelHeight: 64 });
+  assert.ok(compact.includes('padding-bottom:176px'),
+    'A collapsed transfer dock must reserve only its measured height');
+  const none = render({ hasTransferPanel: false });
+  assert.ok(!none.includes('padding-bottom'),
+    'The feed must not reserve transfer space when no dock is visible');
+});
+
+test('Drive metadata warning stays compact and actionable inside the upload dock', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'), 'utf8');
+  assert.ok(source.includes('tr-drive-sync-warning'),
+    'Drive warning still expands into a large multi-paragraph card');
+  assert.ok(!source.includes('Only cross-device metadata publication needs verification'),
+    'Drive warning still repeats a long secondary explanation');
+});
+
+test('verified background Drive syncs clear stale upload warnings', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/hooks/useDeviceContinuity.ts'), 'utf8');
+  assert.ok(source.includes('publishVerifiedDriveSync'),
+    'background continuity sync success never clears the stale upload warning');
+});
+
+test('collapsed upload summary keeps its counts on their own row', () => {
+  const source = fs.readFileSync(path.join(root, 'app/src/components/desktop/dashboard/UploadQueue.tsx'), 'utf8');
+  assert.ok(source.includes('tr-transfer-summary'),
+    'Collapsed folder summary still competes with the Uploads title for one truncated line');
+});
+
 test('folder upload episode rows use a distinct progress card with per-file controls', () => {
+
   const { FolderUploadEpisodeRow } = load(path.join(root, 'app/src/components/desktop/dashboard/FolderUploadEpisodeRow.tsx'));
   const item = {
     id: 'episode-01', path: '/fixture/Episode 01.mkv',

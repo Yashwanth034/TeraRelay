@@ -217,7 +217,7 @@ export function FileExplorer({
     return (
         <div
             ref={parentRef}
-            className="tr-file-explorer tr-native-scroll flex-1 p-6 overflow-auto custom-scrollbar"
+            className="tr-file-explorer tr-native-scroll min-h-0 flex-1 p-6 overflow-auto custom-scrollbar"
             tabIndex={0}
             aria-label="Files"
         >

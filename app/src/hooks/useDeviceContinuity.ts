@@ -10,6 +10,7 @@ import {
   type DriveSnapshotLike,
   type DriveSyncResultLike,
 } from '../deviceContinuity';
+import { publishVerifiedDriveSync } from '../driveSyncSignal';
 
 export type DeviceContinuityPhase = 'idle' | 'restoring' | 'ready' | 'degraded';
 
@@ -200,6 +201,7 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
       let syncError: unknown = null;
       try {
         syncResult = validateDriveSyncResult(await invoke<unknown>('cmd_drive_sync_metadata'));
+        if (!disposed) publishVerifiedDriveSync(syncResult);
       } catch (error) {
         syncError = error;
         if (!disposed) console.warn('[Continuity] Initial Drive metadata sync deferred:', error);
@@ -271,6 +273,7 @@ export function useDeviceContinuity({ authenticated, authResolved, isMobile }: U
       try {
         const syncResult = validateDriveSyncResult(await invoke<unknown>('cmd_drive_sync_metadata'));
         if (disposed) return;
+        publishVerifiedDriveSync(syncResult);
         const after = validateDriveSnapshot(await invoke<unknown>('cmd_drive_get_snapshot'));
         if (disposed) return;
         let crypto: DriveCryptoStatusLike = { configured: false, unlocked: false };

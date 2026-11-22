@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { QueueItem } from "../../../types";
 import { AlertCircle, ChevronDown, ChevronRight, Folder, Pause, Play, RotateCcw, X } from "lucide-react";
 import { formatBytes } from "../../../utils";
-import { FolderUploadEpisodeRow } from './FolderUploadEpisodeRow';
+import { FolderUploadContents } from './FolderUploadContents';
 
 interface UploadQueueProps {
     items: QueueItem[];
@@ -38,6 +38,11 @@ export function UploadQueue({
     onDismissGroup,
 }: UploadQueueProps) {
     const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+    const hasFolderUploads = items.some(item => Boolean(item.uploadGroupId));
+    const [collapsed, setCollapsed] = useState(() => hasFolderUploads);
+    useEffect(() => {
+        setCollapsed(hasFolderUploads);
+    }, [hasFolderUploads]);
     if (items.length === 0 && !driveSyncWarning) return null;
 
     const activeCount = items.filter(i => i.status === 'pending' || i.status === 'pausing' || i.status === 'uploading' || i.status === 'downloading').length;
@@ -50,6 +55,33 @@ export function UploadQueue({
         members.push(item);
         groupedItems.set(item.uploadGroupId, members);
     }
+    const summaryFolderItem = items.find(item => item.uploadGroupId);
+    const summaryFolderMembers = summaryFolderItem?.uploadGroupId
+        ? groupedItems.get(summaryFolderItem.uploadGroupId) ?? []
+        : [];
+    const summaryFolderTotal = summaryFolderItem?.uploadGroupFileCount ?? summaryFolderMembers.length;
+    const summaryFolderCompleted = summaryFolderMembers.filter(item => item.status === 'success').length;
+    const summaryFolderFailed = summaryFolderMembers.filter(item => item.status === 'error').length;
+    const summaryFolderCancelled = summaryFolderMembers.filter(item => item.status === 'cancelled').length;
+    const summaryFolderTotalBytes = summaryFolderItem?.uploadGroupTotalBytes ?? summaryFolderMembers.reduce((sum, item) =>
+        sum + (typeof item.totalBytes === 'number' && Number.isFinite(item.totalBytes) ? Math.max(0, item.totalBytes) : 0), 0);
+    const summaryFolderTransferredBytes = summaryFolderMembers.reduce((sum, item) => {
+        const size = typeof item.totalBytes === 'number' && Number.isFinite(item.totalBytes) ? Math.max(0, item.totalBytes) : 0;
+        if (item.status === 'success') return sum + size;
+        if (['uploading', 'downloading', 'pausing', 'paused'].includes(item.status)) {
+            const sent = typeof item.uploadedBytes === 'number' && Number.isFinite(item.uploadedBytes) ? Math.max(0, item.uploadedBytes) : 0;
+            return sum + Math.min(size, sent);
+        }
+        return sum;
+    }, 0);
+    const summaryFolderProgress = summaryFolderTotalBytes > 0
+        ? Math.round(Math.min(summaryFolderTotalBytes, summaryFolderTransferredBytes) / summaryFolderTotalBytes * 100)
+        : summaryFolderTotal > 0 ? Math.round(summaryFolderCompleted / summaryFolderTotal * 100) : 0;
+    const summaryFolderActive = summaryFolderMembers.some(item =>
+        item.status === 'uploading' || item.status === 'downloading' || item.status === 'pending' || item.status === 'pausing'
+    );
+    const summaryFolderPaused = summaryFolderMembers.some(item => item.status === 'paused');
+    const summaryFolderUnfinished = summaryFolderActive || summaryFolderPaused;
     type UploadRow = { kind: 'item'; item: QueueItem } | { kind: 'group'; id: string };
     const uploadRows: UploadRow[] = [];
     const emittedGroups = new Set<string>();
@@ -201,49 +233,115 @@ export function UploadQueue({
 
     return (
         <div className="tr-transfer-dock w-full overflow-hidden">
-            <div className="tr-transfer-header flex justify-between items-center">
-                <div className="flex items-center gap-2">
-                    <h4 className="text-sm font-medium text-telegram-text">Uploads</h4>
-                    {activeCount > 0 && (
-                        <span className="text-xs px-1.5 py-0.5 bg-blue-500/15 text-blue-400 rounded-full">
-                            {activeCount} active
+            <div className="tr-transfer-header flex items-center justify-between gap-2 p-2.5">
+                <button
+                    type="button"
+                    className="flex min-w-0 flex-1 flex-col items-stretch gap-1 text-left"
+                    title={collapsed ? 'View files' : 'Hide files'}
+                    aria-expanded={!collapsed}
+                    aria-controls="upload-queue-details"
+                    aria-label={`${collapsed ? 'Show' : 'Hide'} upload details`}
+                    onClick={() => {
+                        if (collapsed && summaryFolderItem?.uploadGroupId) {
+                            setExpandedGroups(current => ({ ...current, [summaryFolderItem.uploadGroupId!]: true }));
+                        }
+                        setCollapsed(value => !value);
+                    }}
+                >
+                    <span className="flex min-w-0 items-center gap-2">
+                        <span className="flex shrink-0 items-center gap-2">
+                            <span className="text-sm font-medium text-telegram-text">Uploads</span>
+                            {activeCount > 0 && (
+                                <span className="rounded-full bg-blue-500/15 px-1.5 py-0.5 text-xs text-blue-400">
+                                    {activeCount} active
+                                </span>
+                            )}
+                            {pausedCount > 0 && (
+                                <span className="rounded-full bg-yellow-500/15 px-1.5 py-0.5 text-xs text-yellow-400">
+                                    {pausedCount} paused
+                                </span>
+                            )}
+                        </span>
+                        <ChevronDown className={`ml-auto h-4 w-4 shrink-0 text-telegram-subtext transition-transform ${collapsed ? '' : 'rotate-180'}`} aria-hidden="true" />
+                    </span>
+                    {collapsed && summaryFolderItem && (
+                        <span className="tr-transfer-summary flex min-w-0 items-center gap-2 text-[11px] text-telegram-subtext">
+                            <span className="min-w-0 truncate" title={summaryFolderItem.uploadGroupName}>
+                                {summaryFolderItem.uploadGroupName} · {summaryFolderCompleted}/{summaryFolderTotal}
+                                {summaryFolderFailed > 0 ? ` · ${summaryFolderFailed} failed` : ''}
+                                {summaryFolderCancelled > 0 ? ` · ${summaryFolderCancelled} cancelled` : ''}
+                            </span>
+                            {summaryFolderTotalBytes > 0 && (
+                                <span className="shrink-0 tabular-nums">
+                                    {formatBytes(summaryFolderTransferredBytes)} / {formatBytes(summaryFolderTotalBytes)}
+                                </span>
+                            )}
                         </span>
                     )}
-                    {pausedCount > 0 && (
-                        <span className="text-xs px-1.5 py-0.5 bg-yellow-500/15 text-yellow-400 rounded-full">
-                            {pausedCount} paused
-                        </span>
+                </button>
+                <div className="flex shrink-0 items-center gap-0.5">
+                    {summaryFolderItem?.uploadGroupId && summaryFolderActive && (
+                        <button type="button" className="rounded-lg p-1.5 text-telegram-subtext hover:bg-telegram-bg hover:text-yellow-400"
+                            title="Pause folder upload" aria-label={`Pause folder upload ${summaryFolderItem.uploadGroupName}`}
+                            onClick={() => onPauseGroup(summaryFolderItem.uploadGroupId!)}>
+                            <Pause className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                    )}
+                    {summaryFolderItem?.uploadGroupId && summaryFolderPaused && (
+                        <button type="button" className="rounded-lg p-1.5 text-telegram-subtext hover:bg-telegram-bg hover:text-green-400"
+                            title="Resume folder upload" aria-label={`Resume folder upload ${summaryFolderItem.uploadGroupName}`}
+                            onClick={() => onResumeGroup(summaryFolderItem.uploadGroupId!)}>
+                            <Play className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                    )}
+                    {summaryFolderItem?.uploadGroupId && summaryFolderUnfinished && (
+                        <button type="button" className="rounded-lg p-1.5 text-telegram-subtext hover:bg-red-500/10 hover:text-red-400"
+                            title="Cancel folder upload" aria-label={`Cancel folder upload ${summaryFolderItem.uploadGroupName}`}
+                            onClick={() => onCancelGroup(summaryFolderItem.uploadGroupId!)}>
+                            <X className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                    )}
+                    {summaryFolderItem?.uploadGroupId && !summaryFolderUnfinished && (
+                        <button type="button" className="rounded-lg p-1.5 text-telegram-subtext hover:bg-telegram-bg hover:text-telegram-text"
+                            title="Dismiss folder upload" aria-label={`Dismiss folder upload ${summaryFolderItem.uploadGroupName}`}
+                            onClick={() => onDismissGroup(summaryFolderItem.uploadGroupId!)}>
+                            <X className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                    )}
+                    {(activeCount > 0 || pausedCount > 0) && (!summaryFolderItem || items.some(item => !item.uploadGroupId)) && (
+                        <button onClick={onCancelAll} className="tr-transfer-cancel-all shrink-0" aria-label="Cancel all uploads">
+                            Cancel All
+                        </button>
                     )}
                 </div>
-                {(activeCount > 0 || pausedCount > 0) && (
-                    <button onClick={onCancelAll} className="tr-transfer-cancel-all" aria-label="Cancel all uploads">
-                        Cancel All
-                    </button>
-                )}
             </div>
-
-            {driveSyncWarning && (
-                <div role="alert" className="m-2 rounded-md border border-amber-500/30 p-2.5 text-xs text-telegram-text">
-                    <div className="flex items-start gap-2">
-                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
-                        <div className="min-w-0 flex-1 space-y-1.5">
-                            <p>{driveSyncWarning}</p>
-                            <p className="text-telegram-subtext">Your uploaded file is not marked failed. Only cross-device metadata publication needs verification.</p>
-                            <button
-                                type="button"
-                                aria-label="Retry TeraRelay Drive metadata sync"
-                                onClick={onRetryDriveSync}
-                                disabled={!onRetryDriveSync || driveSyncRetryBusy}
-                                className="inline-flex items-center gap-1 rounded-md bg-telegram-primary/15 px-2 py-1.5 font-semibold text-telegram-primary disabled:opacity-50"
-                            >
-                                <RotateCcw className={`h-3.5 w-3.5 ${driveSyncRetryBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
-                                {driveSyncRetryBusy ? 'Syncing…' : 'Retry Drive sync'}
-                            </button>
-                        </div>
-                    </div>
+            {collapsed && summaryFolderItem?.uploadGroupId && (
+                <div className="h-1 overflow-hidden bg-telegram-border" role="progressbar"
+                    aria-label={`Folder upload progress for ${summaryFolderItem.uploadGroupName}`}
+                    aria-valuemin={0} aria-valuemax={100} aria-valuenow={summaryFolderProgress}>
+                    <div className="h-full bg-gradient-to-r from-blue-500 to-telegram-primary transition-[width] duration-500"
+                        style={{ width: `${summaryFolderProgress}%` }} />
                 </div>
             )}
-            {items.length > 0 && <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2" role="list" aria-label="Upload transfer status">
+
+            {driveSyncWarning && (
+                <div role="alert" className="tr-drive-sync-warning mx-2 mb-2 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[11px] leading-snug text-telegram-text">
+                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" aria-hidden="true" />
+                    <p className="min-w-0 flex-1">{driveSyncWarning}</p>
+                    <button
+                        type="button"
+                        aria-label="Retry TeraRelay Drive metadata sync"
+                        onClick={onRetryDriveSync}
+                        disabled={!onRetryDriveSync || driveSyncRetryBusy}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-md bg-telegram-primary/15 px-2 py-1 font-semibold text-telegram-primary disabled:opacity-50"
+                    >
+                        <RotateCcw className={`h-3.5 w-3.5 ${driveSyncRetryBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+                        {driveSyncRetryBusy ? 'Syncing…' : 'Retry'}
+                    </button>
+                </div>
+            )}
+            <div id="upload-queue-details" hidden={collapsed}>
+                {items.length > 0 && <div className="tr-transfer-list tr-upload-transfer-list p-2 space-y-2" role="list" aria-label="Upload transfer status" tabIndex={uploadRows.length > 4 ? 0 : undefined}>
                 {uploadRows.map(entry => {
                     if (entry.kind === 'item') return renderItem(entry.item);
                     const members = groupedItems.get(entry.id) ?? [];
@@ -379,35 +477,22 @@ export function UploadQueue({
                                 </div>
                             </div>
                             {expanded && (
-                                <div id={detailId} className="border-t border-telegram-border/80 bg-telegram-bg/40 p-3"
-                                    role="list" aria-label={`Files in folder upload ${first.uploadGroupName}`}>
-                                    <div className="mb-2 flex items-center justify-between gap-2">
-                                        <span className="text-[9px] font-bold uppercase tracking-[0.16em] text-telegram-subtext">
-                                            Folder contents
-                                        </span>
-                                        <span className="text-[10px] tabular-nums text-telegram-subtext">
-                                            {members.length} / {totalFiles} tracked
-                                        </span>
-                                    </div>
-                                    <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
-                                        {members.map((item, index) => (
-                                            <FolderUploadEpisodeRow
-                                                key={item.id}
-                                                index={index}
-                                                item={item}
-                                                onPause={onPauseItem}
-                                                onResume={onResumeItem}
-                                                onCancel={onCancelItem}
-                                                onRetry={onRetryItem}
-                                            />
-                                        ))}
-                                    </div>
-                                </div>
+                                <FolderUploadContents
+                                    detailsId={detailId}
+                                    groupName={first.uploadGroupName}
+                                    items={members}
+                                    totalFiles={totalFiles}
+                                    onPause={onPauseItem}
+                                    onResume={onResumeItem}
+                                    onCancel={onCancelItem}
+                                    onRetry={onRetryItem}
+                                />
                             )}
                         </div>
                     );
                 })}
             </div>}
+            </div>
         </div>
     );
 }

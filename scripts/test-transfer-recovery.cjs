@@ -565,9 +565,12 @@ test('older delayed Drive metadata result cannot undo a newer verified upload sy
       });
       await h.flush();
     }
-    assert.equal(backend.driveSyncs, 2);
+    assert.equal(backend.driveSyncs, 1,
+      'the second metadata request must wait instead of racing the unresolved first sync');
     delayed.resolve({ revision: 6, dirty: true, source: 'current' });
     await h.flush();
+    assert.equal(backend.driveSyncs, 2,
+      'the queued request must run against the latest metadata after the first sync settles');
     assert.equal(h.toasts.filter(t => t.level === 'warning').length, 0,
       'stale delayed dirty response may not override newer clean metadata result');
   })
@@ -702,8 +705,10 @@ test('Drive upload sync warning ignores native reply after frontend unmount', ()
 
 test('Drive upload warning panel remains usable with no queue rows and handles busy Retry', () => {
   const dashboard = fs.readFileSync(path.join(root, 'app/src/components/desktop/DesktopDashboard.tsx'), 'utf8');
-  assert.match(dashboard, /driveSyncWarning !== null\) && \(/,
+  assert.match(dashboard, /driveSyncWarning !== null;/,
     'desktop transfer dock must stay visible after upload queue drains');
+  assert.match(dashboard, /\{hasTransferPanel && \(/,
+    'the desktop transfer dock is not driven by the shared visibility flag');
   assert.match(dashboard, /driveSyncWarning=\{driveSyncWarning\}/);
   assert.match(dashboard, /driveSyncRetryBusy=\{driveSyncRetryBusy\}/);
   assert.match(dashboard, /onRetryDriveSync=\{retryDriveMetadataSync\}/);
@@ -719,10 +724,14 @@ test('Drive upload warning panel remains usable with no queue rows and handles b
     exports: exported,
     require(name) {
       if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx, Fragment: 'fragment' };
-      if (name === 'react') return { useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}] };
+      if (name === 'react') return {
+        useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}],
+        useEffect: () => {},
+      };
       if (name === 'lucide-react') return icons;
       if (name === '../../../utils') return { formatBytes: n => `${n} bytes` };
       if (name === './FolderUploadEpisodeRow') return { FolderUploadEpisodeRow: () => null };
+      if (name === './FolderUploadContents') return { FolderUploadContents: () => null };
       throw new Error('unexpected UI import: ' + name);
     },
   });
@@ -1088,6 +1097,163 @@ test('successful folder episode is indexed in Drive before its queue row drains'
     assert.deepEqual(backend.read('upload'), [],
       'A completely successful folder upload must clear its durable group summary');
     assert.ok(!fs.existsSync(backend.filename), 'No temporary ZIP should exist or need cleanup');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('folder upload publishes one Drive metadata snapshot after every episode settles', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/Episode 01.mkv', relative_path: 'Episode 01.mkv', name: 'Episode 01.mkv', size: 10 },
+        { path: '/fixture/Episode 02.mkv', relative_path: 'Episode 02.mkv', name: 'Episode 02.mkv', size: 20 },
+      ],
+      directories: [],
+      total_size: 30,
+    };
+    backend.folderDirectories = [
+      { relative_path: '', directory_id: 'a'.repeat(32) },
+    ];
+
+    await h.state.handleFolderUpload();
+    await h.flush();
+    assert.equal(backend.driveSyncs, 0,
+      'folder preparation must not publish a manifest before the file moves finish');
+    assert.equal(backend.jobs.filter(job => !job.finished).length, 1,
+      'folder uploads remain sequential');
+
+    backend.complete(backend.jobs[0].id, null, {
+      message: 'first episode uploaded', logical_file_id: 'b'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.folderMoves.length, 1);
+    assert.equal(backend.driveSyncs, 0,
+      'the first episode must not trigger a sync while another episode is pending');
+    const nextJob = backend.jobs.find(job => !job.finished);
+    assert.ok(nextJob, 'the second episode did not start');
+
+    backend.complete(nextJob.id, null, {
+      message: 'second episode uploaded', logical_file_id: 'c'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.folderMoves.length, 2);
+    assert.equal(backend.driveSyncs, 1,
+      'the completed folder group must publish exactly one final metadata snapshot');
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('manual Drive sync waits until the active folder upload has settled', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/Episode 01.mkv', relative_path: 'Episode 01.mkv', name: 'Episode 01.mkv', size: 10 },
+      ],
+      directories: [],
+      total_size: 10,
+    };
+    backend.folderDirectories = [
+      { relative_path: '', directory_id: 'a'.repeat(32) },
+    ];
+
+    await h.state.handleFolderUpload();
+    await h.flush();
+    h.state.retryDriveMetadataSync();
+    await h.flush();
+    assert.equal(backend.driveSyncs, 0,
+      'manual Retry must not publish a partial folder manifest');
+    assert.equal(h.state.driveSyncRetryBusy, true,
+      'manual Retry remains visibly pending while the folder upload finishes');
+
+    backend.complete(backend.jobs[0].id, null, {
+      message: 'episode uploaded', logical_file_id: 'b'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.driveSyncs, 1,
+      'the deferred manual request runs against the completed folder manifest');
+    assert.equal(h.state.driveSyncRetryBusy, false);
+    assert.equal(h.state.driveSyncWarning, null);
+  }, 1, {}, backend => { backend.activeFolderId = 9100001; })
+);
+
+test('stale Drive metadata snapshots retry with backoff instead of warning during a normal upload', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'stale-snapshot-backoff.txt');
+    fs.writeFileSync(source, 'already stored bytes');
+    backend.preflightResult = {
+      file_name: 'stale snapshot.txt', size: 19,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-stale-snapshot',
+      exact_duplicate: { logical_file_id: '6'.repeat(32), message_id: 55,
+        name: 'same.txt', size: 19 }, similar_files: [],
+    };
+    backend.driveSyncResults = [
+      new Error('Drive metadata changed during sync; preserving newer local edits for retry'),
+      { revision: 9, dirty: false, source: 'current' },
+    ];
+    backend.emit('drive-upload-staged', {
+      pending_id: 'e'.repeat(32), path: source, folder_id: 9100001,
+      file_name: 'stale snapshot.txt',
+    });
+    await h.flush();
+    assert.equal(backend.driveSyncs, 1);
+    assert.equal(h.state.driveSyncWarning, null,
+      'a stale metadata snapshot is a retryable race, not a user-facing failure');
+    await h.advance(250);
+    assert.equal(backend.driveSyncs, 1,
+      'stale snapshot retry must back off instead of immediately racing another publication');
+    await h.advance(2000);
+    assert.equal(backend.driveSyncs, 2,
+      'the stale snapshot is republished from a fresh manifest after the backoff');
+    assert.equal(h.state.driveSyncWarning, null);
+    assert.equal(h.toasts.filter(t => t.level === 'warning').length, 0,
+      'transient sync races must not produce warning toasts');
+  })
+);
+
+test('an active folder upload hides a previous metadata warning until the folder settles', () =>
+  withHarness('upload', { upload: [] }, async (h, backend) => {
+    const source = path.join(fixtures, 'folder-clears-warning.txt');
+    fs.writeFileSync(source, 'already stored bytes');
+    backend.preflightResult = {
+      file_name: 'warning fixture.txt', size: 19,
+      source_sha256: 'f'.repeat(64), source_identity: 'fixture-folder-warning',
+      exact_duplicate: { logical_file_id: '5'.repeat(32), message_id: 54,
+        name: 'same.txt', size: 19 }, similar_files: [],
+    };
+    backend.driveSyncResults = [new Error('synthetic Telegram offline')];
+    backend.emit('drive-upload-staged', {
+      pending_id: 'f'.repeat(32), path: source, folder_id: 9100001,
+      file_name: 'warning fixture.txt',
+    });
+    await h.flush();
+    assert.ok(h.state.driveSyncWarning, 'precondition: a real sync failure produced a warning');
+
+    backend.preflightResult = null;
+    backend.folderManifest = {
+      folder_name: 'Season Pack',
+      source_root: '/fixture',
+      files: [
+        { path: '/fixture/Episode 01.mkv', relative_path: 'Episode 01.mkv', name: 'Episode 01.mkv', size: 10 },
+      ],
+      directories: [],
+      total_size: 10,
+    };
+    await h.state.handleFolderUpload();
+    await h.flush();
+    assert.equal(h.state.driveSyncWarning, null,
+      'an active folder upload must not display a stale metadata warning');
+    assert.equal(backend.driveSyncs, 1,
+      'starting a folder upload must not publish a partial manifest');
+
+    backend.complete(backend.jobs.find(job => !job.finished).id, null, {
+      message: 'episode uploaded', logical_file_id: 'b'.repeat(32),
+    });
+    await h.flush();
+    assert.equal(backend.driveSyncs, 2, 'the settled folder publishes one final manifest');
+    assert.equal(h.state.driveSyncWarning, null,
+      'a successful settled publication must leave no warning behind');
   }, 1, {}, backend => { backend.activeFolderId = 9100001; })
 );
 

@@ -64,7 +64,7 @@ export function RemoteImportQueue({ jobs, batches, uploadItems, onReview, onCanc
                     {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
                 </button>
             </div>
-            {expanded && <div className="tr-transfer-list max-h-52 overflow-y-auto p-2 space-y-2">
+            {expanded && <div className="tr-transfer-list p-2 space-y-2">
                 {visible.map(original => {
                     const batch = batches.find(value => value.entries.some(entry => entry.jobId === original.id && entry.phase !== 'skipped'));
                     const entry = batch?.entries.find(value => value.jobId === original.id);

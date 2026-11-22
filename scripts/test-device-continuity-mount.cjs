@@ -69,6 +69,7 @@ function makeHarness(status, mount) {
     if (name === 'react') return fakeReact;
     if (name === '@tauri-apps/api/core') return { invoke };
     if (name === '../driveMountStatus') return mountStatusExports;
+    if (name === '../driveSyncSignal') return { publishVerifiedDriveSync: () => true };
     if (name === '../deviceContinuity') return { ...helperExports, classifyDeviceContinuity: () => ({
       restoredFromRemote: false, directoryCount: 0, fileCount: 0,
       needsDriveUnlock: false, syncSource: 'synthetic',

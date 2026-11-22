@@ -72,6 +72,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [isSearching, setIsSearching] = useState(false);
     const [cardScale, setCardScale] = useState(1.0);
     const internalDragRef = useRef<number[] | null>(null);
+    const transferDockRef = useRef<HTMLDivElement | null>(null);
+    const [transferPanelHeight, setTransferPanelHeight] = useState(0);
 
     const setInternalDragIds = (ids: number[] | null) => {
         internalDragRef.current = ids;
@@ -274,6 +276,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         retryItem: retryDownloadItem,
         dismissItem: dismissDownloadItem,
     } = useFileDownload(store);
+
+    const hasTransferPanel = uploadQueue.length > 0 || downloadQueue.length > 0
+        || remoteImportJobs.length > 0 || driveSyncWarning !== null;
+    // The transfer dock overlays the channel feed on small windows. Reserve
+    // its real height instead of a fixed guess so the newest file rows and
+    // their actions stay reachable.
+    useEffect(() => {
+        const node = transferDockRef.current;
+        if (!node || typeof ResizeObserver === 'undefined') return;
+        const update = () => {
+            if (node.isConnected) setTransferPanelHeight(Math.ceil(node.getBoundingClientRect().height));
+        };
+        update();
+        const observer = new ResizeObserver(update);
+        observer.observe(node);
+        return () => observer.disconnect();
+    }, [hasTransferPanel]);
 
     const {
         handleDelete, handleDeleteFolder, handleBulkDelete, handleBulkDownload,
@@ -883,7 +902,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onDeleteGroup={handleDeleteGroup}
             />
 
-            <main className="tr-main-panel flex-1 flex flex-col">
+            <main className="tr-main-panel flex-1 min-h-0 flex flex-col">
                 <TopBar
                     currentFolderName={currentFolderName}
                     selectedIds={selectedIds}
@@ -915,7 +934,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {activeFolderId !== null ? (
                     <ChannelFeed
-                        hasTransferPanel={uploadQueue.length > 0 || downloadQueue.length > 0 || remoteImportJobs.length > 0 || driveSyncWarning !== null}
+                        hasTransferPanel={hasTransferPanel}
+                        transferPanelHeight={transferPanelHeight}
                         files={displayedFiles}
                         driveDirectoryPaths={driveChannelPaths?.directories ?? []}
                         driveDirectoryIdsByPath={driveChannelPaths?.directory_ids ?? {}}
@@ -1056,8 +1076,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             )}
 
 
-            {(uploadQueue.length > 0 || downloadQueue.length > 0 || remoteImportJobs.length > 0 || driveSyncWarning !== null) && (
-                <div className="fixed bottom-24 right-5 z-[100] flex max-h-[calc(100vh-8rem)] w-[380px] max-w-[calc(100vw-2.5rem)] flex-col gap-3 overflow-y-auto">
+            {hasTransferPanel && (
+                <div ref={transferDockRef} className="fixed bottom-24 right-4 z-[100] flex max-h-[min(55vh,calc(100vh-8rem))] w-[min(380px,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] flex-col gap-2 overflow-y-auto overscroll-contain">
                     <RemoteImportQueue
                         jobs={remoteImportJobs}
                         batches={remoteImportBatch.batches}

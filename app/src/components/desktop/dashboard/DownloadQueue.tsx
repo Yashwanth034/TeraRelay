@@ -50,7 +50,7 @@ export function DownloadQueue({
                 )}
             </div>
 
-            <div className="tr-transfer-list max-h-64 overflow-y-auto p-2 space-y-2" role="list" aria-label="Download transfer status">
+            <div className="tr-transfer-list p-2 space-y-2" role="list" aria-label="Download transfer status">
                 {items.map(item => {
                     const showProgress = item.status === 'downloading' || item.status === 'pausing' || item.status === 'paused';
                     const active = item.status === 'downloading';

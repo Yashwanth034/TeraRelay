@@ -148,6 +148,12 @@ jobs:
         # documented, exact-function #[expect] rather than a global lint waiver.
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Build native Drive fixture dependencies
+        working-directory: app/src-tauri
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --locked
+
       - name: Native HTTP range, V2 cache and pending-read integrity fixtures
         timeout-minutes: 3
         working-directory: .

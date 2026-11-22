@@ -245,7 +245,7 @@ async function runBrowser(url) {
   const mp4 = fs.readFileSync(single);
   const split = [mp4.subarray(0, 620013), mp4.subarray(620013, 1212037), mp4.subarray(1212037)];
   assert.deepEqual(Buffer.concat(split), mp4);
-  const assets = { '/single.mp4': mp4, '/faststart.mp4': fs.readFileSync(faststart), '/multipart.mp4': Buffer.concat(split), '/source.mkv': fs.readFileSync(source), '/fmp4/qa/output.mp4': fs.readFileSync(remux), '/player.js': fs.readFileSync(path.join(tmp,'player.js')) };
+  const assets = { '/single.mp4': mp4, '/faststart.mp4': fs.readFileSync(faststart), '/multipart.mp4': Buffer.concat(split), '/source.mkv': fs.readFileSync(source), '/fmp4/qa/output.mp4': fs.readFileSync(finalized), '/player.js': fs.readFileSync(path.join(tmp,'player.js')) };
   const css = fs.readdirSync(path.join(root,'app/dist/assets')).filter(n=>n.endsWith('.css')).map(n=>fs.readFileSync(path.join(root,'app/dist/assets',n),'utf8')).join('\n');
   // Both no-store spellings are valid HTTP. Keep the native experiment
   // selectable without allowing untrusted arbitrary response headers.

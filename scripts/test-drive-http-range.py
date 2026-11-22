@@ -18,7 +18,7 @@ deps = root / "app/src-tauri/target/debug/deps"
 externs = []
 for name in ["reqwest", "urlencoding", "log"]:
     found = sorted(deps.glob("lib" + name + "-*.rlib"), key=lambda p: p.stat().st_mtime, reverse=True)
-    assert found, "Compile development Rust tests before this check"
+    assert found, f"Compile development Rust tests before this check (missing {name} artifact in {deps})"
     externs += ["--extern", name + "=" + str(found[0])]
 rust = r"""
 use std::io::{Read, Write};

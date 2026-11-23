@@ -4,6 +4,15 @@ All notable public changes to TeraRelay are documented here.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-23
+
+### Security
+- Update cookie dependencies to patched `cookie 0.18.3` and remove the unnecessary Actix cookie feature while preserving shared-file authentication behavior.
+
+### Linux validation and release
+- Stabilize Linux Drive/FUSE fixtures, isolated display setup, and WebKitGTK seeking regression coverage.
+- Publish Linux x86_64 desktop packages only; Windows, macOS, Android, and iOS release builds remain withheld.
+
 ## [0.2.5] - 2026-11-22
 
 ### Drive, uploads, and transfer reliability

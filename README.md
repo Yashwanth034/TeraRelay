@@ -97,6 +97,12 @@ Beyond basic folders, the desktop app includes tools for organizing and checking
 
 Native integration differs by OS. **Linux** supports an optional TDLib/C++ fast-transfer engine; **Windows** includes Explorer integration; **macOS** File Provider distribution depends on Apple provisioning. See [platform and release notes](https://github.com/Yashwanth034/TeraRelay/releases/latest) for distribution limits.
 
+## What's improved in v0.2.6
+
+- **Security:** update cookie dependencies to patched `cookie 0.18.3` and preserve shared-file authentication behavior.
+- **Linux release reliability:** strengthen automated Drive/FUSE and WebKitGTK seeking regression coverage.
+- **Linux-only distribution:** v0.2.6 provides Linux x86_64 desktop packages. Windows, macOS, Android, and iOS builds and installers remain withheld.
+
 ## What's improved in v0.2.5
 
 - **Drive sync reliability:** prevent stale metadata responses from overwriting newer verified upload state; improve retry and recovery behavior.

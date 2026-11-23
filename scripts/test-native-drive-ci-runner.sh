@@ -20,7 +20,7 @@ echo "PASS isolated X11 display ready: $display"
 mkdir -p terarelay-ci-fixtures
 export DISPLAY="$display"
 printf "Starting Openbox on DISPLAY=%s XAUTHORITY=%s\\n" "$DISPLAY" "${XAUTHORITY:-<unset>}" > terarelay-ci-fixtures/ci-native-window-manager.log
-openbox --display "$DISPLAY" --sm-disable >> terarelay-ci-fixtures/ci-native-window-manager.log 2>&1 &
+openbox --sm-disable >> terarelay-ci-fixtures/ci-native-window-manager.log 2>&1 &
 wm_pid=$!
 cleanup() {
   local original=$?

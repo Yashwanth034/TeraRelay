@@ -1,7 +1,8 @@
 use crate::commands::utils::resolve_peer;
 use crate::commands::TelegramState;
 use crate::db::DbConnection;
-use actix_web::{cookie::Cookie, get, post, web, HttpRequest, HttpResponse, Responder};
+use actix_web::{get, post, web, HttpRequest, HttpResponse, Responder};
+use cookie::{Cookie, SameSite};
 use grammers_client::types::Media;
 use rand::Rng;
 use serde::Deserialize;
@@ -9,6 +10,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const SHARE_AUTH_TTL_SECONDS: i64 = 30 * 60;
+
+fn share_auth_cookie_value(req: &HttpRequest, token: &str) -> Option<String> {
+    let name = format!("share_auth_{token}");
+    let header = req.headers().get("Cookie")?.to_str().ok()?;
+    Cookie::split_parse(header)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
+}
 const MAX_SHARE_AUTH_SESSIONS: usize = 4096;
 const SHARE_VERIFY_WINDOW_SECONDS: i64 = 60;
 const SHARE_VERIFY_MAX_ATTEMPTS: u32 = 8;
@@ -413,13 +423,9 @@ async fn get_shared_file(
     // Check password protection
     if let Some(hash) = &row.password_hash {
         let mut authenticated = false;
-        if let Some(cookie) = req.cookie(&format!("share_auth_{}", token)) {
-            if share_auth_session_valid(
-                &token,
-                hash,
-                cookie.value(),
-                chrono::Utc::now().timestamp(),
-            ) {
+        if let Some(cookie_value) = share_auth_cookie_value(&req, &token) {
+            if share_auth_session_valid(&token, hash, &cookie_value, chrono::Utc::now().timestamp())
+            {
                 authenticated = true;
             }
         }
@@ -535,18 +541,16 @@ async fn verify_shared_file_password(
                 return HttpResponse::InternalServerError().body("Internal server error");
             }
         };
-        let cookie = Cookie::build(format!("share_auth_{}", token), val)
-            .path(format!("/d/{}", token))
+        let cookie = Cookie::build((format!("share_auth_{token}"), val))
+            .path(format!("/d/{token}"))
             .http_only(true)
-            .same_site(actix_web::cookie::SameSite::Strict)
-            .max_age(actix_web::cookie::time::Duration::seconds(
-                SHARE_AUTH_TTL_SECONDS,
-            ))
-            .finish();
+            .same_site(SameSite::Strict)
+            .max_age(cookie::time::Duration::seconds(SHARE_AUTH_TTL_SECONDS))
+            .build();
 
         HttpResponse::Found()
-            .insert_header(("Location", format!("/d/{}", token)))
-            .cookie(cookie)
+            .insert_header(("Location", format!("/d/{token}")))
+            .insert_header(("Set-Cookie", cookie.to_string()))
             .finish()
     } else {
         render_password_form(
@@ -568,6 +572,23 @@ mod tests {
     use actix_web::test as web_test;
     use actix_web::{body::to_bytes, http::StatusCode, App};
     use std::sync::Mutex;
+
+    #[test]
+    fn share_auth_cookie_parser_selects_exact_cookie_from_multiple_values() {
+        let request = web_test::TestRequest::default()
+            .insert_header((
+                "Cookie",
+                "theme=dark; share_auth_token=abc123; share_auth_other=def456",
+            ))
+            .to_http_request();
+
+        assert_eq!(
+            share_auth_cookie_value(&request, "token").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(share_auth_cookie_value(&request, "token-extra"), None);
+        assert_eq!(share_auth_cookie_value(&request, "missing"), None);
+    }
 
     #[actix_web::test]
     async fn password_form_escapes_untrusted_values_and_disables_active_content() {
@@ -909,17 +930,17 @@ mod tests {
                 .to_request();
             let response = web_test::call_service(&app, request).await;
             assert_eq!(response.status(), StatusCode::FOUND);
-            let cookie = response
+            let cookie_header = response
                 .response()
-                .cookies()
-                .next()
-                .expect("successful verification must issue a cookie");
+                .headers()
+                .get("Set-Cookie")
+                .expect("successful verification must issue a cookie")
+                .to_str()
+                .unwrap();
+            let cookie = Cookie::parse(cookie_header).expect("issued cookie must parse");
             assert_eq!(cookie.name(), "share_auth_qa-session");
             assert!(cookie.http_only().unwrap_or(false));
-            assert_eq!(
-                cookie.same_site(),
-                Some(actix_web::cookie::SameSite::Strict)
-            );
+            assert_eq!(cookie.same_site(), Some(SameSite::Strict));
             assert_eq!(
                 cookie.max_age().unwrap().whole_seconds(),
                 SHARE_AUTH_TTL_SECONDS
